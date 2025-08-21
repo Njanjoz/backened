@@ -6,12 +6,8 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const admin = require('firebase-admin');
 
-// --- FINAL FIX START ---
-// The package exports the constructor directly, so we require it and assign it
-// to the variable name we want to use.
+// The intasend-node package exports the constructor directly
 const IntaSend = require('intasend-node');
-const Callback = IntaSend.Callback; // Access the Callback class from the main export
-// --- FINAL FIX END ---
 
 dotenv.config();
 
@@ -24,6 +20,12 @@ if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY) {
 // Check for Firebase service account credentials
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     console.error('Error: Missing FIREBASE_SERVICE_ACCOUNT_KEY in environment variables.');
+    process.exit(1);
+}
+
+// Check for the webhook secret
+if (!process.env.INTASEND_WEBHOOK_SECRET) {
+    console.error('Error: Missing INTASEND_WEBHOOK_SECRET in environment variables.');
     process.exit(1);
 }
 
@@ -47,14 +49,11 @@ const PORT = process.env.PORT || 3001;
 app.use(bodyParser.json());
 app.use(cors());
 
-// --- FINAL FIX START ---
-// Initialize IntaSend using the directly imported constructor
 const intasend = new IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
     false // Set to true for live environment
 );
-// --- FINAL FIX END ---
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -93,16 +92,8 @@ app.post('/api/intasend-callback', async (req, res) => {
     console.log("IntaSend Callback received:", transaction);
 
     try {
-        // --- FINAL FIX START ---
-        // Initialize Callback using the directly imported constructor
-        const callback = new Callback({
-            public_key: process.env.INTASEND_PUBLISHABLE_KEY,
-            secret_key: process.env.INTASEND_SECRET_KEY,
-        });
-        const verified = callback.verify(req.body);
-        // --- FINAL FIX END ---
-
-        if (!verified) {
+        // --- FINAL FIX: Verify callback using the challenge from the payload ---
+        if (!transaction.challenge || transaction.challenge !== process.env.INTASEND_WEBHOOK_SECRET) {
             console.error('Webhook verification failed.');
             return res.status(403).json({ success: false, message: 'Invalid callback signature.' });
         }
@@ -133,7 +124,7 @@ app.post('/api/intasend-callback', async (req, res) => {
 
         console.log(`Order ${orderId} updated to status: ${statusToUpdate}`);
 
-        res.status(200).json({ success: true, message: "Callback received" });
+        res.status(200).json({ success: true, message: "Callback processed successfully" });
     } catch (error) {
         console.error('Error processing IntaSend callback:', error.message);
         res.status(500).json({ success: false, message: 'Internal Server Error' });
