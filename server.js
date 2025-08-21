@@ -96,12 +96,23 @@ function verifyIntaSendWebhook(req, res, next) {
                        .update(req.rawBody)  // ✅ Use the raw body for the hash
                        .digest('hex');
 
+    // --- NEW DEBUGGING LOGS ---
+    console.log(`\n============================`);
+    console.log(`🔍 DEBUGGING SIGNATURE CHECK`);
+    console.log(`============================`);
+    console.log(`IntaSend Signature: ${signature}`);
+    console.log(`Server-Calculated Hash: ${hash}`);
+    console.log(`Webhook Secret (first 5 chars): ${process.env.INTASEND_WEBHOOK_SECRET.substring(0, 5)}...`);
+    // NOTE: Logging the full secret is a security risk, so we only show a part of it.
+    console.log(`Is hash === signature? ${hash === signature}`);
+    console.log(`============================\n`);
+    // --- END DEBUGGING LOGS ---
+
     if (hash === signature) {
         console.log('✅ Webhook signature verified successfully.');
         next();
     } else {
         console.error('❌ Webhook signature verification failed.');
-        // It's important to use a return here to stop execution
         return res.status(403).send('Forbidden: Invalid signature');
     }
 }
