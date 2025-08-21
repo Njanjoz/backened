@@ -1,71 +1,120 @@
-/**
- * server.js - A complete Node.js server with a secure IntaSend webhook handler.
- * This file is designed to be a replacement for a backend server.
- */
+// server.js
 
-// 1. Import necessary libraries
 const express = require('express');
 const bodyParser = require('body-parser');
+const dotenv = require('dotenv');
+const cors = require('cors'); // ✅ Ensure 'cors' is imported
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
-// 2. Initialize Express app
-const app = express();
-const port = process.env.PORT || 3000;
+// The intasend-node package exports the constructor directly
+const IntaSend = require('intasend-node');
 
-// 3. Initialize Firebase Admin SDK
-// This assumes you have your service account key stored as an environment variable
-// on your server (e.g., in a .env file or on Render).
-// Replace the placeholders with your actual variable names if they differ.
-// Example: If you pasted the JSON key directly, make sure to parse it correctly.
-const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_KEY ?
-  JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY) :
-  { projectId: 'your-project-id' }; // Fallback for local testing
-  
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+dotenv.config();
 
-// Get a reference to the Firestore database
-const db = admin.firestore();
-
-// 4. IntaSend Webhook Secret
-// Make sure this environment variable is set on your server.
-const intaSendWebhookSecret = process.env.INTASEND_WEBHOOK_SECRET;
-if (!intaSendWebhookSecret) {
-    console.error('❌ INTASEND_WEBHOOK_SECRET environment variable is not set!');
+// Check for required environment variables
+if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY) {
+    console.error('Error: Missing IntaSend API keys in environment variables.');
     process.exit(1);
 }
 
-// 5. Webhook Signature Verification Middleware
-// This function verifies that the request came from IntaSend.
+// Check for Firebase service account credentials
+if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+    console.error('Error: Missing FIREBASE_SERVICE_ACCOUNT_KEY in environment variables.');
+    process.exit(1);
+}
+
+// Check for the webhook secret
+if (!process.env.INTASEND_WEBHOOK_SECRET) {
+    console.error('Error: Missing INTASEND_WEBHOOK_SECRET in environment variables.');
+    process.exit(1);
+}
+
+// Initialize Firebase Admin SDK
+try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("Firebase Admin SDK initialized successfully.");
+} catch (error) {
+    console.error("Failed to initialize Firebase Admin SDK:", error);
+    process.exit(1);
+}
+const db = admin.firestore();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// --- Correct CORS Middleware Configuration ---
+// This middleware must be placed before any routes that handle requests from the frontend.
+app.use(cors());
+
+// Middleware for parsing JSON request bodies
+app.use(bodyParser.json());
+
+// Initialize IntaSend using the directly imported constructor
+const intasend = new IntaSend(
+    process.env.INTASEND_PUBLISHABLE_KEY,
+    process.env.INTASEND_SECRET_KEY,
+    false // Set to true for live environment
+);
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', message: 'Server is running.' });
+});
+
+// STK Push API Endpoint
+app.post('/api/stk-push', async (req, res) => {
+    try {
+        const { amount, phoneNumber, fullName, email, orderId } = req.body;
+
+        console.log(`Received STK Push request for order ID: ${orderId}`);
+
+        const collection = intasend.collection();
+        const response = await collection.mpesaStkPush({
+            first_name: fullName,
+            last_name: 'N/A',
+            email: email,
+            phone_number: phoneNumber,
+            amount: amount,
+            host: 'https://backened-lt67.onrender.com',
+            api_ref: orderId // Use the orderId as the API reference for tracking
+        });
+
+        console.log(`STK Push initiated successfully for order ${orderId}.`);
+        res.status(200).json({ success: true, message: 'STK push initiated successfully.', data: response });
+    } catch (error) {
+        console.error('STK Push Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to initiate STK Push.', error: error.message });
+    }
+});
+
+// Webhook Signature Verification Middleware
 function verifyIntaSendWebhook(req, res, next) {
     const signature = req.get('x-intasend-signature');
     const body = JSON.stringify(req.body);
-
-    // Create a SHA-256 HMAC hash of the request body using your secret key
-    const hash = crypto.createHmac('sha256', intaSendWebhookSecret)
+    const hash = crypto.createHmac('sha256', process.env.INTASEND_WEBHOOK_SECRET)
                        .update(body)
                        .digest('hex');
 
-    // Compare the generated hash with the signature from the request header
     if (hash === signature) {
         console.log('✅ Webhook signature verified successfully.');
-        next(); // Proceed to the webhook handler
+        next();
     } else {
         console.error('❌ Webhook signature verification failed.');
         res.status(403).send('Forbidden: Invalid signature');
     }
 }
 
-// 6. Define the webhook endpoint
-app.post('/api/intasend-callback', bodyParser.json(), verifyIntaSendWebhook, async (req, res) => {
+// IntaSend Webhook Endpoint
+app.post('/api/intasend-callback', verifyIntaSendWebhook, async (req, res) => {
     try {
         const payload = req.body;
         console.log('✅ Verified webhook payload:', payload);
 
-        // Use the correct payload fields based on the IntaSend documentation
-        const orderId = payload.api_ref; // The API reference you used for the STK Push
+        const orderId = payload.api_ref;
         const transactionId = payload.mpesa_reference || payload.id;
         const paymentStatus = payload.state;
 
@@ -77,36 +126,26 @@ app.post('/api/intasend-callback', bodyParser.json(), verifyIntaSendWebhook, asy
             console.log(`  - Customer Phone: ${payload.account}`);
             console.log(`=====================================\n`);
 
-            // --- Your "Print Order" / Database Update Logic ---
-            // 1. Get a reference to the order document in Firestore.
             const docRef = db.collection('orders').doc(orderId);
-
-            // 2. Update the document with the new payment status and transaction details.
             await docRef.update({
                 status: 'paid',
                 transactionId: transactionId,
-                paymentTime: admin.firestore.FieldValue.serverTimestamp(),
-                paidAmount: payload.net_amount,
-                payerPhone: payload.account
+                paymentTime: admin.firestore.FieldValue.serverTimestamp()
             });
 
             console.log(`Order ${orderId} updated to PAID ✅`);
-            
-            // Send a 200 OK response to IntaSend to stop them from retrying.
             res.status(200).send('Webhook received and processed.');
         } else {
-            // Handle other states like 'FAILED' or 'PENDING' if needed
             console.log(`ℹ️ Received payment status: ${paymentStatus} for order ${orderId}`);
             res.status(200).send('Status received, no action taken.');
         }
-
     } catch (error) {
         console.error('❌ Error processing webhook:', error);
         res.status(500).send('Internal Server Error');
     }
 });
 
-// 7. Start the server
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+// Start the server
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
