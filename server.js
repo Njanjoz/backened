@@ -3,12 +3,15 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
-// --- FIX START ---
-// Import the entire library module
-const intasendLib = require('intasend-node');
-// --- FIX END ---
 const cors = require('cors');
 const admin = require('firebase-admin');
+
+// --- FINAL FIX START ---
+// The package exports the constructor directly, so we require it and assign it
+// to the variable name we want to use.
+const IntaSend = require('intasend-node');
+const Callback = IntaSend.Callback; // Access the Callback class from the main export
+// --- FINAL FIX END ---
 
 dotenv.config();
 
@@ -44,14 +47,14 @@ const PORT = process.env.PORT || 3001;
 app.use(bodyParser.json());
 app.use(cors());
 
-// --- FIX START ---
-// Initialize IntaSend using the property from the imported module
-const intasend = new intasendLib.IntaSend(
+// --- FINAL FIX START ---
+// Initialize IntaSend using the directly imported constructor
+const intasend = new IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
     false // Set to true for live environment
 );
-// --- FIX END ---
+// --- FINAL FIX END ---
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -90,14 +93,14 @@ app.post('/api/intasend-callback', async (req, res) => {
     console.log("IntaSend Callback received:", transaction);
 
     try {
-        // --- FIX START ---
-        // Access the Callback class as a property of the imported module
-        const callback = new intasendLib.Callback({
+        // --- FINAL FIX START ---
+        // Initialize Callback using the directly imported constructor
+        const callback = new Callback({
             public_key: process.env.INTASEND_PUBLISHABLE_KEY,
             secret_key: process.env.INTASEND_SECRET_KEY,
         });
         const verified = callback.verify(req.body);
-        // --- FIX END ---
+        // --- FINAL FIX END ---
 
         if (!verified) {
             console.error('Webhook verification failed.');
