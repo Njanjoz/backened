@@ -3,7 +3,10 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
-const IntaSend = require('intasend-node');
+// --- FIX START ---
+// We need to import IntaSend and Callback directly from the library
+const { IntaSend, Callback } = require('intasend-node');
+// --- FIX END ---
 const cors = require('cors');
 const admin = require('firebase-admin');
 
@@ -87,8 +90,8 @@ app.post('/api/intasend-callback', async (req, res) => {
     try {
         // --- FIX START ---
         // The IntaSend webhook verification needs to be handled by a new
-        // instance of the Callback class, not the main IntaSend object.
-        const callback = new IntaSend.Callback({
+        // instance of the Callback class.
+        const callback = new Callback({
             public_key: process.env.INTASEND_PUBLISHABLE_KEY,
             secret_key: process.env.INTASEND_SECRET_KEY,
         });
