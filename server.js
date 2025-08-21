@@ -4,8 +4,8 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
 // --- FIX START ---
-// We need to import IntaSend and Callback directly from the library
-const { IntaSend, Callback } = require('intasend-node');
+// Import the entire library module and access the classes as properties
+const intasendNode = require('intasend-node');
 // --- FIX END ---
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -44,12 +44,14 @@ const PORT = process.env.PORT || 3001;
 app.use(bodyParser.json());
 app.use(cors());
 
-// Initialize IntaSend
-const intasend = new IntaSend(
+// --- FIX START ---
+// Initialize IntaSend using the property from the imported module
+const intasend = new intasendNode.IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
     false // Set to true for live environment
 );
+// --- FIX END ---
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -89,9 +91,9 @@ app.post('/api/intasend-callback', async (req, res) => {
 
     try {
         // --- FIX START ---
-        // The IntaSend webhook verification needs to be handled by a new
-        // instance of the Callback class.
-        const callback = new Callback({
+        // The IntaSend webhook verification needs to be handled by an instance of the Callback class.
+        // We access the Callback class as a property of the imported module.
+        const callback = new intasendNode.Callback({
             public_key: process.env.INTASEND_PUBLISHABLE_KEY,
             secret_key: process.env.INTASEND_SECRET_KEY,
         });
