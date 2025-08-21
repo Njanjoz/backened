@@ -45,17 +45,18 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 
-// --- CRITICAL FIX: Capture the raw body before parsing ---
+// ✅ Capture raw body for webhook verification
 app.use(express.json({
     verify: (req, res, buf) => {
-        req.rawBody = buf.toString(); // Store raw body for HMAC check
+        req.rawBody = buf.toString();
     }
 }));
 
+// Initialize IntaSend
 const intasend = new IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
-    false
+    false // Set true for live environment
 );
 
 // Health check endpoint
@@ -93,20 +94,8 @@ app.post('/api/stk-push', async (req, res) => {
 function verifyIntaSendWebhook(req, res, next) {
     const signature = req.get('x-intasend-signature');
     const hash = crypto.createHmac('sha256', process.env.INTASEND_WEBHOOK_SECRET)
-                       .update(req.rawBody)  // ✅ Use the raw body for the hash
+                       .update(req.rawBody) // ✅ raw body instead of parsed JSON
                        .digest('hex');
-
-    // --- NEW DEBUGGING LOGS ---
-    console.log(`\n============================`);
-    console.log(`🔍 DEBUGGING SIGNATURE CHECK`);
-    console.log(`============================`);
-    console.log(`IntaSend Signature: ${signature}`);
-    console.log(`Server-Calculated Hash: ${hash}`);
-    console.log(`Webhook Secret (first 5 chars): ${process.env.INTASEND_WEBHOOK_SECRET.substring(0, 5)}...`);
-    // NOTE: Logging the full secret is a security risk, so we only show a part of it.
-    console.log(`Is hash === signature? ${hash === signature}`);
-    console.log(`============================\n`);
-    // --- END DEBUGGING LOGS ---
 
     if (hash === signature) {
         console.log('✅ Webhook signature verified successfully.');
@@ -123,9 +112,8 @@ app.post('/api/intasend-callback', verifyIntaSendWebhook, async (req, res) => {
         const payload = req.body;
         console.log('✅ Verified webhook payload:', payload);
 
-        // Use `api_ref` or `invoice_id` for robustness
-        const orderId = payload.api_ref; 
-        const transactionId = payload.invoice_id || payload.api_ref;
+        const orderId = payload.api_ref;
+        const transactionId = payload.mpesa_reference || payload.invoice_id || payload.api_ref;
         const paymentStatus = payload.state;
 
         if (paymentStatus === 'COMPLETE') {
@@ -145,10 +133,10 @@ app.post('/api/intasend-callback', verifyIntaSendWebhook, async (req, res) => {
 
             console.log(`Order ${orderId} updated to PAID ✅`);
             return res.status(200).send('Webhook received and processed.');
-        } else {
-            console.log(`ℹ️ Received payment status: ${paymentStatus} for order ${orderId}`);
-            return res.status(200).send('Status received, no action taken.');
         }
+
+        console.log(`ℹ️ Received payment status: ${paymentStatus} for order ${orderId}`);
+        return res.status(200).send('Status received, no action taken.');
     } catch (error) {
         console.error('❌ Error processing webhook:', error);
         return res.status(500).send('Internal Server Error');
