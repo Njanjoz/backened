@@ -1,9 +1,8 @@
 // server.js
 
 const express = require('express');
-const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
-const cors = require('cors'); // ✅ Ensure 'cors' is imported
+const cors = require('cors');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
@@ -18,13 +17,11 @@ if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY) {
     process.exit(1);
 }
 
-// Check for Firebase service account credentials
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     console.error('Error: Missing FIREBASE_SERVICE_ACCOUNT_KEY in environment variables.');
     process.exit(1);
 }
 
-// Check for the webhook secret
 if (!process.env.INTASEND_WEBHOOK_SECRET) {
     console.error('Error: Missing INTASEND_WEBHOOK_SECRET in environment variables.');
     process.exit(1);
@@ -46,18 +43,19 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// --- Correct CORS Middleware Configuration ---
-// This middleware must be placed before any routes that handle requests from the frontend.
 app.use(cors());
 
-// Middleware for parsing JSON request bodies
-app.use(bodyParser.json());
+// --- CRITICAL FIX: Capture the raw body before parsing ---
+app.use(express.json({
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString(); // Store raw body for HMAC check
+    }
+}));
 
-// Initialize IntaSend using the directly imported constructor
 const intasend = new IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
-    false // Set to true for live environment
+    false
 );
 
 // Health check endpoint
@@ -80,7 +78,7 @@ app.post('/api/stk-push', async (req, res) => {
             phone_number: phoneNumber,
             amount: amount,
             host: 'https://backened-lt67.onrender.com',
-            api_ref: orderId // Use the orderId as the API reference for tracking
+            api_ref: orderId
         });
 
         console.log(`STK Push initiated successfully for order ${orderId}.`);
@@ -94,9 +92,8 @@ app.post('/api/stk-push', async (req, res) => {
 // Webhook Signature Verification Middleware
 function verifyIntaSendWebhook(req, res, next) {
     const signature = req.get('x-intasend-signature');
-    const body = JSON.stringify(req.body);
     const hash = crypto.createHmac('sha256', process.env.INTASEND_WEBHOOK_SECRET)
-                       .update(body)
+                       .update(req.rawBody)  // ✅ Use the raw body for the hash
                        .digest('hex');
 
     if (hash === signature) {
@@ -104,7 +101,8 @@ function verifyIntaSendWebhook(req, res, next) {
         next();
     } else {
         console.error('❌ Webhook signature verification failed.');
-        res.status(403).send('Forbidden: Invalid signature');
+        // It's important to use a return here to stop execution
+        return res.status(403).send('Forbidden: Invalid signature');
     }
 }
 
@@ -114,8 +112,9 @@ app.post('/api/intasend-callback', verifyIntaSendWebhook, async (req, res) => {
         const payload = req.body;
         console.log('✅ Verified webhook payload:', payload);
 
-        const orderId = payload.api_ref;
-        const transactionId = payload.mpesa_reference || payload.id;
+        // Use `api_ref` or `invoice_id` for robustness
+        const orderId = payload.api_ref; 
+        const transactionId = payload.invoice_id || payload.api_ref;
         const paymentStatus = payload.state;
 
         if (paymentStatus === 'COMPLETE') {
@@ -134,14 +133,14 @@ app.post('/api/intasend-callback', verifyIntaSendWebhook, async (req, res) => {
             });
 
             console.log(`Order ${orderId} updated to PAID ✅`);
-            res.status(200).send('Webhook received and processed.');
+            return res.status(200).send('Webhook received and processed.');
         } else {
             console.log(`ℹ️ Received payment status: ${paymentStatus} for order ${orderId}`);
-            res.status(200).send('Status received, no action taken.');
+            return res.status(200).send('Status received, no action taken.');
         }
     } catch (error) {
         console.error('❌ Error processing webhook:', error);
-        res.status(500).send('Internal Server Error');
+        return res.status(500).send('Internal Server Error');
     }
 });
 
