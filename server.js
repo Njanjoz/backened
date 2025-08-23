@@ -44,7 +44,7 @@ app.post('/api/stk-push', async (req, res) => {
             email: email,
             phone_number: phoneNumber,
             amount: amount,
-            host: process.env.BACKEND_URL,  // 👈 backend URL (not frontend)
+            host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com",  
             api_ref: `order_${Date.now()}`
         });
 
