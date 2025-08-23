@@ -11,6 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Define a list of allowed origins for CORS.
+// This is crucial for local testing where your frontend is on a different domain/port.
 const allowedOrigins = [
   'http://localhost:5173', // Your frontend's local development server
   'https://backened-lt67.onrender.com' // Your deployed backend
@@ -19,7 +20,9 @@ const allowedOrigins = [
 // Configure CORS middleware to check if the incoming request origin is allowed.
 app.use(cors({
   origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
+    // If the origin is in our allowed list, permit the request.
     if (allowedOrigins.indexOf(origin) === -1) {
       const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
       return callback(new Error(msg), false);
@@ -66,6 +69,15 @@ const intasend = new IntaSend(
 app.post('/api/stk-push', async (req, res) => {
     try {
         const { amount, phoneNumber, fullName, email } = req.body;
+
+        // CRITICAL VALIDATION: Check for missing fields before making the API call
+        if (!amount || !phoneNumber || !fullName || !email) {
+            console.error('Validation Error: Missing required fields in request body.');
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Missing required fields (amount, phoneNumber, fullName, or email).' 
+            });
+        }
 
         const collection = intasend.collection();
         const response = await collection.mpesaStkPush({
