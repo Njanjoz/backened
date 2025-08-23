@@ -160,11 +160,12 @@ app.post('/api/intasend-callback', async (req, res) => {
         // Update the document in Firestore with the new state
         const docRef = db.collection('payments').doc(invoiceId);
         try {
-            await docRef.update({
+            await docRef.set({
                 status: state,
                 mpesaReference: mpesaReference,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
+            }, { merge: true }); // Use set with merge: true to create or update the document
+
             console.log(`Transaction ${invoiceId} updated to status: ${state}`);
         } catch (error) {
             console.error(`Error updating transaction ${invoiceId} in Firestore:`, error);
