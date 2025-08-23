@@ -14,7 +14,8 @@ const PORT = process.env.PORT || 3001;
 // This is crucial for local testing where your frontend is on a different domain/port.
 const allowedOrigins = [
   'http://localhost:5173', // Your frontend's local development server
-  'https://backened-lt67.onrender.com' // Your deployed backend
+  'https://backened-lt67.onrender.com', // Your deployed backend
+  'https://my-campus-store-frontend.vercel.app' // <<<<<<< CORRECT VERCEL FRONTEND URL ADDED HERE
 ];
 
 // Configure CORS middleware to check if the incoming request origin is allowed.
@@ -102,7 +103,8 @@ app.post('/api/stk-push', async (req, res) => {
             email: email,
             phone_number: phoneNumber,
             amount: amount,
-            host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com", 
+            // Use the environment variable for the backend URL for better practice
+            host: process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com", 
             api_ref: orderId // CRITICAL: Use the orderId as the API reference
         });
 
