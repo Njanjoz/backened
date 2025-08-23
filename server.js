@@ -70,13 +70,21 @@ app.post('/api/stk-push', async (req, res) => {
     try {
         const { amount, phoneNumber, fullName, email } = req.body;
 
-        // CRITICAL VALIDATION: Check for missing fields before making the API call
-        if (!amount || !phoneNumber || !fullName || !email) {
-            console.error('Validation Error: Missing required fields in request body.');
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Missing required fields (amount, phoneNumber, fullName, or email).' 
-            });
+        // CRITICAL: Log the incoming data to see exactly what is being received
+        console.log('Incoming STK Push request data:', { amount, phoneNumber, fullName, email });
+
+        // More specific validation checks
+        if (!amount || isNaN(amount) || amount <= 0) {
+            return res.status(400).json({ success: false, message: 'Invalid amount.' });
+        }
+        if (!phoneNumber || phoneNumber.length < 9) { // Basic length check for phone number
+            return res.status(400).json({ success: false, message: 'Invalid phone number.' });
+        }
+        if (!fullName || fullName.trim() === '') {
+            return res.status(400).json({ success: false, message: 'Full name is required.' });
+        }
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ success: false, message: 'Invalid email address.' });
         }
 
         const collection = intasend.collection();
