@@ -25,10 +25,14 @@ if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY) {
 const intasend = new IntaSend(
     process.env.INTASEND_PUBLISHABLE_KEY,
     process.env.INTASEND_SECRET_KEY,
-    false 
+    false // false = sandbox, true = live
 );
 
-// Payment API Endpoint
+// ============================
+// Routes
+// ============================
+
+// STK Push initiation
 app.post('/api/stk-push', async (req, res) => {
     try {
         const { amount, phoneNumber, fullName, email } = req.body;
@@ -40,7 +44,7 @@ app.post('/api/stk-push', async (req, res) => {
             email: email,
             phone_number: phoneNumber,
             amount: amount,
-            host: process.env.REACT_APP_FRONTEND_URL, 
+            host: process.env.BACKEND_URL,  // 👈 backend URL (not frontend)
             api_ref: `order_${Date.now()}`
         });
 
@@ -51,7 +55,19 @@ app.post('/api/stk-push', async (req, res) => {
     }
 });
 
-// Start the server
+// IntaSend callback endpoint
+app.post('/api/intasend-callback', (req, res) => {
+    console.log("IntaSend callback received:", req.body);
+
+    // 👉 TODO: Save transaction details to DB or update order status here
+
+    // Always acknowledge callback
+    res.status(200).send("OK");
+});
+
+// ============================
+// Start Server
+// ============================
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
