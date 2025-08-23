@@ -68,17 +68,16 @@ const intasend = new IntaSend(
 // STK Push initiation
 app.post('/api/stk-push', async (req, res) => {
     try {
-        const { amount, phoneNumber, fullName, email } = req.body;
+        const { amount, phoneNumber, fullName, email, orderId } = req.body; // Receive orderId from the frontend
 
         // CRITICAL: Log the incoming data to see exactly what is being received
-        console.log('Incoming STK Push request data:', { amount, phoneNumber, fullName, email });
+        console.log('Incoming STK Push request data:', { amount, phoneNumber, fullName, email, orderId });
 
         // More specific validation checks
         if (!amount || isNaN(amount) || amount <= 0) {
             return res.status(400).json({ success: false, message: 'Invalid amount.' });
         }
         
-        // --- IMPROVEMENT 1: Phone number validation
         // Use a regex to strictly validate the number format for M-Pesa
         const phoneRegex = /^(2547|2541)\d{8}$/;
         if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
@@ -92,7 +91,6 @@ app.post('/api/stk-push', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid email address.' });
         }
 
-        // --- IMPROVEMENT 2: Split full name
         const names = fullName.trim().split(" ");
         const firstName = names[0];
         const lastName = names.slice(1).join(" ") || "N/A";
@@ -102,27 +100,24 @@ app.post('/api/stk-push', async (req, res) => {
             first_name: firstName,
             last_name: lastName,
             email: email,
-            phone_number: phoneNumber, // Use the validated number directly
+            phone_number: phoneNumber,
             amount: amount,
             host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com", 
-            api_ref: `order_${Date.now()}`
+            api_ref: orderId // CRITICAL: Use the orderId as the API reference
         });
 
-        // Save the initial transaction to Firestore with a 'pending' status
-        const docRef = db.collection('payments').doc(response.invoice.invoice_id);
-        await docRef.set({
+        // The frontend has already created the document, we just need to ensure it exists
+        const docRef = db.collection('orders').doc(orderId);
+        await docRef.update({
             invoiceId: response.invoice.invoice_id,
-            apiRef: response.invoice.api_ref,
-            status: 'PENDING',
-            amount: amount,
-            phoneNumber: phoneNumber,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
+            status: 'STK_PUSH_SENT',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-        console.log(`Initial transaction stored in Firestore: ${response.invoice.invoice_id}`);
+        console.log(`Initial transaction stored in Firestore: ${orderId}`);
         
         res.status(200).json({ success: true, data: response });
     } catch (error) {
-        // --- IMPROVEMENT 3: Better error logging
+        // Better error logging
         console.error('STK Push Error raw:', error);
         let errorMessage = 'Failed to initiate STK Push.';
 
@@ -151,25 +146,37 @@ app.post('/api/stk-push', async (req, res) => {
 app.post('/api/intasend-callback', async (req, res) => {
     console.log("IntaSend callback received:", req.body);
     
+    // The IntaSend callback uses api_ref to pass our orderId
+    const { api_ref, state, mpesa_reference } = req.body;
+    
     // Check for the required data from the callback
-    const invoiceId = req.body.invoice_id;
-    const state = req.body.state;
-    const mpesaReference = req.body.mpesa_reference || null;
-
-    if (invoiceId && state) {
-        // Update the document in Firestore with the new state
-        const docRef = db.collection('payments').doc(invoiceId);
-        try {
-            await docRef.set({
-                status: state,
-                mpesaReference: mpesaReference,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true }); // Use set with merge: true to create or update the document
-
-            console.log(`Transaction ${invoiceId} updated to status: ${state}`);
-        } catch (error) {
-            console.error(`Error updating transaction ${invoiceId} in Firestore:`, error);
+    if (api_ref && state) {
+        const orderId = api_ref;
+        const orderDocRef = db.collection('orders').doc(orderId);
+        
+        // CRITICAL: Map IntaSend state to our payment status
+        let paymentStatus = 'pending';
+        if (state === 'COMPLETE') {
+            paymentStatus = 'paid';
+        } else if (state === 'FAILED' || state === 'CANCELLED') {
+            paymentStatus = 'failed';
         }
+
+        try {
+            // Now, update the correct order document with the new state
+            await orderDocRef.set({
+                paymentStatus: paymentStatus,
+                mpesaReference: mpesa_reference || null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+            
+            console.log(`Order ${orderId} updated to paymentStatus: ${paymentStatus}`);
+            
+        } catch (error) {
+            console.error(`Error updating order ${orderId} in Firestore:`, error);
+        }
+    } else {
+        console.error("Callback data incomplete. Missing api_ref or state.");
     }
 
     // Always acknowledge callback to IntaSend
@@ -180,14 +187,13 @@ app.post('/api/intasend-callback', async (req, res) => {
 app.get('/api/transaction/:invoiceId', async (req, res) => {
     try {
         const invoiceId = req.params.invoiceId;
-        const docRef = db.collection('payments').doc(invoiceId);
-        const doc = await docRef.get();
+        const docs = await db.collection('orders').where('invoiceId', '==', invoiceId).get();
 
-        if (!doc.exists) {
+        if (docs.empty) {
             return res.status(404).json({ success: false, message: 'Transaction not found.' });
         }
 
-        const data = doc.data();
+        const data = docs.docs[0].data();
         res.status(200).json({ success: true, data: data });
     } catch (error) {
         console.error('Error fetching transaction status:', error);
