@@ -1,5 +1,3 @@
-// server.js
-
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
@@ -11,9 +9,29 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Define a list of allowed origins for CORS.
+// This is crucial for local testing where your frontend is on a different domain/port.
+const allowedOrigins = [
+  'http://localhost:5173', // Your frontend's local development server
+  'https://backened-lt67.onrender.com' // Your deployed backend
+];
+
+// Configure CORS middleware to check if the incoming request origin is allowed.
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    // If the origin is in our allowed list, permit the request.
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  }
+}));
+
 // Middleware
 app.use(bodyParser.json());
-app.use(cors()); 
 
 // Check for API keys before starting the server
 if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY) {
@@ -44,7 +62,7 @@ app.post('/api/stk-push', async (req, res) => {
             email: email,
             phone_number: phoneNumber,
             amount: amount,
-            host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com",  
+            host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com", 
             api_ref: `order_${Date.now()}`
         });
 
