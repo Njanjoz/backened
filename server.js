@@ -77,9 +77,14 @@ app.post('/api/stk-push', async (req, res) => {
         if (!amount || isNaN(amount) || amount <= 0) {
             return res.status(400).json({ success: false, message: 'Invalid amount.' });
         }
-        if (!phoneNumber || phoneNumber.length < 9) { // Basic length check for phone number
-            return res.status(400).json({ success: false, message: 'Invalid phone number.' });
+        
+        // --- IMPROVEMENT 1: Phone number validation
+        // Use a regex to strictly validate the number format for M-Pesa
+        const phoneRegex = /^(2547|2541)\d{8}$/;
+        if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
+            return res.status(400).json({ success: false, message: 'Invalid phone number format. Use 2547XXXXXXXX or 2541XXXXXXXX.' });
         }
+
         if (!fullName || fullName.trim() === '') {
             return res.status(400).json({ success: false, message: 'Full name is required.' });
         }
@@ -87,12 +92,17 @@ app.post('/api/stk-push', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid email address.' });
         }
 
+        // --- IMPROVEMENT 2: Split full name
+        const names = fullName.trim().split(" ");
+        const firstName = names[0];
+        const lastName = names.slice(1).join(" ") || "N/A";
+        
         const collection = intasend.collection();
         const response = await collection.mpesaStkPush({
-            first_name: fullName,
-            last_name: 'N/A',
+            first_name: firstName,
+            last_name: lastName,
             email: email,
-            phone_number: phoneNumber,
+            phone_number: phoneNumber, // Use the validated number directly
             amount: amount,
             host: process.env.BACKEND_URL || "https://backened-lt67.onrender.com", 
             api_ref: `order_${Date.now()}`
@@ -112,8 +122,28 @@ app.post('/api/stk-push', async (req, res) => {
         
         res.status(200).json({ success: true, data: response });
     } catch (error) {
-        console.error('STK Push Error:', error);
-        res.status(500).json({ success: false, message: 'Failed to initiate STK Push.', error: error.message });
+        // --- IMPROVEMENT 3: Better error logging
+        console.error('STK Push Error raw:', error);
+        let errorMessage = 'Failed to initiate STK Push.';
+
+        if (error.response && error.response.data) {
+            console.error('STK Push Error parsed:', error.response.data);
+            try {
+                const parsedError = JSON.parse(error.response.data.toString());
+                errorMessage = parsedError.error_message || JSON.stringify(parsedError);
+            } catch (e) {
+                errorMessage = error.response.data.toString();
+            }
+        } else if (Buffer.isBuffer(error)) {
+            errorMessage = error.toString();
+        } else {
+            errorMessage = error.message || error.toString();
+        }
+
+        res.status(500).json({
+            success: false,
+            message: errorMessage
+        });
     }
 });
 
