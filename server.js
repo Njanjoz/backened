@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3001;
 const allowedOrigins = [
   'http://localhost:5173', // Your frontend's local development server
   'https://backened-lt67.onrender.com', // Your deployed backend
-  'https://my-campus-store-frontend.vercel.app' // <<<<<<< CORRECT VERCEL FRONTEND URL ADDED HERE
+  'https://my-campus-store-frontend.vercel.app', // <<<<<<< CORRECT VERCEL FRONTEND URL ADDED HERE
+  'https://localhost' // ADDED FOR CAPACITOR ANDROID APPS
 ];
 
 // Configure CORS middleware to check if the incoming request origin is allowed.
