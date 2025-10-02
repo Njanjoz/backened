@@ -11,13 +11,12 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Define a list of allowed origins for CORS.
-// Define a list of allowed origins for CORS.
 const allowedOrigins = [
-  'http://localhost:5173', // Your frontend's local development server
-  'https://backened-lt67.onrender.com', // Your deployed backend
-  'https://my-campus-store-frontend.vercel.app',
-  'https://marketmix.site', // ✅ Added your production frontend
-  'https://localhost' // ADDED FOR CAPACITOR ANDROID APPS
+  'http://localhost:5173', // Your frontend's local development server
+  'https://backened-lt67.onrender.com', // Your deployed backend
+  'https://my-campus-store-frontend.vercel.app',
+  'https://marketmix.site', // ✅ Added your production frontend
+  'https://localhost' // ADDED FOR CAPACITOR ANDROID APPS
 ];
 
 
@@ -62,6 +61,11 @@ const intasend = new IntaSend(
     process.env.INTASEND_SECRET_KEY,
     false // false = sandbox, true = live
 );
+
+// ============================
+// Constants
+// ============================
+const WITHDRAWAL_FEE_RATE = 0.055; // 5.5% fee
 
 // ============================
 // Routes
@@ -146,8 +150,11 @@ app.post('/api/intasend-callback', async (req, res) => {
     const { api_ref, state, mpesa_reference } = req.body;
     
     if (api_ref && state) {
-        const orderId = api_ref;
-        const orderDocRef = db.collection('orders').doc(orderId);
+        // NOTE: This logic assumes the callback is for an STK collection (order). 
+        // For Payouts, IntaSend may send a separate callback. If you use this endpoint for both, 
+        // you must add logic to check if the api_ref belongs to an order or a withdrawal record.
+
+        const docRef = db.collection('orders').doc(api_ref); // Assuming api_ref is the orderId
         
         let paymentStatus = 'pending';
         if (state === 'COMPLETE') {
@@ -157,16 +164,16 @@ app.post('/api/intasend-callback', async (req, res) => {
         }
 
         try {
-            await orderDocRef.set({
+            await docRef.set({
                 paymentStatus: paymentStatus,
                 mpesaReference: mpesa_reference || null,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
             
-            console.log(`Order ${orderId} updated to paymentStatus: ${paymentStatus}`);
+            console.log(`Order ${api_ref} updated to paymentStatus: ${paymentStatus}`);
             
         } catch (error) {
-            console.error(`Error updating order ${orderId} in Firestore:`, error);
+            console.error(`Error updating document ${api_ref} in Firestore:`, error);
         }
     } else {
         console.error("Callback data incomplete. Missing api_ref or state.");
@@ -193,46 +200,162 @@ app.get('/api/transaction/:invoiceId', async (req, res) => {
     }
 });
 
+// ============================================
+// NEW: Seller Withdrawal Endpoint (5.5% Fee)
+// ============================================
+app.post('/api/seller/withdraw', async (req, res) => {
+    try {
+        const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
+        
+        if (!sellerId || !requestedAmount || isNaN(requestedAmount) || requestedAmount <= 0) {
+            return res.status(400).json({ success: false, message: 'Invalid seller ID or amount.' });
+        }
+
+        const amount = parseFloat(requestedAmount);
+        
+        // Basic phone number validation (assuming M-Pesa/IntaSend B2C)
+        const phoneRegex = /^(2547|2541)\d{8}$/;
+        if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
+            return res.status(400).json({ success: false, message: 'Invalid M-Pesa phone number format. Use 2547XXXXXXXX or 2541XXXXXXXX.' });
+        }
+
+        const netPayoutAmount = parseFloat((amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2));
+        const feeAmount = parseFloat((amount * WITHDRAWAL_FEE_RATE).toFixed(2));
+
+        // --- 1. Firestore Transaction: Check Balance & Deduct ---
+        const userRef = db.collection('users').doc(sellerId);
+        let withdrawalDocRef;
+        let transactionSuccess = false;
+
+        try {
+            await db.runTransaction(async (transaction) => {
+                const userDoc = await transaction.get(userRef);
+
+                if (!userDoc.exists) {
+                    throw new Error('Seller account not found.');
+                }
+                
+                // ASSUMPTION: The seller's available revenue is stored in a field called 'revenue'.
+                const currentBalance = userDoc.data().revenue || 0; 
+                
+                if (currentBalance < amount) {
+                    throw new Error('Insufficient withdrawable balance.');
+                }
+
+                // Deduct the full requested amount from the seller's balance
+                const newBalance = currentBalance - amount;
+
+                // Update the balance 
+                transaction.update(userRef, {
+                    revenue: newBalance, // Update the balance
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                
+                // Log transaction to a 'withdrawals' collection
+                withdrawalDocRef = db.collection('withdrawals').doc();
+                transaction.set(withdrawalDocRef, {
+                    sellerId,
+                    requestedAmount: amount,
+                    feeAmount: feeAmount,
+                    netPayoutAmount: netPayoutAmount,
+                    phoneNumber,
+                    status: 'PENDING_PAYOUT', // Initial status
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+
+                transactionSuccess = true;
+            });
+        } catch (e) {
+            console.error('Firestore Transaction Error:', e.message);
+            // If transaction failed due to insufficient funds or other DB errors, return immediately
+            return res.status(400).json({ success: false, message: e.message });
+        }
+        
+        if (!transactionSuccess) {
+             return res.status(500).json({ success: false, message: 'Internal error during balance deduction.' });
+        }
+        
+        // --- 2. Initiate IntaSend Payout (B2C M-Pesa Disbursement) ---
+        const payouts = intasend.payouts();
+        
+        // Use the withdrawal document ID as the API reference for tracking
+        const apiRef = withdrawalDocRef.id; 
+        
+        const payoutResponse = await payouts.b2c({
+            phone_number: phoneNumber,
+            amount: netPayoutAmount, // Payout the net amount after fee
+            api_ref: apiRef,
+            // Use the same host for the callback, best practice is to have a dedicated payout callback URL
+            host: process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com", 
+        });
+
+        // --- 3. Update Status in Firestore with IntaSend Reference ---
+        await withdrawalDocRef.update({
+            trackingId: payoutResponse.tracking_id, // IntaSend tracking ID
+            status: 'PAYOUT_INITIATED',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            // Store the full response for debugging/auditing
+            intasendResponse: payoutResponse, 
+        });
+
+        res.status(200).json({ 
+            success: true, 
+            message: 'Withdrawal initiated successfully.', 
+            data: {
+                requestedAmount: amount,
+                fee: feeAmount,
+                netPayout: netPayoutAmount,
+                trackingId: payoutResponse.tracking_id,
+            }
+        });
+
+    } catch (error) {
+        console.error('Seller Withdrawal Error:', error);
+        // If IntaSend fails, the balance is already deducted. Manual reversal may be needed.
+        res.status(500).json({ success: false, message: 'Failed to process withdrawal. Check server logs for API error.', error: error.message });
+    }
+});
+
 // ============================
 // NEW: Route to Update Product Stock
 // ============================
 app.post('/api/update-stock', async (req, res) => {
-    try {
-        const { productId, quantity } = req.body;
+    try {
+        const { productId, quantity } = req.body;
 
-        if (!productId || typeof quantity !== 'number' || quantity <= 0) {
-            return res.status(400).json({ success: false, message: 'Invalid product ID or quantity.' });
-        }
+        if (!productId || typeof quantity !== 'number' || quantity <= 0) {
+            return res.status(400).json({ success: false, message: 'Invalid product ID or quantity.' });
+        }
 
-        // Use a Firestore transaction to ensure the stock is updated atomically
-        const productRef = db.collection('products').doc(productId);
+        // Use a Firestore transaction to ensure the stock is updated atomically
+        const productRef = db.collection('products').doc(productId);
 
-        await db.runTransaction(async (transaction) => {
-            const doc = await transaction.get(productRef);
+        await db.runTransaction(async (transaction) => {
+            const doc = await transaction.get(productRef);
 
-            if (!doc.exists) {
-                console.error(`Attempted to update stock for non-existent product: ${productId}`);
-                return res.status(404).json({ success: false, message: 'Product not found.' });
-            }
+            if (!doc.exists) {
+                console.error(`Attempted to update stock for non-existent product: ${productId}`);
+                return res.status(404).json({ success: false, message: 'Product not found.' });
+            }
 
-            const currentQuantity = doc.data().quantity || 0;
-            const newQuantity = currentQuantity - quantity;
-            
-            if (newQuantity < 0) {
-                console.error(`Insufficient stock for product ${productId}. Current: ${currentQuantity}, Ordered: ${quantity}`);
-                return res.status(400).json({ success: false, message: 'Not enough stock available.' });
-            }
+            const currentQuantity = doc.data().quantity || 0;
+            const newQuantity = currentQuantity - quantity;
+            
+            if (newQuantity < 0) {
+                console.error(`Insufficient stock for product ${productId}. Current: ${currentQuantity}, Ordered: ${quantity}`);
+                return res.status(400).json({ success: false, message: 'Not enough stock available.' });
+            }
 
-            transaction.update(productRef, { quantity: newQuantity });
-        });
+            transaction.update(productRef, { quantity: newQuantity });
+        });
 
-        console.log(`Stock for product ${productId} updated successfully.`);
-        res.status(200).json({ success: true, message: 'Inventory updated successfully.' });
+        console.log(`Stock for product ${productId} updated successfully.`);
+        res.status(200).json({ success: true, message: 'Inventory updated successfully.' });
 
-    } catch (error) {
-        console.error('Error updating inventory:', error);
-        res.status(500).json({ success: false, message: 'Failed to update inventory.', error: error.message });
-    }
+    } catch (error) {
+        console.error('Error updating inventory:', error);
+        res.status(500).json({ success: false, message: 'Failed to update inventory.', error: error.message });
+    }
 });
 
 
