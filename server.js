@@ -11,12 +11,15 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Define a list of allowed origins for CORS.
+// Define a list of allowed origins for CORS.
 const allowedOrigins = [
-  'http://localhost:5173', // Your frontend's local development server
-  'https://backened-lt67.onrender.com', // Your deployed backend
-  'https://my-campus-store-frontend.vercel.app', 
-  'https://localhost' // ADDED FOR CAPACITOR ANDROID APPS
+  'http://localhost:5173', // Your frontend's local development server
+  'https://backened-lt67.onrender.com', // Your deployed backend
+  'https://my-campus-store-frontend.vercel.app',
+  'https://marketmix.site', // ✅ Added your production frontend
+  'https://localhost' // ADDED FOR CAPACITOR ANDROID APPS
 ];
+
 
 // Configure CORS middleware to check if the incoming request origin is allowed.
 app.use(cors({
