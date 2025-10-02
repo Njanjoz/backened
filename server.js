@@ -14,30 +14,25 @@ const PORT = process.env.PORT || 3001;
 // FIXED CORS CONFIGURATION
 // ============================
 const allowedOrigins = [
-  'http://localhost:5173', // Local dev frontend
-  'https://backened-lt67.onrender.com', // Deployed backend
-  'https://my-campus-store-frontend.vercel.app', // Vercel frontend
-  'https://marketmix.site', // Production frontend
-  'https://localhost' // Capacitor apps
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://backened-lt67.onrender.com',
+  'https://my-campus-store-frontend.vercel.app',
+  'https://marketmix.site',
+  'https://localhost'
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (curl, mobile apps, etc.)
     if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
 
-    // Allow exact matches
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    // Allow any localhost / 127.0.0.1 on any port
     if (origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
       return callback(null, true);
     }
 
-    // Otherwise block
     const msg = `CORS blocked: ${origin}`;
+    console.error(msg);
     return callback(new Error(msg), false);
   },
   credentials: true
@@ -51,7 +46,9 @@ app.use(bodyParser.json());
 // ============================
 // Env Check
 // ============================
-if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY || !process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+if (!process.env.INTASEND_PUBLISHABLE_KEY ||
+    !process.env.INTASEND_SECRET_KEY ||
+    !process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
   console.error('Error: Missing required environment variables.');
   process.exit(1);
 }
@@ -61,12 +58,10 @@ if (!process.env.INTASEND_PUBLISHABLE_KEY || !process.env.INTASEND_SECRET_KEY ||
 // ============================
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('Firebase Admin SDK initialized successfully.');
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  console.log('✅ Firebase Admin initialized');
 } catch (e) {
-  console.error('Error initializing Firebase Admin SDK:', e);
+  console.error('❌ Firebase Admin init failed:', e);
   process.exit(1);
 }
 
@@ -78,24 +73,24 @@ const db = admin.firestore();
 const intasend = new IntaSend(
   process.env.INTASEND_PUBLISHABLE_KEY,
   process.env.INTASEND_SECRET_KEY,
-  false // sandbox = false, live = true
+  false
 );
+
+const BACKEND_HOST = process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com";
 
 // ============================
 // Constants
 // ============================
-const WITHDRAWAL_FEE_RATE = 0.055; // 5.5%
+const WITHDRAWAL_FEE_RATE = 0.055;
 
 // ============================
 // Routes
 // ============================
 
-// STK Push initiation
+// --- STK Push ---
 app.post('/api/stk-push', async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body;
-
-    console.log('Incoming STK Push request:', { amount, phoneNumber, fullName, email, orderId });
 
     if (!amount || isNaN(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid amount.' });
@@ -105,93 +100,71 @@ app.post('/api/stk-push', async (req, res) => {
     if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
       return res.status(400).json({ success: false, message: 'Invalid phone number format.' });
     }
-
-    if (!fullName || fullName.trim() === '') {
-      return res.status(400).json({ success: false, message: 'Full name is required.' });
-    }
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ success: false, message: 'Invalid email address.' });
+    if (!fullName?.trim() || !email?.includes('@')) {
+      return res.status(400).json({ success: false, message: 'Invalid name or email.' });
     }
 
-    const names = fullName.trim().split(" ");
-    const firstName = names[0];
-    const lastName = names.slice(1).join(" ") || "N/A";
+    const [firstName, ...rest] = fullName.trim().split(" ");
+    const lastName = rest.join(" ") || "N/A";
 
-    const collection = intasend.collection();
-    const response = await collection.mpesaStkPush({
+    const response = await intasend.collection().mpesaStkPush({
       first_name: firstName,
       last_name: lastName,
       email,
       phone_number: phoneNumber,
       amount,
-      host: process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com",
+      host: BACKEND_HOST,
       api_ref: orderId
     });
 
-    const docRef = db.collection('orders').doc(orderId);
-    await docRef.update({
+    await db.collection('orders').doc(orderId).update({
       invoiceId: response.invoice.invoice_id,
       status: 'STK_PUSH_SENT',
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`Stored STK push transaction: ${orderId}`);
-    res.status(200).json({ success: true, data: response });
+    res.json({ success: true, data: response });
   } catch (error) {
     console.error('STK Push Error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to initiate STK Push.'
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// IntaSend callback endpoint
+// --- IntaSend Callback ---
 app.post('/api/intasend-callback', async (req, res) => {
-  console.log("IntaSend callback received:", req.body);
-
   const { api_ref, state, mpesa_reference } = req.body;
+  if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
 
-  if (api_ref && state) {
-    const docRef = db.collection('orders').doc(api_ref);
-    let paymentStatus = 'pending';
-    if (state === 'COMPLETE') paymentStatus = 'paid';
-    if (state === 'FAILED' || state === 'CANCELLED') paymentStatus = 'failed';
+  let status = 'pending';
+  if (state === 'COMPLETE') status = 'paid';
+  if (state === 'FAILED' || state === 'CANCELLED') status = 'failed';
 
-    try {
-      await docRef.set({
-        paymentStatus,
-        mpesaReference: mpesa_reference || null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
-
-      console.log(`Order ${api_ref} updated: ${paymentStatus}`);
-    } catch (error) {
-      console.error(`Error updating order ${api_ref}:`, error);
-    }
+  try {
+    await db.collection('orders').doc(api_ref).set({
+      paymentStatus: status,
+      mpesaReference: mpesa_reference || null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) {
+    console.error(`Error updating order ${api_ref}:`, err);
   }
-
-  res.status(200).send("OK");
+  res.send("OK");
 });
 
-// Transaction status
+// --- Transaction Status ---
 app.get('/api/transaction/:invoiceId', async (req, res) => {
   try {
     const docs = await db.collection('orders')
       .where('invoiceId', '==', req.params.invoiceId)
       .get();
-
-    if (docs.empty) {
-      return res.status(404).json({ success: false, message: 'Transaction not found.' });
-    }
-
-    res.status(200).json({ success: true, data: docs.docs[0].data() });
+    if (docs.empty) return res.status(404).json({ success: false, message: 'Transaction not found.' });
+    res.json({ success: true, data: docs.docs[0].data() });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch transaction.', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// Seller Withdrawal
+// --- Seller Withdrawal ---
 app.post('/api/seller/withdraw', async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -203,56 +176,38 @@ app.post('/api/seller/withdraw', async (req, res) => {
     const amount = parseFloat(requestedAmount);
     const phoneRegex = /^(2547|2541)\d{8}$/;
     if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
-      return res.status(400).json({ success: false, message: 'Invalid phone number format.' });
+      return res.status(400).json({ success: false, message: 'Invalid phone number.' });
     }
 
-    const netPayoutAmount = parseFloat((amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2));
-    const feeAmount = parseFloat((amount * WITHDRAWAL_FEE_RATE).toFixed(2));
+    const netPayoutAmount = +(amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2);
+    const feeAmount = +(amount * WITHDRAWAL_FEE_RATE).toFixed(2);
 
     const userRef = db.collection('users').doc(sellerId);
-    let withdrawalDocRef;
-    let transactionSuccess = false;
+    const withdrawalDocRef = db.collection('withdrawals').doc();
 
-    try {
-      await db.runTransaction(async (transaction) => {
-        const userDoc = await transaction.get(userRef);
+    await db.runTransaction(async (t) => {
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw new Error('Seller not found.');
+      const balance = userDoc.data().revenue || 0;
+      if (balance < amount) throw new Error('Insufficient balance.');
 
-        if (!userDoc.exists) throw new Error('Seller account not found.');
-        const currentBalance = userDoc.data().revenue || 0;
-        if (currentBalance < amount) throw new Error('Insufficient balance.');
-
-        const newBalance = currentBalance - amount;
-        transaction.update(userRef, { revenue: newBalance, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-
-        withdrawalDocRef = db.collection('withdrawals').doc();
-        transaction.set(withdrawalDocRef, {
-          sellerId,
-          requestedAmount: amount,
-          feeAmount,
-          netPayoutAmount,
-          phoneNumber,
-          status: 'PENDING_PAYOUT',
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        transactionSuccess = true;
+      t.update(userRef, { revenue: balance - amount, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      t.set(withdrawalDocRef, {
+        sellerId,
+        requestedAmount: amount,
+        feeAmount,
+        netPayoutAmount,
+        phoneNumber,
+        status: 'PENDING_PAYOUT',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-    } catch (e) {
-      return res.status(400).json({ success: false, message: e.message });
-    }
+    });
 
-    if (!transactionSuccess) {
-      return res.status(500).json({ success: false, message: 'Balance deduction failed.' });
-    }
-
-    const payouts = intasend.payouts();
-    const apiRef = withdrawalDocRef.id;
-
-    const payoutResponse = await payouts.b2c({
+    const payoutResponse = await intasend.payouts().b2c({
       phone_number: phoneNumber,
       amount: netPayoutAmount,
-      api_ref: apiRef,
-      host: process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com",
+      api_ref: withdrawalDocRef.id,
+      host: BACKEND_HOST,
     });
 
     await withdrawalDocRef.update({
@@ -262,48 +217,42 @@ app.post('/api/seller/withdraw', async (req, res) => {
       intasendResponse: payoutResponse,
     });
 
-    res.status(200).json({
+    res.json({
       success: true,
-      message: 'Withdrawal initiated successfully.',
+      message: 'Withdrawal initiated',
       data: { requestedAmount: amount, fee: feeAmount, netPayout: netPayoutAmount, trackingId: payoutResponse.tracking_id }
     });
-
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Withdrawal failed.', error: error.message });
+    console.error('Withdrawal Error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// Update stock
+// --- Update Stock ---
 app.post('/api/update-stock', async (req, res) => {
   try {
     const { productId, quantity } = req.body;
-
     if (!productId || typeof quantity !== 'number' || quantity <= 0) {
-      return res.status(400).json({ success: false, message: 'Invalid product ID or quantity.' });
+      return res.status(400).json({ success: false, message: 'Invalid product or quantity.' });
     }
 
     const productRef = db.collection('products').doc(productId);
-
-    await db.runTransaction(async (transaction) => {
-      const doc = await transaction.get(productRef);
-      if (!doc.exists) return res.status(404).json({ success: false, message: 'Product not found.' });
-
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(productRef);
+      if (!doc.exists) throw new Error('Product not found');
       const currentQuantity = doc.data().quantity || 0;
-      const newQuantity = currentQuantity - quantity;
-      if (newQuantity < 0) return res.status(400).json({ success: false, message: 'Not enough stock.' });
-
-      transaction.update(productRef, { quantity: newQuantity });
+      if (currentQuantity < quantity) throw new Error('Not enough stock');
+      t.update(productRef, { quantity: currentQuantity - quantity });
     });
 
-    res.status(200).json({ success: true, message: 'Stock updated successfully.' });
+    res.json({ success: true, message: 'Stock updated successfully.' });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to update stock.', error: error.message });
+    console.error('Stock update failed:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
 // ============================
 // Start Server
 // ============================
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
