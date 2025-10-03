@@ -1,14 +1,12 @@
 // server.js
-// Express backend for Campus Store
-// Handles STK push, withdrawals, stock updates, and callbacks
+// Express backend for Campus Store with STK push, withdrawals, stock updates, and IntaSend payouts
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
-const IntaSend = require("intasend-node");
-const { Payouts } = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const fetch = require("node-fetch"); // for calling IntaSend REST APIs
 
 dotenv.config();
 
@@ -21,10 +19,10 @@ const PORT = process.env.PORT || 3001;
 const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "https://localhost",
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
-  "https://localhost",
 ];
 
 app.use(
@@ -89,17 +87,6 @@ try {
 
 const db = admin.firestore();
 
-// ============================
-// IntaSend init
-// ============================
-const intasend = new IntaSend(
-  process.env.INTASEND_PUBLISHABLE_KEY,
-  process.env.INTASEND_SECRET_KEY,
-  false
-);
-
-const payoutsAPI = new Payouts(process.env.INTASEND_SECRET_KEY, false);
-
 const BACKEND_HOST =
   process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com";
 
@@ -126,136 +113,23 @@ function sendServerError(res, err, msg = "Internal server error") {
 // Routes
 // ============================
 
-// ✅ STK Push
-app.post("/api/stk-push", async (req, res) => {
-  try {
-    const { amount, phoneNumber, fullName, email, orderId } = req.body;
-
-    const amt = parsePositiveNumber(amount);
-    if (!amt)
-      return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid phone number format" });
-    if (!fullName)
-      return res.status(400).json({ success: false, message: "Full name required" });
-    if (!email || !email.includes("@"))
-      return res.status(400).json({ success: false, message: "Invalid email" });
-    if (!orderId)
-      return res.status(400).json({ success: false, message: "Missing orderId" });
-
-    const [firstName, ...rest] = fullName.trim().split(" ");
-    const lastName = rest.join(" ") || "N/A";
-
-    let response;
-    try {
-      response = await intasend.collection().mpesaStkPush({
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        phone_number: phoneNumber,
-        amount: amt,
-        host: BACKEND_HOST,
-        api_ref: orderId,
-      });
-    } catch (intasendErr) {
-      console.error(
-        "❌ IntaSend STK Push failed:",
-        intasendErr?.response || intasendErr
-      );
-      return res
-        .status(502)
-        .json({ success: false, message: "Payment provider error" });
-    }
-
-    await db.collection("orders").doc(orderId).set(
-      {
-        invoiceId: response?.invoice?.invoice_id || null,
-        status: "STK_PUSH_SENT",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return res.json({ success: true, data: response });
-  } catch (error) {
-    return sendServerError(res, error, "STK Push failed");
-  }
-});
-
-// ✅ IntaSend callback
-app.post("/api/intasend-callback", async (req, res) => {
-  try {
-    const { api_ref, state, mpesa_reference } = req.body;
-    if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
-
-    let status = "pending";
-    if (state === "COMPLETE") status = "paid";
-    if (["FAILED", "CANCELLED"].includes(state)) status = "failed";
-
-    await db.collection("orders").doc(api_ref).set(
-      {
-        paymentStatus: status,
-        mpesaReference: mpesa_reference || null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return res.send("OK");
-  } catch (error) {
-    return sendServerError(res, error, "IntaSend callback failed");
-  }
-});
-
-// ✅ Transaction lookup
-app.get("/api/transaction/:invoiceId", async (req, res) => {
-  try {
-    const invoiceId = req.params.invoiceId;
-    if (!invoiceId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing invoiceId" });
-
-    const docs = await db
-      .collection("orders")
-      .where("invoiceId", "==", invoiceId)
-      .get();
-
-    if (docs.empty)
-      return res
-        .status(404)
-        .json({ success: false, message: "Transaction not found" });
-
-    return res.json({ success: true, data: docs.docs[0].data() });
-  } catch (error) {
-    return sendServerError(res, error, "Transaction lookup failed");
-  }
-});
-
-// ✅ Seller Withdrawal (fixed)
+// ✅ Seller Withdrawal
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
 
     console.log("📤 Withdrawal Request:", req.body);
 
-    if (!sellerId)
-      return res.status(400).json({ success: false, message: "Missing sellerId" });
+    if (!sellerId) return res.status(400).json({ success: false, message: "Missing sellerId" });
 
     const amount = parsePositiveNumber(requestedAmount);
-    if (!amount)
-      return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!amount) return res.status(400).json({ success: false, message: "Invalid amount" });
     if (!isValidPhone(phoneNumber))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid phone number" });
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
 
     const userRef = db.collection("users").doc(sellerId);
     const userDoc = await userRef.get();
-    if (!userDoc.exists)
-      return res.status(404).json({ success: false, message: "Seller not found" });
+    if (!userDoc.exists) return res.status(404).json({ success: false, message: "Seller not found" });
 
     const currentRevenue = parseFloat(userDoc.data()?.revenue || 0);
     console.log(`💰 Seller ${sellerId} available revenue: ${currentRevenue}`);
@@ -269,8 +143,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
       const balance = parseFloat(snap.data().revenue || 0);
-      if (balance < amount)
-        throw new Error("Insufficient balance in transaction");
+      if (balance < amount) throw new Error("Insufficient balance in transaction");
 
       t.update(userRef, {
         revenue: +(balance - amount).toFixed(2),
@@ -288,35 +161,40 @@ app.post("/api/seller/withdraw", async (req, res) => {
       });
     });
 
-    // ✅ Correct IntaSend payout API
+    // ✅ IntaSend Payout API via fetch
+    const payoutPayload = {
+      currency: "KES",
+      transactions: [
+        {
+          name: userDoc.data()?.name || "Seller",
+          account: phoneNumber,
+          amount: netPayoutAmount,
+        },
+      ],
+    };
+
     let payoutResponse;
     try {
-      payoutResponse = await payoutsAPI.create({
-        currency: "KES",
-        transactions: [
-          {
-            name: userDoc.data()?.name || "Seller",
-            account: phoneNumber,
-            amount: netPayoutAmount,
-          },
-        ],
+      const resp = await fetch("https://payment.intasend.com/api/v1/send-money/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.INTASEND_SECRET_KEY}`,
+        },
+        body: JSON.stringify(payoutPayload),
       });
+      payoutResponse = await resp.json();
+      if (!resp.ok) {
+        throw new Error(payoutResponse.message || "Payout API error");
+      }
     } catch (intasendErr) {
-      console.error(
-        "❌ IntaSend payout failed:",
-        intasendErr?.response || intasendErr
-      );
+      console.error("❌ IntaSend payout failed:", intasendErr);
       await withdrawalDocRef.update({
         status: "PAYOUT_FAILED",
-        intasendError:
-          intasendErr?.response ||
-          intasendErr?.message ||
-          String(intasendErr),
+        intasendError: intasendErr.message || String(intasendErr),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      return res
-        .status(502)
-        .json({ success: false, message: "Payout provider error" });
+      return res.status(502).json({ success: false, message: "Payout provider error" });
     }
 
     await withdrawalDocRef.update({
@@ -343,41 +221,13 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
-// ✅ Stock update
-app.post("/api/update-stock", async (req, res) => {
-  try {
-    const { productId, quantity } = req.body;
-    if (!productId || typeof quantity !== "number" || quantity <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid product or quantity" });
-    }
-
-    const productRef = db.collection("products").doc(productId);
-    await db.runTransaction(async (t) => {
-      const doc = await t.get(productRef);
-      if (!doc.exists) throw new Error("Product not found");
-      const currentQuantity = doc.data().quantity || 0;
-      if (currentQuantity < quantity) throw new Error("Not enough stock");
-      t.update(productRef, { quantity: currentQuantity - quantity });
-    });
-
-    return res.json({ success: true, message: "Stock updated successfully" });
-  } catch (error) {
-    console.error("❌ Stock update failed:", error);
-    return sendServerError(res, error, "Stock update failed");
-  }
-});
-
-// ✅ Health check
-app.get("/_health", (req, res) =>
-  res.json({ ok: true, timestamp: Date.now() })
-);
+// ============================
+// Health check
+// ============================
+app.get("/_health", (req, res) => res.json({ ok: true, timestamp: Date.now() }));
 
 // 404 fallback
-app.use((req, res) =>
-  res.status(404).json({ success: false, message: "Not Found" })
-);
+app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
 
 // ============================
 // Start server
