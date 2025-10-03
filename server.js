@@ -213,7 +213,7 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ Seller Withdrawal (Revenue - Past Withdrawals)
+// ✅ Seller Withdrawal (LIVE from orders + IntaSend B2C)
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -243,22 +243,9 @@ app.post("/api/seller/withdraw", async (req, res) => {
       }
     });
 
-    // 🔎 Subtract past withdrawals
-    const withdrawalsSnap = await db.collection("withdrawals")
-      .where("sellerId", "==", sellerId)
-      .where("status", "in", ["PAYOUT_INITIATED", "PAYOUT_COMPLETE"])
-      .get();
+    console.log(`💰 Seller ${sellerId} live revenue: ${totalRevenue}`);
 
-    let totalWithdrawn = 0;
-    withdrawalsSnap.forEach(doc => {
-      const w = doc.data();
-      totalWithdrawn += w.requestedAmount || 0;
-    });
-
-    const availableBalance = totalRevenue - totalWithdrawn;
-    console.log(`💰 Seller ${sellerId} available balance: ${availableBalance}`);
-
-    if (availableBalance < amount)
+    if (totalRevenue < amount)
       return res.status(400).json({ success: false, message: "Insufficient balance" });
 
     const feeAmount = +(amount * WITHDRAWAL_FEE_RATE).toFixed(2);
