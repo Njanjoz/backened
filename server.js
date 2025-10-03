@@ -1,5 +1,5 @@
 // server.js
-// Express backend for Campus Store with live order-based withdrawal check
+// Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -22,7 +22,7 @@ const allowedOrigins = [
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
-  "https://localhost"
+  "https://localhost",
 ];
 
 app.use(
@@ -49,7 +49,6 @@ app.use(
 // ============================
 app.use(bodyParser.json());
 
-// Simple logger
 app.use((req, res, next) => {
   console.log(
     `${new Date().toISOString()} → ${req.method} ${req.originalUrl}`,
@@ -66,7 +65,6 @@ const requiredEnv = [
   "INTASEND_SECRET_KEY",
   "FIREBASE_SERVICE_ACCOUNT_KEY",
 ];
-
 const missing = requiredEnv.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error("❌ Missing env vars:", missing.join(", "));
@@ -215,7 +213,7 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ Seller Withdrawal (LIVE from orders)
+// ✅ Seller Withdrawal (LIVE from orders + IntaSend B2C)
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -227,7 +225,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
     if (!isValidPhone(phoneNumber))
       return res.status(400).json({ success: false, message: "Invalid phone number" });
 
-    // 🔎 Calculate seller revenue live from orders
+    // 🔎 Calculate seller revenue live from paid orders
     const ordersSnap = await db.collection("orders")
       .where("involvedSellerIds", "array-contains", sellerId)
       .where("paymentStatus", "==", "paid")
@@ -253,7 +251,6 @@ app.post("/api/seller/withdraw", async (req, res) => {
     const feeAmount = +(amount * WITHDRAWAL_FEE_RATE).toFixed(2);
     const netPayoutAmount = +(amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2);
 
-    // Create withdrawal record
     const withdrawalDocRef = db.collection("withdrawals").doc();
     await withdrawalDocRef.set({
       sellerId,
@@ -265,17 +262,18 @@ app.post("/api/seller/withdraw", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // ⚡ Try IntaSend payout
+    // ⚡ IntaSend B2C payout
     let payoutResponse;
     try {
-      payoutResponse = await intasend.payouts().create({
+      payoutResponse = await intasend.payouts().mpesa({
         currency: "KES",
-        recipients: [
+        requires_approval: "NO",
+        transactions: [
           {
-            name: "Seller Payout",
+            name: "Seller Withdrawal",
             account: phoneNumber,
             amount: netPayoutAmount,
-            narrative: "Seller Withdrawal",
+            narrative: "Seller Payout",
           },
         ],
       });
@@ -290,9 +288,10 @@ app.post("/api/seller/withdraw", async (req, res) => {
     }
 
     await withdrawalDocRef.update({
-      trackingId: payoutResponse.tracking_id || null,
+      trackingId: payoutResponse?.tracking_id || null,
       status: "PAYOUT_INITIATED",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      intasendResponse: payoutResponse,
     });
 
     return res.json({
@@ -302,7 +301,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
         requestedAmount: amount,
         fee: feeAmount,
         netPayout: netPayoutAmount,
-        trackingId: payoutResponse.tracking_id || null,
+        trackingId: payoutResponse?.tracking_id || null,
         withdrawalId: withdrawalDocRef.id,
       },
     });
