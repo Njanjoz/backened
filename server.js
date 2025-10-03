@@ -20,6 +20,7 @@ const PORT = process.env.PORT || 3001;
 const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "https://localhost",
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
@@ -28,7 +29,7 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
+      if (!origin) return callback(null, true); // allow tools/Postman
       if (allowedOrigins.includes(origin)) return callback(null, true);
       if (
         origin.startsWith("http://localhost") ||
@@ -49,7 +50,6 @@ app.use(
 // ============================
 app.use(bodyParser.json());
 
-// Simple request logger
 app.use((req, res, next) => {
   console.log(
     `${new Date().toISOString()} → ${req.method} ${req.originalUrl}`,
@@ -66,7 +66,6 @@ const requiredEnv = [
   "INTASEND_SECRET_KEY",
   "FIREBASE_SERVICE_ACCOUNT_KEY",
 ];
-
 const missing = requiredEnv.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error("❌ Missing env vars:", missing.join(", "));
@@ -84,7 +83,6 @@ try {
   console.error("❌ Firebase Admin init failed:", e);
   process.exit(1);
 }
-
 const db = admin.firestore();
 
 // ============================
@@ -95,15 +93,14 @@ const intasend = new IntaSend(
   process.env.INTASEND_SECRET_KEY,
   false
 );
-
 const BACKEND_HOST =
   process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com";
+
+const WITHDRAWAL_FEE_RATE = 0.055;
 
 // ============================
 // Helpers
 // ============================
-const WITHDRAWAL_FEE_RATE = 0.055;
-
 function isValidPhone(phone) {
   return typeof phone === "string" && /^(2547|2541)\d{8}$/.test(phone);
 }
@@ -119,7 +116,7 @@ function sendServerError(res, err, msg = "Internal server error") {
 }
 
 // ============================
-// Routes
+// ROUTES
 // ============================
 
 // ✅ STK Push
@@ -215,11 +212,10 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ Seller Withdrawal
+// ✅ Seller Withdrawal (FIXED: uses paid orders)
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
-
     console.log("📤 Withdrawal Request:", req.body);
 
     if (!sellerId) return res.status(400).json({ success: false, message: "Missing sellerId" });
@@ -229,39 +225,51 @@ app.post("/api/seller/withdraw", async (req, res) => {
     if (!isValidPhone(phoneNumber))
       return res.status(400).json({ success: false, message: "Invalid phone number" });
 
-    const userRef = db.collection("users").doc(sellerId);
-    const userDoc = await userRef.get();
-    if (!userDoc.exists) return res.status(404).json({ success: false, message: "Seller not found" });
+    // 🔎 Calculate seller balance from PAID orders
+    const ordersSnap = await db
+      .collection("orders")
+      .where("involvedSellerIds", "array-contains", sellerId)
+      .where("paymentStatus", "==", "paid")
+      .get();
 
-    const currentRevenue = parseFloat(userDoc.data()?.revenue || 0);
-    if (currentRevenue < amount)
-      return res.status(400).json({ success: false, message: "Insufficient balance" });
+    let totalSellerRevenue = 0;
+    ordersSnap.forEach((doc) => {
+      const order = doc.data();
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach((item) => {
+          if (item.sellerId === sellerId) {
+            totalSellerRevenue += item.price * item.quantity;
+          }
+        });
+      }
+    });
 
-    const withdrawalDocRef = db.collection("withdrawals").doc();
+    console.log(`💰 Seller ${sellerId} available revenue: ${totalSellerRevenue}`);
+
+    if (totalSellerRevenue < amount) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient balance. You only have ${totalSellerRevenue} available.`,
+      });
+    }
+
+    // Apply fee
     const feeAmount = +(amount * WITHDRAWAL_FEE_RATE).toFixed(2);
     const netPayoutAmount = +(amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2);
 
-    await db.runTransaction(async (t) => {
-      const snap = await t.get(userRef);
-      const balance = parseFloat(snap.data().revenue || 0);
-      if (balance < amount) throw new Error("Insufficient balance in transaction");
-
-      t.update(userRef, {
-        revenue: +(balance - amount).toFixed(2),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      t.set(withdrawalDocRef, {
-        sellerId,
-        requestedAmount: amount,
-        feeAmount,
-        netPayoutAmount,
-        phoneNumber,
-        status: "PENDING_PAYOUT",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+    // Record withdrawal
+    const withdrawalDocRef = db.collection("withdrawals").doc();
+    await withdrawalDocRef.set({
+      sellerId,
+      requestedAmount: amount,
+      feeAmount,
+      netPayoutAmount,
+      phoneNumber,
+      status: "PENDING_PAYOUT",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // IntaSend payout
     let payoutResponse;
     try {
       payoutResponse = await intasend.payouts().b2c({
@@ -274,7 +282,8 @@ app.post("/api/seller/withdraw", async (req, res) => {
       console.error("❌ IntaSend payout failed:", intasendErr?.response || intasendErr);
       await withdrawalDocRef.update({
         status: "PAYOUT_FAILED",
-        intasendError: intasendErr?.response || intasendErr?.message || String(intasendErr),
+        intasendError:
+          intasendErr?.response || intasendErr?.message || String(intasendErr),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.status(502).json({ success: false, message: "Payout provider error" });
