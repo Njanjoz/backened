@@ -98,9 +98,15 @@ const BACKEND_HOST =
   process.env.RENDER_BACKEND_URL || "https://backened-lt67.onrender.com";
 
 // ============================
-// Helpers
+// Fee Constants & Helpers (UPDATED)
 // ============================
-const WITHDRAWAL_FEE_RATE = 0.055;
+const CONSTANT_WITHDRAWAL_FEE = 20.00; // Fixed KSH 20 fee
+const AGENCY_FEE_RATE = 0.05; // 5% agency fee
+
+function calculateTotalFee(amount) {
+  const percentageFee = amount * AGENCY_FEE_RATE;
+  return +(percentageFee + CONSTANT_WITHDRAWAL_FEE).toFixed(2);
+}
 
 function isValidPhone(phone) {
   return typeof phone === "string" && /^(2547|2541)\d{8}$/.test(phone);
@@ -225,6 +231,11 @@ app.post("/api/seller/withdraw", async (req, res) => {
     if (!isValidPhone(phoneNumber))
       return res.status(400).json({ success: false, message: "Invalid phone number" });
 
+    // Check if amount is too low to cover the constant fee
+    if (amount <= CONSTANT_WITHDRAWAL_FEE) {
+        return res.status(400).json({ success: false, message: `Requested amount must be greater than the fixed fee of KSH ${CONSTANT_WITHDRAWAL_FEE.toFixed(2)}.` });
+    }
+
     // 🔎 Calculate seller revenue live from paid orders
     const ordersSnap = await db.collection("orders")
       .where("involvedSellerIds", "array-contains", sellerId)
@@ -243,13 +254,31 @@ app.post("/api/seller/withdraw", async (req, res) => {
       }
     });
 
-    console.log(`💰 Seller ${sellerId} live revenue: ${totalRevenue}`);
+    // 💸 Fetch total previously withdrawn amount from ledger (FIXED LOGIC)
+    let totalPreviouslyWithdrawn = 0;
+    const sellerLedgerRef = db.collection("sellerLedgers").doc(sellerId);
+    const ledgerSnap = await sellerLedgerRef.get();
+    if (ledgerSnap.exists) {
+        totalPreviouslyWithdrawn = ledgerSnap.data().totalWithdrawn || 0;
+    }
 
-    if (totalRevenue < amount)
+    const netAvailableRevenue = totalRevenue - totalPreviouslyWithdrawn;
+
+    console.log(`💰 Seller ${sellerId} live total revenue: ${totalRevenue.toFixed(2)}`);
+    console.log(`💸 Total previously withdrawn: ${totalPreviouslyWithdrawn.toFixed(2)}`);
+    console.log(`✅ Net available balance: ${netAvailableRevenue.toFixed(2)}`);
+
+    if (netAvailableRevenue < amount)
       return res.status(400).json({ success: false, message: "Insufficient balance" });
 
-    const feeAmount = +(amount * WITHDRAWAL_FEE_RATE).toFixed(2);
-    const netPayoutAmount = +(amount * (1 - WITHDRAWAL_FEE_RATE)).toFixed(2);
+    // ⚡ NEW FEE CALCULATION
+    const feeAmount = calculateTotalFee(amount);
+    const netPayoutAmount = +(amount - feeAmount).toFixed(2);
+    
+    // Check if the withdrawal is feasible after fees
+    if (netPayoutAmount <= 0) {
+        return res.status(400).json({ success: false, message: `Net payout is KSH 0.00 or less after the KSH ${feeAmount.toFixed(2)} fee. Increase the withdrawal amount.` });
+    }
 
     const withdrawalDocRef = db.collection("withdrawals").doc();
     await withdrawalDocRef.set({
@@ -293,6 +322,14 @@ app.post("/api/seller/withdraw", async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       intasendResponse: payoutResponse,
     });
+    
+    // 🔥 CRITICAL FIX: ATOMICALLY UPDATE THE SELLER LEDGER
+    const withdrawalAmountGross = amount;
+    await db.collection("sellerLedgers").doc(sellerId).set({
+        totalWithdrawn: admin.firestore.FieldValue.increment(withdrawalAmountGross),
+        lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
 
     return res.json({
       success: true,
