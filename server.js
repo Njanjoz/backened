@@ -185,6 +185,9 @@ app.post("/api/stk-push", async (req, res) => {
         amount: amt,
         host: BACKEND_HOST,
         api_ref: orderId,
+        // *** MODIFICATION: Added the narrative for the STK Push prompt ***
+        narrative: "MarketMixKenya",
+        // ***************************************************************
       });
     } catch (intasendErr) {
       console.error(
