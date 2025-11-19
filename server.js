@@ -174,10 +174,6 @@ app.post("/api/stk-push", async (req, res) => {
 
     const [firstName, ...rest] = fullName.trim().split(" ");
     const lastName = rest.join(" ") || "N/A";
-    
-    // *** CHANGE 1: Create a branded api_ref (Account Reference) ***
-    const apiReference = `MMK-${orderId}`; 
-    // ***************************************************************
 
     let response;
     try {
@@ -188,10 +184,7 @@ app.post("/api/stk-push", async (req, res) => {
         phone_number: phoneNumber,
         amount: amt,
         host: BACKEND_HOST,
-        api_ref: apiReference, // Now displays MMK-orderId
-        // *** CHANGE 2: Set the narrative (Description) to your full brand name ***
-        narrative: "MarketMix Kenya Payment", 
-        // *************************************************************************
+        api_ref: orderId,
       });
     } catch (intasendErr) {
       console.error(
@@ -224,15 +217,11 @@ app.post("/api/intasend-callback", async (req, res) => {
     const { api_ref, state, mpesa_reference } = req.body;
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
 
-    // *** CHANGE 3: Safely extract the original orderId from the prefixed api_ref ***
-    const orderId = api_ref.startsWith("MMK-") ? api_ref.substring(4) : api_ref;
-    // *******************************************************************************
-
     let status = "pending";
     if (state === "COMPLETE") status = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) status = "failed";
 
-    await db.collection("orders").doc(orderId).set(
+    await db.collection("orders").doc(api_ref).set(
       {
         paymentStatus: status,
         mpesaReference: mpesa_reference || null,
