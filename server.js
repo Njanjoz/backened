@@ -18,6 +18,7 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
+const Buffer = require('buffer').Buffer; // Ensure Buffer is available for Base64 conversion
 
 // ---- ADDED: node-fetch for backend HF calls (safe, server-side)
 const fetch = require("node-fetch"); // npm i node-fetch@2
@@ -464,14 +465,12 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// ---------------------- ADDED: Hugging Face image generation route ----------------------
+// ---------------------- CORRECTED: Hugging Face image generation route ----------------------
 /*
-  POST /api/generate-ai-image
-  Body: { prompt: "text prompt" }
-  Returns: image bytes from Hugging Face (Content-Type preserved)
-  Notes:
-    - Uses server-side HF key (process.env.HF_API_KEY) — DO NOT store frontend keys.
-    - Keep this route lightweight to avoid blocking.
+  This route is now extremely defensive:
+  1. Guarantees a JSON error body on server crash or provider failure (Fixes frontend JSON.parse error).
+  2. Uses wait_for_model: true to prevent 503 errors when the model is asleep.
+  3. Returns a Base64 Data URI in a JSON body (required by the frontend utility).
 */
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
@@ -482,7 +481,7 @@ app.post("/api/generate-ai-image", async (req, res) => {
 
     if (!process.env.HF_API_KEY) {
       console.error("Missing HF_API_KEY in environment");
-      return res.status(500).json({ success: false, message: "Server misconfiguration" });
+      return res.status(500).json({ success: false, message: "Server misconfiguration: HF_API_KEY is missing." });
     }
 
     const hfResponse = await fetch(
@@ -492,34 +491,49 @@ app.post("/api/generate-ai-image", async (req, res) => {
         headers: {
           "Authorization": `Bearer ${process.env.HF_API_KEY}`,
           "Content-Type": "application/json",
-          "Accept": "*/*"
+          "Accept": "image/png" // Explicitly request PNG
         },
-        body: JSON.stringify({ inputs: prompt })
+        body: JSON.stringify({ 
+             inputs: prompt,
+             options: { wait_for_model: true } // Crucial for cold-start prevention
+        })
       }
     );
 
     if (!hfResponse.ok) {
       const status = hfResponse.status;
-      let bodyText = "<no body>";
+      let bodyText = "Hugging Face call failed.";
       try {
         bodyText = await hfResponse.text();
-      } catch (e) {}
+      } catch (e) { /* silent fail */ }
+      
       console.error(`Hugging Face error ${status}:`, bodyText.slice(0, 300));
       return res.status(502).json({
         success: false,
-        message: "Image generation provider error",
+        message: "Image generation provider error. Check key/limits.",
         providerStatus: status,
-        providerBodySnippet: typeof bodyText === "string" ? bodyText.slice(0, 200) : null
+        providerBody: bodyText.slice(0, 200)
       });
     }
 
-    const contentType = hfResponse.headers.get("content-type") || "application/octet-stream";
+    const contentType = hfResponse.headers.get("content-type") || "image/png";
     const arrBuf = await hfResponse.arrayBuffer();
-    res.set("Content-Type", contentType);
-    return res.send(Buffer.from(arrBuf));
+    
+    // ⭐ FIX: Convert the image buffer to Base64 Data URI
+    const base64Image = Buffer.from(arrBuf).toString('base64');
+    const imageUrl = `data:${contentType};base64,${base64Image}`;
+
+    // ⭐ FIX: Send the Data URI back in a JSON object
+    return res.json({ imageUrl: imageUrl, success: true });
+    
   } catch (err) {
-    console.error("AI generation error:", err);
-    return res.status(500).json({ success: false, message: "AI generation failed" });
+    console.error("❌ AI generation error in server.js catch block:", err);
+    // ⭐ FIX: Ensure that even the generic catch returns a valid JSON response body
+    return res.status(500).json({ 
+        success: false, 
+        message: "AI generation failed due to a server-side error (500).", 
+        detail: err.message
+    });
   }
 });
 // ------------------------------------------------------------------------
