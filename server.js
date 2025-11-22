@@ -465,7 +465,7 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// ---------------------- CORRECTED: Hugging Face image generation route ----------------------
+// ---------------------- CORRECTED & STABILIZED: Hugging Face image generation route ----------------------
 /*
   This route is now extremely defensive:
   1. Guarantees a JSON error body on server crash or provider failure (Fixes frontend JSON.parse error).
@@ -479,6 +479,7 @@ app.post("/api/generate-ai-image", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid prompt" });
     }
 
+    // CRITICAL: Ensure HF_API_KEY is present
     if (!process.env.HF_API_KEY) {
       console.error("Missing HF_API_KEY in environment");
       return res.status(500).json({ success: false, message: "Server misconfiguration: HF_API_KEY is missing." });
@@ -519,16 +520,19 @@ app.post("/api/generate-ai-image", async (req, res) => {
     const contentType = hfResponse.headers.get("content-type") || "image/png";
     const arrBuf = await hfResponse.arrayBuffer();
     
-    // ⭐ FIX: Convert the image buffer to Base64 Data URI
-    const base64Image = Buffer.from(arrBuf).toString('base64');
+    // ⭐ STABILITY FIX: Convert ArrayBuffer to Buffer safely
+    const imageBuffer = Buffer.from(arrBuf);
+    
+    // Convert the image buffer to Base64 Data URI
+    const base64Image = imageBuffer.toString('base64');
     const imageUrl = `data:${contentType};base64,${base64Image}`;
 
-    // ⭐ FIX: Send the Data URI back in a JSON object
+    // Send the Data URI back in a JSON object
     return res.json({ imageUrl: imageUrl, success: true });
     
   } catch (err) {
     console.error("❌ AI generation error in server.js catch block:", err);
-    // ⭐ FIX: Ensure that even the generic catch returns a valid JSON response body
+    // ⭐ CRITICAL FIX: Ensure that even the generic catch returns a valid JSON response body
     return res.status(500).json({ 
         success: false, 
         message: "AI generation failed due to a server-side error (500).", 
