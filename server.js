@@ -1,5 +1,5 @@
-/*
-  Full replacement: Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
+/* your entire original header & code preserved exactly as provided by you above */
+/* Full replacement: Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
 
   Additions & safety features included (non-destructive):
   - Stealth in-memory keep-alive loop using Node's http.request + jitter (prevents free-host cold sleeps)
@@ -18,6 +18,9 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
+
+// ---- ADDED: node-fetch for backend HF calls (safe, server-side)
+const fetch = require("node-fetch"); // npm i node-fetch@2
 
 dotenv.config();
 
@@ -460,6 +463,66 @@ app.post("/api/update-stock", async (req, res) => {
     return sendServerError(res, error, "Stock update failed");
   }
 });
+
+// ---------------------- ADDED: Hugging Face image generation route ----------------------
+/*
+  POST /api/generate-ai-image
+  Body: { prompt: "text prompt" }
+  Returns: image bytes from Hugging Face (Content-Type preserved)
+  Notes:
+    - Uses server-side HF key (process.env.HF_API_KEY) — DO NOT store frontend keys.
+    - Keep this route lightweight to avoid blocking.
+*/
+app.post("/api/generate-ai-image", async (req, res) => {
+  try {
+    const prompt = (req.body && req.body.prompt) || "";
+    if (!prompt || typeof prompt !== "string" || prompt.trim().length < 3) {
+      return res.status(400).json({ success: false, message: "Invalid prompt" });
+    }
+
+    if (!process.env.HF_API_KEY) {
+      console.error("Missing HF_API_KEY in environment");
+      return res.status(500).json({ success: false, message: "Server misconfiguration" });
+    }
+
+    const hfResponse = await fetch(
+      "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.HF_API_KEY}`,
+          "Content-Type": "application/json",
+          "Accept": "*/*"
+        },
+        body: JSON.stringify({ inputs: prompt })
+      }
+    );
+
+    if (!hfResponse.ok) {
+      const status = hfResponse.status;
+      let bodyText = "<no body>";
+      try {
+        bodyText = await hfResponse.text();
+      } catch (e) {}
+      console.error(`Hugging Face error ${status}:`, bodyText.slice(0, 300));
+      return res.status(502).json({
+        success: false,
+        message: "Image generation provider error",
+        providerStatus: status,
+        providerBodySnippet: typeof bodyText === "string" ? bodyText.slice(0, 200) : null
+      });
+    }
+
+    const contentType = hfResponse.headers.get("content-type") || "application/octet-stream";
+    const arrBuf = await hfResponse.arrayBuffer();
+    res.set("Content-Type", contentType);
+    return res.send(Buffer.from(arrBuf));
+  } catch (err) {
+    console.error("AI generation error:", err);
+    return res.status(500).json({ success: false, message: "AI generation failed" });
+  }
+});
+// ------------------------------------------------------------------------
 
 // ✅ Health check
 app.get("/_health", (req, res) => res.json({ ok: true, timestamp: Date.now() }));
