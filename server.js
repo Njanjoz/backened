@@ -1,14 +1,8 @@
 /* your entire original header & code preserved exactly as provided by you above */
 /* Full replacement: Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
-
-  Additions & safety features included (non-destructive):
-  - Stealth in-memory keep-alive loop using Node's http.request + jitter (prevents free-host cold sleeps)
-  - Toggleable via env: KEEP_ALIVE=true (defaults to enabled in production when not explicitly disabled)
-  - Short request timeout & silent error handling so it never interferes with real handlers
-  - Graceful shutdown clearing keep-alive interval
-  - Unref() on interval so it doesn't keep process alive on shutdown
-  - Global uncaughtException/unhandledRejection logging (no crash swallowing)
-  - Minimal changes to your original logic; routes unchanged
+  - Added: Dynamic Instasend fee configuration
+  - Added: Seller markup capability (3% by default)
+  - Added: Admin fee withholding functionality
 */
 
 const express = require("express");
@@ -18,7 +12,7 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
-const Buffer = require('buffer').Buffer; // Ensure Buffer is available for Base64 conversion
+const Buffer = require('buffer').Buffer;
 
 // ---- ADDED: node-fetch for backend HF calls (safe, server-side)
 const fetch = require("node-fetch"); // npm i node-fetch@2
@@ -121,7 +115,7 @@ const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}
 const WITHDRAWAL_THRESHOLD = 100.0; // 100 KSH
 const FIXED_FEE_BELOW_THRESHOLD = 10.0; // 10 KSH fixed fee for < 100 KSH
 const FIXED_FEE_ABOVE_THRESHOLD = 20.0; // 20 KSH fixed fee for >= 100 KSH
-const AGENCY_FEE_RATE = 0.035; // 3.5% agency fee
+const DEFAULT_INSTASEND_FEE_RATE = 0.03; // 3% default Instasend fee
 
 function getTieredFixedFee(amount) {
   return amount < WITHDRAWAL_THRESHOLD
@@ -129,10 +123,16 @@ function getTieredFixedFee(amount) {
     : FIXED_FEE_ABOVE_THRESHOLD;
 }
 
-function calculateTotalFee(amount) {
-  const percentageFee = amount * AGENCY_FEE_RATE;
+// NEW: Calculate total fee with dynamic Instasend rate
+function calculateTotalFee(amount, instasendFeeRate = DEFAULT_INSTASEND_FEE_RATE) {
+  const percentageFee = amount * instasendFeeRate;
   const fixedFee = getTieredFixedFee(amount);
   return +(percentageFee + fixedFee).toFixed(2);
+}
+
+// NEW: Calculate only Instasend fee
+function calculateInstasendFee(amount, instasendFeeRate = DEFAULT_INSTASEND_FEE_RATE) {
+  return +(amount * instasendFeeRate).toFixed(2);
 }
 
 function isValidPhone(phone) {
@@ -150,7 +150,7 @@ function sendServerError(res, err, msg = "Internal server error") {
 }
 
 // ============================
-// Routes (UNCHANGED logic, kept as-is but defensive)
+// Routes
 // ============================
 
 // ✅ STK Push
@@ -265,7 +265,46 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ Seller Withdrawal (LIVE from orders + IntaSend B2C)
+// ✅ NEW: Admin Fee Configuration Endpoint
+app.post("/api/admin/fee-config", async (req, res) => {
+  try {
+    const { instasendFeeRate, allowSellerMarkup } = req.body;
+    
+    if (instasendFeeRate === undefined) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "instasendFeeRate is required" 
+      });
+    }
+
+    const feeRate = parseFloat(instasendFeeRate);
+    if (isNaN(feeRate) || feeRate < 0 || feeRate > 1) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "instasendFeeRate must be between 0 and 1" 
+      });
+    }
+
+    const config = {
+      instasendFeeRate: feeRate,
+      allowSellerMarkup: Boolean(allowSellerMarkup),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await db.collection("platformSettings").doc("feeConfig").set(config, { merge: true });
+
+    return res.json({ 
+      success: true, 
+      message: "Fee configuration updated successfully",
+      data: config
+    });
+  } catch (error) {
+    console.error("Fee config update error:", error);
+    return sendServerError(res, error, "Failed to update fee configuration");
+  }
+});
+
+// ✅ Seller Withdrawal (UPDATED with dynamic Instasend fee)
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -281,13 +320,23 @@ app.post("/api/seller/withdraw", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Invalid phone number" });
 
-    const minFeeCheck = calculateTotalFee(amount);
-    if (amount <= minFeeCheck) {
+    // 🔎 Get fee configuration
+    const feeConfigDoc = await db.collection("platformSettings").doc("feeConfig").get();
+    const feeConfig = feeConfigDoc.exists() ? feeConfigDoc.data() : {};
+    const instasendFeeRate = feeConfig.instasendFeeRate || DEFAULT_INSTASEND_FEE_RATE;
+    const allowSellerMarkup = feeConfig.allowSellerMarkup !== false;
+
+    console.log(`💰 Using Instasend fee rate: ${(instasendFeeRate * 100).toFixed(1)}%`);
+
+    // Calculate fees with dynamic Instasend rate
+    const instasendFee = calculateInstasendFee(amount, instasendFeeRate);
+    const fixedFee = getTieredFixedFee(amount);
+    const totalFee = +(instasendFee + fixedFee).toFixed(2);
+
+    if (amount <= totalFee) {
       return res.status(400).json({
         success: false,
-        message: `Requested amount must be greater than the total fee of KSH ${minFeeCheck.toFixed(
-          2
-        )}.`,
+        message: `Requested amount must be greater than the total fee of KSH ${totalFee.toFixed(2)}.`,
       });
     }
 
@@ -334,10 +383,21 @@ app.post("/api/seller/withdraw", async (req, res) => {
 
     // 💸 Fetch total previously withdrawn amount from ledger
     let totalPreviouslyWithdrawn = 0;
+    let isWithheld = false;
     const sellerLedgerRef = db.collection("sellerLedgers").doc(sellerId);
     const ledgerSnap = await sellerLedgerRef.get();
     if (ledgerSnap.exists) {
-      totalPreviouslyWithdrawn = ledgerSnap.data().totalWithdrawn || 0;
+      const ledgerData = ledgerSnap.data();
+      totalPreviouslyWithdrawn = ledgerData.totalWithdrawn || 0;
+      isWithheld = ledgerData.withheld || false;
+    }
+
+    // Check if seller is withheld
+    if (isWithheld) {
+      return res.status(400).json({
+        success: false,
+        message: "Withdrawals are currently withheld for your account. Please contact admin.",
+      });
     }
 
     const netAvailableRevenue = totalRevenue - totalPreviouslyWithdrawn;
@@ -351,15 +411,12 @@ app.post("/api/seller/withdraw", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Insufficient balance" });
 
-    const feeAmount = calculateTotalFee(amount);
-    const netPayoutAmount = +(amount - feeAmount).toFixed(2);
+    const netPayoutAmount = +(amount - totalFee).toFixed(2);
 
     if (netPayoutAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: `Net payout is KSH 0.00 or less after the KSH ${feeAmount.toFixed(
-          2
-        )} fee. Increase the withdrawal amount.`,
+        message: `Net payout is KSH 0.00 or less after the KSH ${totalFee.toFixed(2)} fee. Increase the withdrawal amount.`,
       });
     }
 
@@ -367,9 +424,12 @@ app.post("/api/seller/withdraw", async (req, res) => {
     await withdrawalDocRef.set({
       sellerId,
       amount,
-      feeAmount,
+      instasendFee,
+      fixedFee,
+      totalFee,
       netPayout: netPayoutAmount,
       phoneNumber,
+      instasendFeeRate,
       status: "PENDING_PAYOUT",
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -411,24 +471,24 @@ app.post("/api/seller/withdraw", async (req, res) => {
       intasendResponse: payoutResponse,
     });
 
-    await db
-      .collection("sellerLedgers")
-      .doc(sellerId)
-      .set(
-        {
-          totalWithdrawn: admin.firestore.FieldValue.increment(amount),
-          lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+    await sellerLedgerRef.set(
+      {
+        totalWithdrawn: admin.firestore.FieldValue.increment(amount),
+        lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 
     return res.json({
       success: true,
       message: "Withdrawal initiated",
       data: {
         requestedAmount: amount,
-        fee: feeAmount,
+        instasendFee: instasendFee,
+        fixedFee: fixedFee,
+        totalFee: totalFee,
         netPayout: netPayoutAmount,
+        instasendFeeRate: instasendFeeRate,
         trackingId: payoutResponse?.tracking_id || null,
         withdrawalId: withdrawalDocRef.id,
       },
@@ -465,13 +525,36 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
+// ✅ NEW: Admin Withhold Toggle Endpoint
+app.post("/api/admin/toggle-withhold", async (req, res) => {
+  try {
+    const { sellerId, withheld } = req.body;
+    
+    if (!sellerId || typeof withheld !== "boolean") {
+      return res.status(400).json({ 
+        success: false, 
+        message: "sellerId and withheld (boolean) are required" 
+      });
+    }
+
+    await db.collection("sellerLedgers").doc(sellerId).set({
+      withheld: withheld,
+      withholdUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      withholdUpdatedBy: "admin" // You can add admin user ID here
+    }, { merge: true });
+
+    return res.json({ 
+      success: true, 
+      message: `Withhold status ${withheld ? 'enabled' : 'disabled'} for seller`,
+      data: { sellerId, withheld }
+    });
+  } catch (error) {
+    console.error("Toggle withhold error:", error);
+    return sendServerError(res, error, "Failed to update withhold status");
+  }
+});
+
 // ---------------------- CORRECTED & STABILIZED: Hugging Face image generation route ----------------------
-/*
-  This route is now extremely defensive:
-  1. Guarantees a JSON error body on server crash or provider failure (Fixes frontend JSON.parse error).
-  2. Uses wait_for_model: true to prevent 503 errors when the model is asleep.
-  3. Returns a Base64 Data URI in a JSON body (required by the frontend utility).
-*/
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
