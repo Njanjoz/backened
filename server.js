@@ -1,8 +1,9 @@
-/* your entire original header & code preserved exactly as provided by you above */
 /* Full replacement: Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
   - Added: Dynamic Instasend fee configuration
   - Added: Seller markup capability (3% by default)
   - Added: Admin fee withholding functionality
+  - ⭐ FIXED: Fee calculation logic updated to combine Agency Fee (Dynamic) and Instasend Fee (Static) for alignment with frontend.
+  - ⭐ FIXED: Admin fee config endpoint updated to manage 'agencyFeeRate'.
 */
 
 const express = require("express");
@@ -110,29 +111,18 @@ const intasend = new IntaSend(
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
 
 // ============================
-// Fee Constants & Helpers
+// Fee Constants & Helpers - UPDATED FOR AGENCY + INSTASEND ALIGNMENT
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0; // 100 KSH
 const FIXED_FEE_BELOW_THRESHOLD = 10.0; // 10 KSH fixed fee for < 100 KSH
 const FIXED_FEE_ABOVE_THRESHOLD = 20.0; // 20 KSH fixed fee for >= 100 KSH
-const DEFAULT_INSTASEND_FEE_RATE = 0.03; // 3% default Instasend fee
+const DEFAULT_AGENCY_FEE_RATE = 0.035; // 3.5% Agency default (Dynamic, from DB)
+const INSTASEND_STATIC_FEE_RATE = 0.03; // 3% Instasend fixed charge (Static)
 
 function getTieredFixedFee(amount) {
   return amount < WITHDRAWAL_THRESHOLD
     ? FIXED_FEE_BELOW_THRESHOLD
     : FIXED_FEE_ABOVE_THRESHOLD;
-}
-
-// NEW: Calculate total fee with dynamic Instasend rate
-function calculateTotalFee(amount, instasendFeeRate = DEFAULT_INSTASEND_FEE_RATE) {
-  const percentageFee = amount * instasendFeeRate;
-  const fixedFee = getTieredFixedFee(amount);
-  return +(percentageFee + fixedFee).toFixed(2);
-}
-
-// NEW: Calculate only Instasend fee
-function calculateInstasendFee(amount, instasendFeeRate = DEFAULT_INSTASEND_FEE_RATE) {
-  return +(amount * instasendFeeRate).toFixed(2);
 }
 
 function isValidPhone(phone) {
@@ -265,28 +255,31 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ NEW: Admin Fee Configuration Endpoint
+// ✅ NEW: Admin Fee Configuration Endpoint (UPDATED to use agencyFeeRate)
 app.post("/api/admin/fee-config", async (req, res) => {
   try {
-    const { instasendFeeRate, allowSellerMarkup } = req.body;
+    // ⭐ CHANGE 1: Use agencyFeeRate parameter
+    const { agencyFeeRate, allowSellerMarkup } = req.body;
     
-    if (instasendFeeRate === undefined) {
+    // ⭐ CHANGE 2: Validate agencyFeeRate
+    if (agencyFeeRate === undefined) {
       return res.status(400).json({ 
         success: false, 
-        message: "instasendFeeRate is required" 
+        message: "agencyFeeRate is required" 
       });
     }
 
-    const feeRate = parseFloat(instasendFeeRate);
+    const feeRate = parseFloat(agencyFeeRate);
     if (isNaN(feeRate) || feeRate < 0 || feeRate > 1) {
       return res.status(400).json({ 
         success: false, 
-        message: "instasendFeeRate must be between 0 and 1" 
+        message: "agencyFeeRate must be between 0 and 1" 
       });
     }
 
     const config = {
-      instasendFeeRate: feeRate,
+      // ⭐ CHANGE 3: Set agencyFeeRate in Firestore
+      agencyFeeRate: feeRate, 
       allowSellerMarkup: Boolean(allowSellerMarkup),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
@@ -304,7 +297,7 @@ app.post("/api/admin/fee-config", async (req, res) => {
   }
 });
 
-// ✅ Seller Withdrawal (UPDATED with dynamic Instasend fee)
+// ✅ Seller Withdrawal (UPDATED with correct combined fee calculation)
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -323,15 +316,24 @@ app.post("/api/seller/withdraw", async (req, res) => {
     // 🔎 Get fee configuration
     const feeConfigDoc = await db.collection("platformSettings").doc("feeConfig").get();
     const feeConfig = feeConfigDoc.exists() ? feeConfigDoc.data() : {};
-    const instasendFeeRate = feeConfig.instasendFeeRate || DEFAULT_INSTASEND_FEE_RATE;
-    const allowSellerMarkup = feeConfig.allowSellerMarkup !== false;
+    
+    // ⭐ CHANGE 1: Fetch the dynamic agencyFeeRate
+    const agencyFeeRate = feeConfig.agencyFeeRate || DEFAULT_AGENCY_FEE_RATE; 
+    
+    // ⭐ CHANGE 2: Define the static Instasend fee rate
+    const instasendStaticFeeRate = INSTASEND_STATIC_FEE_RATE; // 0.03
+    const allowSellerMarkup = feeConfig.allowSellerMarkup !== false; // Keep this
 
-    console.log(`💰 Using Instasend fee rate: ${(instasendFeeRate * 100).toFixed(1)}%`);
+    console.log(`💰 Using Agency fee rate: ${(agencyFeeRate * 100).toFixed(1)}%`);
+    console.log(`💰 Using Static Instasend fee rate: ${(instasendStaticFeeRate * 100).toFixed(1)}%`);
 
-    // Calculate fees with dynamic Instasend rate
-    const instasendFee = calculateInstasendFee(amount, instasendFeeRate);
+    // ⭐ CHANGE 3: Calculate the two separate percentage fees
+    const agencyPercentageFee = +(amount * agencyFeeRate).toFixed(2);
+    const instasendPercentageFee = +(amount * instasendStaticFeeRate).toFixed(2);
+    
+    const percentageFee = +(agencyPercentageFee + instasendPercentageFee).toFixed(2); // New combined percentage fee
     const fixedFee = getTieredFixedFee(amount);
-    const totalFee = +(instasendFee + fixedFee).toFixed(2);
+    const totalFee = +(percentageFee + fixedFee).toFixed(2);
 
     if (amount <= totalFee) {
       return res.status(400).json({
@@ -424,12 +426,16 @@ app.post("/api/seller/withdraw", async (req, res) => {
     await withdrawalDocRef.set({
       sellerId,
       amount,
-      instasendFee,
+      // ⭐ CHANGE 4: Save all fees individually
+      agencyPercentageFee,
+      instasendPercentageFee,
+      percentageFee, // combined percentage fee
       fixedFee,
       totalFee,
+      // END CHANGE
       netPayout: netPayoutAmount,
       phoneNumber,
-      instasendFeeRate,
+      agencyFeeRate, // Save the dynamic rate used
       status: "PENDING_PAYOUT",
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -484,11 +490,12 @@ app.post("/api/seller/withdraw", async (req, res) => {
       message: "Withdrawal initiated",
       data: {
         requestedAmount: amount,
-        instasendFee: instasendFee,
+        agencyPercentageFee: agencyPercentageFee,
+        instasendPercentageFee: instasendPercentageFee,
         fixedFee: fixedFee,
         totalFee: totalFee,
         netPayout: netPayoutAmount,
-        instasendFeeRate: instasendFeeRate,
+        agencyFeeRate: agencyFeeRate,
         trackingId: payoutResponse?.tracking_id || null,
         withdrawalId: withdrawalDocRef.id,
       },
