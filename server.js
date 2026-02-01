@@ -22,6 +22,7 @@ const Buffer = require('buffer').Buffer; // Ensure Buffer is available for Base6
 
 // ---- ADDED: node-fetch for backend HF calls (safe, server-side)
 const fetch = require("node-fetch"); // npm i node-fetch@2
+const nodemailer = require('nodemailer'); // For sending PIN recovery emails
 
 dotenv.config();
 
@@ -114,6 +115,42 @@ const intasend = new IntaSend(
 );
 
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
+
+// ============================
+// Email transporter setup
+// ============================
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD
+  }
+});
+
+// Fallback email config if SMTP not available
+const sendEmail = async (to, subject, html) => {
+  try {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+      console.log('Email credentials not configured. Email would have been sent to:', to);
+      console.log('Subject:', subject);
+      return true;
+    }
+    
+    const mailOptions = {
+      from: `"Marketplace Security" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      html
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`📧 Email sent to ${to}: ${info.messageId}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Email sending failed:', error);
+    return false;
+  }
+};
 
 // ============================
 // Fee Constants & Helpers
@@ -436,6 +473,194 @@ app.post("/api/seller/withdraw", async (req, res) => {
   } catch (error) {
     console.error("❌ Withdrawal Error:", error);
     return sendServerError(res, error, "Withdrawal failed");
+  }
+});
+
+// ✅ PIN Recovery Endpoint
+app.post("/api/seller/recover-pin", async (req, res) => {
+  try {
+    const { email, userId } = req.body;
+    
+    console.log("🔑 PIN Recovery Request:", { email, userId });
+    
+    if (!email || !userId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and user ID are required' 
+      });
+    }
+
+    // 1. Verify the user exists and email matches
+    const userDoc = await db.collection('users').doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'User not found' 
+      });
+    }
+
+    const userData = userDoc.data();
+    
+    // 2. Check if email matches (security measure)
+    if (userData.email && userData.email !== email) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Email does not match user account' 
+      });
+    }
+
+    // 3. Check if user has a PIN set
+    if (!userData.withdrawalPin) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No PIN is set for this account' 
+      });
+    }
+
+    // 4. Record the PIN recovery request (for security audit)
+    await db.collection('securityLogs').add({
+      userId: userId,
+      email: email,
+      action: 'PIN_RECOVERY_REQUESTED',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
+    // 5. Generate HTML email template
+    const emailHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }
+          .container { max-width: 600px; margin: 0 auto; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; }
+          .content { background: white; border-radius: 10px; padding: 40px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+          .header { text-align: center; margin-bottom: 30px; }
+          .logo { color: #667eea; font-size: 28px; font-weight: bold; margin-bottom: 10px; }
+          .pin-display { 
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
+            color: white; 
+            font-size: 36px; 
+            font-weight: bold; 
+            padding: 25px; 
+            border-radius: 10px; 
+            text-align: center; 
+            letter-spacing: 10px; 
+            margin: 30px 0;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+          }
+          .security-alert { 
+            background: #fff3e0; 
+            border-left: 5px solid #ff9800; 
+            padding: 15px; 
+            margin: 20px 0; 
+            border-radius: 5px;
+          }
+          .footer { 
+            margin-top: 30px; 
+            padding-top: 20px; 
+            border-top: 1px solid #eee; 
+            text-align: center; 
+            color: #666; 
+            font-size: 12px;
+          }
+          .warning-icon { color: #ff9800; margin-right: 10px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="content">
+            <div class="header">
+              <div class="logo">MARKETPLACE</div>
+              <h1>Withdrawal PIN Recovery</h1>
+              <p>Here is your requested PIN information</p>
+            </div>
+            
+            <div style="text-align: center; margin-bottom: 20px;">
+              <p style="color: #666; font-size: 16px;">Your withdrawal PIN is:</p>
+            </div>
+            
+            <div class="pin-display">
+              ${userData.withdrawalPin}
+            </div>
+            
+            <div class="security-alert">
+              <p style="margin: 0;">
+                <strong>⚠️ IMPORTANT SECURITY NOTICE</strong><br>
+                • This PIN provides access to your funds<br>
+                • Never share it with anyone<br>
+                • Marketplace staff will never ask for your PIN<br>
+                • If you suspect unauthorized access, contact support immediately
+              </p>
+            </div>
+            
+            <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0;">
+              <p style="margin: 0; color: #666; font-size: 14px;">
+                <strong>Request Details:</strong><br>
+                • Time: ${new Date().toLocaleString()}<br>
+                • Email: ${email}
+              </p>
+            </div>
+            
+            <div class="footer">
+              <p>This email was sent in response to your PIN recovery request.</p>
+              <p>If you didn't request this, please secure your account immediately.</p>
+              <p style="margin-top: 20px;">
+                <a href="https://yourmarketplace.com/seller/dashboard" style="color: #667eea; text-decoration: none;">Go to Dashboard</a> | 
+                <a href="https://yourmarketplace.com/contact" style="color: #667eea; text-decoration: none;">Contact Support</a> | 
+                <a href="https://yourmarketplace.com" style="color: #667eea; text-decoration: none;">Visit Marketplace</a>
+              </p>
+            </div>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    // 6. Send email with PIN
+    const emailSent = await sendEmail(
+      email,
+      '🔒 Your Withdrawal PIN Recovery Request',
+      emailHtml
+    );
+
+    if (!emailSent) {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to send PIN recovery email. Please contact support.' 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'PIN recovery email sent successfully' 
+    });
+
+  } catch (error) {
+    console.error('PIN recovery error:', error);
+    
+    // Log the error for security monitoring
+    try {
+      await db.collection('securityLogs').add({
+        userId: req.body?.userId || 'unknown',
+        email: req.body?.email || 'unknown',
+        action: 'PIN_RECOVERY_FAILED',
+        error: error.message,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        ipAddress: req.ip
+      });
+    } catch (logError) {
+      console.error('Failed to log security error:', logError);
+    }
+
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to process PIN recovery request' 
+    });
   }
 });
 
