@@ -309,7 +309,7 @@ const markCodeAsUsed = async (userId) => {
 };
 
 // ============================
-// Order Confirmation Email System
+// Order Confirmation Email System - UPDATED TO MATCH RECEIPT DESIGN
 // ============================
 
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
@@ -325,9 +325,9 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     const orderDate = orderData.orderDate?.toDate() || new Date();
     const formattedDate = orderDate.toLocaleString('en-KE', {
       timeZone: 'Africa/Nairobi',
-      year: 'numeric',
-      month: 'long',
+      month: 'short',
       day: 'numeric',
+      year: 'numeric',
       hour: '2-digit',
       minute: '2-digit'
     });
@@ -339,119 +339,331 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     const deliveryTotal = orderData.sellerGroups?.reduce((sum, group) => 
       sum + (group.deliveryCost || 0), 0) || 0;
     
-    // Create email template
+    // Create email template matching receipt design
     const emailHtml = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background: #f8f9fa; }
-          .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; color: white; }
-          .logo { font-size: 32px; font-weight: bold; margin-bottom: 10px; }
-          .content { padding: 40px 30px; }
-          .order-box { background: #f8f9fa; padding: 25px; border-radius: 10px; border: 1px solid #e9ecef; margin: 25px 0; }
-          .order-id { background: #667eea; color: white; padding: 10px 20px; border-radius: 6px; display: inline-block; font-weight: bold; }
-          .item-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #e9ecef; }
-          .item-row:last-child { border-bottom: none; }
-          .total-row { display: flex; justify-content: space-between; padding: 15px 0; border-top: 2px solid #667eea; font-weight: bold; font-size: 18px; }
-          .info-box { background: #e8f4fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 5px solid #2196f3; }
-          .footer { background: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 14px; }
-          .status-badge { display: inline-block; padding: 6px 15px; background: #28a745; color: white; border-radius: 20px; font-size: 14px; }
-          @media (max-width: 600px) { .container { border-radius: 0; } .header { padding: 30px 20px; } .content { padding: 30px 20px; } }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <div class="logo">MarketMix Kenya</div>
-            <h2 style="margin: 10px 0 0 0; font-weight: 300;">Order Confirmation</h2>
-          </div>
-          
-          <div class="content">
-            <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Thank you for your order!</h3>
-            <p style="color: #666; text-align: center; margin-bottom: 30px;">
-              Your order has been successfully placed and is being processed.
-            </p>
-            
-            <div style="text-align: center; margin-bottom: 30px;">
-              <div class="order-id">Order #${orderId.substring(0, 8)}</div>
-              <div style="margin-top: 15px;">
-                <span class="status-badge">Payment Confirmed</span>
-              </div>
-            </div>
-            
-            <div class="order-box">
-              <h4 style="margin-top: 0; color: #333; margin-bottom: 20px;">Order Summary</h4>
-              
-              <div class="item-row">
-                <div>Items Total</div>
-                <div>KSH ${itemsTotal.toFixed(2)}</div>
-              </div>
-              
-              ${orderData.couponDiscount > 0 ? `
-                <div class="item-row" style="color: #28a745;">
-                  <div>Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}</div>
-                  <div>- KSH ${orderData.couponDiscount.toFixed(2)}</div>
-                </div>
-              ` : ''}
-              
-              <div class="item-row">
-                <div>Delivery Total</div>
-                <div>KSH ${deliveryTotal.toFixed(2)}</div>
-              </div>
-              
-              <div class="total-row">
-                <div>Total Amount Paid</div>
-                <div>KSH ${orderData.totalAmount?.toFixed(2) || '0.00'}</div>
-              </div>
-            </div>
-            
-            <div class="info-box">
-              <h4 style="margin-top: 0; color: #0c5460;">Order Information</h4>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Order Date:</strong> ${formattedDate}</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Payment Method:</strong> M-Pesa</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Status:</strong> Confirmed</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Customer:</strong> ${orderData.shippingDetails?.fullName || 'Customer'}</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Phone:</strong> ${orderData.shippingDetails?.phoneNumber || 'N/A'}</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Order ID:</strong> ${orderId}</p>
-            </div>
-            
-            <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 25px 0; text-align: center;">
-              <p style="margin: 0 0 15px 0; color: #333;">
-                <strong>What happens next?</strong>
-              </p>
-              <ol style="text-align: left; margin: 0; padding-left: 20px; color: #666;">
-                <li>Each seller will prepare your items</li>
-                <li>You'll receive delivery updates from sellers</li>
-                <li>Estimated delivery: 1-3 business days</li>
-                <li>Contact sellers directly for specific queries</li>
-              </ol>
-            </div>
-            
-            <p style="text-align: center; color: #666; margin-top: 30px;">
-              View your order details: 
-              <a href="https://marketmix.site/order-receipt/${orderId}" style="color: #667eea; text-decoration: none;">Order Receipt</a>
-            </p>
-          </div>
-          
-          <div class="footer">
-            <p style="margin: 0 0 10px 0;"><strong>MarketMix Kenya</strong></p>
-            <p style="margin: 0 0 10px 0; font-size: 12px;">This email confirms your recent purchase from MarketMix Kenya.</p>
-            <p style="margin: 0 0 10px 0; font-size: 12px;">
-              Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #667eea; text-decoration: none;">sales@marketmix.site</a>
-            </p>
-            <p style="margin: 0; font-size: 12px;">
-              <a href="https://marketmix.site" style="color: #667eea; text-decoration: none;">Visit Marketplace</a> | 
-              <a href="https://marketmix.site/orders" style="color: #667eea; text-decoration: none;">My Orders</a>
-            </p>
-          </div>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { 
+      font-family: 'Georgia', 'Times New Roman', serif;
+      line-height: 1.6; 
+      color: #1f2937; 
+      margin: 0; 
+      padding: 0; 
+      background: linear-gradient(to bottom right, #f9fafb, #f3f4f6);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .container { 
+      max-width: 480px; 
+      width: 100%;
+      margin: 20px auto; 
+      background: white; 
+      border-radius: 20px; 
+      overflow: hidden; 
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08); 
+      position: relative;
+      border: 1px solid #e5e7eb;
+      padding-bottom: 64px;
+    }
+    .watermark {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.05;
+    }
+    .watermark img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .logo-container {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 24px;
+      margin-top: 24px;
+      position: relative;
+      z-index: 10;
+    }
+    .logo {
+      height: 64px;
+    }
+    .header {
+      text-align: center;
+      position: relative;
+      z-index: 10;
+      padding: 0 24px;
+    }
+    .title {
+      font-weight: bold;
+      font-size: 18px;
+      margin-bottom: 4px;
+      color: #1f2937;
+    }
+    .subtitle {
+      color: #6b7280;
+      font-size: 14px;
+      margin-bottom: 24px;
+    }
+    .content-box {
+      background: #f9fafb;
+      border-radius: 12px;
+      padding: 20px;
+      margin: 0 24px 24px;
+      border: 1px solid #e5e7eb;
+      position: relative;
+      z-index: 10;
+    }
+    .order-info {
+      margin-bottom: 16px;
+    }
+    .info-row {
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+    .info-label {
+      font-weight: 600;
+      color: #374151;
+    }
+    .items-section {
+      margin-top: 16px;
+    }
+    .items-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #374151;
+    }
+    .items-list {
+      padding-left: 20px;
+      list-style-type: disc;
+      margin: 0;
+    }
+    .item {
+      margin-bottom: 6px;
+      color: #4b5563;
+      font-size: 14px;
+    }
+    .item span {
+      color: #1f2937;
+      font-weight: 500;
+    }
+    .total-row {
+      text-align: right;
+      font-weight: 600;
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px dashed #d1d5db;
+      font-size: 15px;
+      color: #1f2937;
+    }
+    .divider {
+      height: 1px;
+      background: #e5e7eb;
+      margin: 24px;
+      position: relative;
+      z-index: 10;
+    }
+    .section-title {
+      font-weight: 600;
+      margin-bottom: 12px;
+      margin-left: 24px;
+      color: #374151;
+      position: relative;
+      z-index: 10;
+      font-size: 15px;
+    }
+    .shipping-box {
+      background: #f9fafb;
+      border-radius: 8px;
+      padding: 16px;
+      margin: 0 24px;
+      border: 1px solid #e5e7eb;
+      position: relative;
+      z-index: 10;
+    }
+    .shipping-row {
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+    .footer {
+      text-align: center;
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 24px;
+      position: relative;
+      z-index: 10;
+      padding: 0 24px;
+    }
+    .receipt-id {
+      display: inline-block;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-weight: bold;
+      margin-bottom: 16px;
+      font-size: 14px;
+      letter-spacing: 0.5px;
+    }
+    .status-badge {
+      display: inline-block;
+      background: #10b981;
+      color: white;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+      margin-top: 8px;
+    }
+    .print-section {
+      text-align: center;
+      margin-top: 24px;
+      position: relative;
+      z-index: 10;
+    }
+    .action-link {
+      color: #4f46e5;
+      text-decoration: none;
+      font-weight: 500;
+      font-size: 14px;
+    }
+    .action-link:hover {
+      text-decoration: underline;
+    }
+    .action-button {
+      display: inline-block;
+      background: #4f46e5;
+      color: white;
+      padding: 10px 20px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 500;
+      margin: 0 8px;
+      font-size: 14px;
+      border: none;
+      cursor: pointer;
+    }
+    .coupon-row {
+      color: #10b981;
+      font-size: 14px;
+    }
+    .delivery-row {
+      font-size: 14px;
+      color: #4b5563;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Watermark -->
+    <div class="watermark">
+      <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="Watermark">
+    </div>
+    
+    <!-- Logo -->
+    <div class="logo-container">
+      <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="MarketMix Logo" class="logo">
+    </div>
+    
+    <!-- Header -->
+    <div class="header">
+      <div class="receipt-id">Order #${orderId.substring(0, 8)}</div>
+      <div class="title">Thank you for shopping with us</div>
+      <div class="subtitle">We appreciate your trust and hope you enjoyed your order.</div>
+      <div class="status-badge">Payment Confirmed</div>
+    </div>
+    
+    <!-- Order Summary -->
+    <div class="content-box">
+      <div class="order-info">
+        <div class="info-row">
+          <span class="info-label">Order ID:</span> ${orderId || "N/A"}
         </div>
-      </body>
-      </html>
-    `;
+        <div class="info-row">
+          <span class="info-label">Date:</span> ${formattedDate}
+        </div>
+        <div class="info-row">
+          <span class="info-label">Buyer:</span> ${orderData.shippingDetails?.fullName || userEmail || "N/A"}
+        </div>
+      </div>
+      
+      <div class="items-section">
+        <div class="items-title">Items:</div>
+        <ul class="items-list">
+          ${orderData.items?.map(item => `
+            <li class="item">
+              ${item.name} × ${item.quantity} – Ksh <span>${((item.price || 0) * (item.quantity || 1)).toFixed(2)}</span>
+            </li>
+          `).join('') || '<li class="item">No items</li>'}
+        </ul>
+      </div>
+      
+      <div class="total-row">
+        Items Total: Ksh ${itemsTotal.toFixed(2)}
+      </div>
+      
+      ${orderData.couponDiscount > 0 ? `
+        <div class="total-row coupon-row">
+          Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}: -Ksh ${orderData.couponDiscount.toFixed(2)}
+        </div>
+      ` : ''}
+      
+      <div class="total-row delivery-row">
+        Delivery Total: Ksh ${deliveryTotal.toFixed(2)}
+      </div>
+      
+      <div class="total-row" style="font-size: 16px; color: #1f2937; margin-top: 20px;">
+        Total Amount Paid: Ksh ${orderData.totalAmount?.toFixed(2) || '0.00'}
+      </div>
+    </div>
+    
+    <div class="divider"></div>
+    
+    <!-- Shipping Details -->
+    <div class="section-title">Shipping Details</div>
+    <div class="shipping-box">
+      <div class="shipping-row">
+        <span class="info-label">Full Name:</span> ${orderData.shippingDetails?.fullName || "N/A"}
+      </div>
+      <div class="shipping-row">
+        <span class="info-label">Phone:</span> ${orderData.shippingDetails?.phoneNumber || "N/A"}
+      </div>
+      <div class="shipping-row">
+        <span class="info-label">Delivery Place:</span> ${orderData.shippingDetails?.deliveryPlace || "N/A"}
+      </div>
+    </div>
+    
+    <!-- Action Links -->
+    <div class="print-section">
+      <p style="margin-bottom: 16px; color: #6b7280; font-size: 14px;">
+        View your full receipt: 
+        <a href="https://marketmix.site/order-receipt/${orderId}" class="action-link">Order Receipt</a>
+      </p>
+      <div style="margin-top: 20px;">
+        <a href="https://marketmix.site" class="action-button" style="background: #1f2937;">Continue Shopping</a>
+        <a href="https://marketmix.site/orders" class="action-button">View All Orders</a>
+      </div>
+    </div>
+    
+    <!-- Footer -->
+    <div class="footer">
+      <p style="margin: 0;">MarketMix Kenya © ${new Date().getFullYear()} | Receipt generated online</p>
+      <p style="margin: 8px 0 0 0; font-size: 10px;">
+        Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #6b7280;">sales@marketmix.site</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
 
     // Send email via MarketMixKenya <sales@marketmix.site>
     const emailSent = await sendEmail(
@@ -1442,6 +1654,7 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
   console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
   console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
+  console.log(`🖼️ Logo Image: https://i.ibb.co/JjSrxbPz/icon-png-1.png`);
 });
 
 // Graceful shutdown
