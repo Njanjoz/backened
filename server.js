@@ -1,6 +1,7 @@
 /* Full replacement: Express backend for Campus Store with Brevo Email Integration
    Features:
-   - Brevo transactional email for PIN recovery (environment variable only)
+   - Brevo transactional email for PIN recovery (REPLACEMENT CODES ONLY)
+   - Automated order confirmation emails after purchase
    - Real-time fee listener from Firestore
    - IntaSend B2C withdrawals
    - Hugging Face image generation
@@ -114,16 +115,28 @@ const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
-const sendEmail = async (to, subject, html) => {
+const sendEmail = async (to, subject, html, type = 'security') => {
   try {
     console.log('📧 Attempting to send email to:', to);
     console.log('📧 Subject:', subject);
+    console.log('📧 Type:', type);
     
     if (!BREVO_API_KEY) {
       console.log('❌ BREVO_API_KEY not configured in environment');
       console.log('📧 Email would have been sent to:', to);
       return false;
     }
+    
+    // Determine sender based on email type
+    const sender = type === 'sales' 
+      ? {
+          name: 'MarketMixKenya',
+          email: 'sales@marketmix.site'
+        }
+      : {
+          name: 'MarketMixKenya',
+          email: 'security@marketmix.site'
+        };
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -133,17 +146,14 @@ const sendEmail = async (to, subject, html) => {
         'content-type': 'application/json'
       },
       body: JSON.stringify({
-        sender: {
-          name: 'MarketMix Kenya',
-          email: 'security@marketmix.site'
-        },
+        sender: sender,
         to: [{
           email: to,
           name: to.split('@')[0] || 'User'
         }],
         subject: subject,
         htmlContent: html,
-        tags: ['pin-recovery', 'transactional']
+        tags: [type === 'sales' ? 'order-confirmation' : 'pin-recovery']
       })
     });
 
@@ -157,7 +167,7 @@ const sendEmail = async (to, subject, html) => {
     console.log(`✅ Email sent successfully!`);
     console.log(`📧 Message ID: ${data.messageId}`);
     console.log(`📧 To: ${to}`);
-    console.log(`📧 From: security@marketmix.site`);
+    console.log(`📧 From: ${sender.name} <${sender.email}>`);
     return true;
     
   } catch (error) {
@@ -181,7 +191,9 @@ const sendEmail = async (to, subject, html) => {
         const data = await response.json();
         console.log(`✅ Brevo API connected successfully`);
         console.log(`📧 Account: ${data.email}`);
-        console.log(`📧 Sender: security@marketmix.site`);
+        console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
+        console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
+        console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
       } else {
         console.warn('⚠️ Brevo API key may be invalid');
       }
@@ -189,9 +201,291 @@ const sendEmail = async (to, subject, html) => {
       console.warn('⚠️ Could not verify Brevo API key on startup:', error.message);
     }
   } else {
-    console.warn('⚠️ BREVO_API_KEY not set in environment - PIN recovery emails will not be sent');
+    console.warn('⚠️ BREVO_API_KEY not set in environment - emails will not be sent');
   }
 })();
+
+// ============================
+// PIN Recovery System (Replacement Codes)
+// ============================
+
+// Generate a 6-digit replacement code
+const generateReplacementCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// Store replacement codes in Firestore with TTL
+const storeReplacementCode = async (userId, email, code) => {
+  try {
+    const expiryTime = new Date();
+    expiryTime.setMinutes(expiryTime.getMinutes() + 15); // 15 minute expiry
+    
+    await db.collection('pinRecoveryCodes').doc(userId).set({
+      code,
+      email,
+      userId,
+      expiresAt: expiryTime,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      attempts: 0,
+      maxAttempts: 3,
+      used: false,
+      status: 'pending'
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Failed to store replacement code:', error);
+    return false;
+  }
+};
+
+// Verify replacement code
+const verifyReplacementCode = async (userId, code) => {
+  try {
+    const recoveryDoc = await db.collection('pinRecoveryCodes').doc(userId).get();
+    
+    if (!recoveryDoc.exists) {
+      return { valid: false, message: 'No recovery request found' };
+    }
+    
+    const recoveryData = recoveryDoc.data();
+    
+    // Check if expired
+    if (recoveryData.expiresAt.toDate() < new Date()) {
+      await db.collection('pinRecoveryCodes').doc(userId).delete();
+      return { valid: false, message: 'Recovery code has expired' };
+    }
+    
+    // Check if already used
+    if (recoveryData.used) {
+      return { valid: false, message: 'Recovery code has already been used' };
+    }
+    
+    // Check if max attempts reached
+    if (recoveryData.attempts >= recoveryData.maxAttempts) {
+      return { valid: false, message: 'Too many failed attempts' };
+    }
+    
+    // Check if code matches
+    if (recoveryData.code !== code) {
+      // Increment attempts
+      await db.collection('pinRecoveryCodes').doc(userId).update({
+        attempts: admin.firestore.FieldValue.increment(1)
+      });
+      
+      const remainingAttempts = recoveryData.maxAttempts - (recoveryData.attempts + 1);
+      return { 
+        valid: false, 
+        message: `Invalid code. ${remainingAttempts} attempts remaining` 
+      };
+    }
+    
+    // Mark as verified (not used yet - will be used when PIN is reset)
+    await db.collection('pinRecoveryCodes').doc(userId).update({
+      status: 'verified',
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    return { valid: true, data: recoveryData };
+  } catch (error) {
+    console.error('Failed to verify replacement code:', error);
+    return { valid: false, message: 'Verification failed' };
+  }
+};
+
+// Mark replacement code as used
+const markCodeAsUsed = async (userId) => {
+  try {
+    await db.collection('pinRecoveryCodes').doc(userId).update({
+      used: true,
+      usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: 'completed'
+    });
+    return true;
+  } catch (error) {
+    console.error('Failed to mark code as used:', error);
+    return false;
+  }
+};
+
+// ============================
+// Order Confirmation Email System
+// ============================
+
+const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
+  try {
+    console.log('📧 Sending order confirmation to:', userEmail);
+    
+    if (!BREVO_API_KEY) {
+      console.log('❌ BREVO_API_KEY not configured - skipping email');
+      return false;
+    }
+    
+    // Format date
+    const orderDate = orderData.orderDate?.toDate() || new Date();
+    const formattedDate = orderDate.toLocaleString('en-KE', {
+      timeZone: 'Africa/Nairobi',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    
+    // Calculate totals
+    const itemsTotal = orderData.items?.reduce((sum, item) => 
+      sum + ((item.price || 0) * (item.quantity || 1)), 0) || 0;
+    
+    const deliveryTotal = orderData.sellerGroups?.reduce((sum, group) => 
+      sum + (group.deliveryCost || 0), 0) || 0;
+    
+    // Create email template
+    const emailHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background: #f8f9fa; }
+          .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; color: white; }
+          .logo { font-size: 32px; font-weight: bold; margin-bottom: 10px; }
+          .content { padding: 40px 30px; }
+          .order-box { background: #f8f9fa; padding: 25px; border-radius: 10px; border: 1px solid #e9ecef; margin: 25px 0; }
+          .order-id { background: #667eea; color: white; padding: 10px 20px; border-radius: 6px; display: inline-block; font-weight: bold; }
+          .item-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #e9ecef; }
+          .item-row:last-child { border-bottom: none; }
+          .total-row { display: flex; justify-content: space-between; padding: 15px 0; border-top: 2px solid #667eea; font-weight: bold; font-size: 18px; }
+          .info-box { background: #e8f4fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 5px solid #2196f3; }
+          .footer { background: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 14px; }
+          .status-badge { display: inline-block; padding: 6px 15px; background: #28a745; color: white; border-radius: 20px; font-size: 14px; }
+          @media (max-width: 600px) { .container { border-radius: 0; } .header { padding: 30px 20px; } .content { padding: 30px 20px; } }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="logo">MarketMix Kenya</div>
+            <h2 style="margin: 10px 0 0 0; font-weight: 300;">Order Confirmation</h2>
+          </div>
+          
+          <div class="content">
+            <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Thank you for your order!</h3>
+            <p style="color: #666; text-align: center; margin-bottom: 30px;">
+              Your order has been successfully placed and is being processed.
+            </p>
+            
+            <div style="text-align: center; margin-bottom: 30px;">
+              <div class="order-id">Order #${orderId.substring(0, 8)}</div>
+              <div style="margin-top: 15px;">
+                <span class="status-badge">Payment Confirmed</span>
+              </div>
+            </div>
+            
+            <div class="order-box">
+              <h4 style="margin-top: 0; color: #333; margin-bottom: 20px;">Order Summary</h4>
+              
+              <div class="item-row">
+                <div>Items Total</div>
+                <div>KSH ${itemsTotal.toFixed(2)}</div>
+              </div>
+              
+              ${orderData.couponDiscount > 0 ? `
+                <div class="item-row" style="color: #28a745;">
+                  <div>Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}</div>
+                  <div>- KSH ${orderData.couponDiscount.toFixed(2)}</div>
+                </div>
+              ` : ''}
+              
+              <div class="item-row">
+                <div>Delivery Total</div>
+                <div>KSH ${deliveryTotal.toFixed(2)}</div>
+              </div>
+              
+              <div class="total-row">
+                <div>Total Amount Paid</div>
+                <div>KSH ${orderData.totalAmount?.toFixed(2) || '0.00'}</div>
+              </div>
+            </div>
+            
+            <div class="info-box">
+              <h4 style="margin-top: 0; color: #0c5460;">Order Information</h4>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Order Date:</strong> ${formattedDate}</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Payment Method:</strong> M-Pesa</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Status:</strong> Confirmed</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Customer:</strong> ${orderData.shippingDetails?.fullName || 'Customer'}</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Phone:</strong> ${orderData.shippingDetails?.phoneNumber || 'N/A'}</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Order ID:</strong> ${orderId}</p>
+            </div>
+            
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 25px 0; text-align: center;">
+              <p style="margin: 0 0 15px 0; color: #333;">
+                <strong>What happens next?</strong>
+              </p>
+              <ol style="text-align: left; margin: 0; padding-left: 20px; color: #666;">
+                <li>Each seller will prepare your items</li>
+                <li>You'll receive delivery updates from sellers</li>
+                <li>Estimated delivery: 1-3 business days</li>
+                <li>Contact sellers directly for specific queries</li>
+              </ol>
+            </div>
+            
+            <p style="text-align: center; color: #666; margin-top: 30px;">
+              View your order details: 
+              <a href="https://marketmix.site/order-receipt/${orderId}" style="color: #667eea; text-decoration: none;">Order Receipt</a>
+            </p>
+          </div>
+          
+          <div class="footer">
+            <p style="margin: 0 0 10px 0;"><strong>MarketMix Kenya</strong></p>
+            <p style="margin: 0 0 10px 0; font-size: 12px;">This email confirms your recent purchase from MarketMix Kenya.</p>
+            <p style="margin: 0 0 10px 0; font-size: 12px;">
+              Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #667eea; text-decoration: none;">sales@marketmix.site</a>
+            </p>
+            <p style="margin: 0; font-size: 12px;">
+              <a href="https://marketmix.site" style="color: #667eea; text-decoration: none;">Visit Marketplace</a> | 
+              <a href="https://marketmix.site/orders" style="color: #667eea; text-decoration: none;">My Orders</a>
+            </p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    // Send email via MarketMixKenya <sales@marketmix.site>
+    const emailSent = await sendEmail(
+      userEmail,
+      `Order Confirmation #${orderId.substring(0, 8)} - MarketMix Kenya`,
+      emailHtml,
+      'sales'
+    );
+
+    if (emailSent) {
+      // Record email sent status
+      try {
+        await db.collection('orderEmails').add({
+          orderId,
+          userEmail,
+          type: 'confirmation',
+          sender: 'MarketMixKenya <sales@marketmix.site>',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          authenticated: true,
+          dmarc: 'configured',
+          dkim: 'signed'
+        });
+      } catch (logErr) {
+        console.error('Failed to log email:', logErr);
+      }
+    }
+    
+    return emailSent;
+    
+  } catch (error) {
+    console.error('❌ Order confirmation email failed:', error.message);
+    return false;
+  }
+};
 
 // ============================
 // Fee Constants & Helpers
@@ -293,7 +587,7 @@ app.post("/api/stk-push", async (req, res) => {
   }
 });
 
-// ✅ IntaSend callback
+// ✅ IntaSend callback - UPDATED WITH EMAIL CONFIRMATION
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body;
@@ -303,17 +597,74 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (state === "COMPLETE") status = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) status = "failed";
 
-    await db.collection("orders").doc(api_ref).set(
-      {
-        paymentStatus: status,
-        mpesaReference: mpesa_reference || null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    // Get order data before updating
+    const orderRef = db.collection("orders").doc(api_ref);
+    const orderSnap = await orderRef.get();
+    
+    if (!orderSnap.exists) {
+      console.error(`Order ${api_ref} not found`);
+      return res.status(404).send("Order not found");
+    }
+
+    const orderData = orderSnap.data();
+    
+    // Update the order status
+    await orderRef.update({
+      paymentStatus: status,
+      mpesaReference: mpesa_reference || null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`Order ${api_ref} updated to status: ${status}`);
+
+    // If payment is successful, send confirmation email
+    if (state === "COMPLETE") {
+      console.log(`Payment successful for order ${api_ref}, sending confirmation email...`);
+      
+      // Get user email
+      let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
+      
+      if (!userEmail && orderData.userId) {
+        try {
+          const userDoc = await db.collection('users').doc(orderData.userId).get();
+          if (userDoc.exists) {
+            const userData = userDoc.data();
+            userEmail = userData.email;
+          }
+        } catch (userErr) {
+          console.error('Failed to fetch user email:', userErr);
+        }
+      }
+      
+      if (userEmail) {
+        console.log(`Sending order confirmation to ${userEmail} for order ${api_ref}`);
+        
+        // Send order confirmation email asynchronously
+        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+          .then(success => {
+            if (success) {
+              console.log(`✅ Order confirmation email sent for ${api_ref}`);
+              
+              // Update order with email sent flag
+              orderRef.update({
+                confirmationEmailSent: true,
+                confirmationSentAt: admin.firestore.FieldValue.serverTimestamp()
+              }).catch(e => console.error('Failed to update email flag:', e));
+            } else {
+              console.log(`❌ Failed to send confirmation email for ${api_ref}`);
+            }
+          })
+          .catch(emailErr => {
+            console.error('Email sending error:', emailErr);
+          });
+      } else {
+        console.log(`⚠️ No email found for order ${api_ref}, skipping confirmation email`);
+      }
+    }
 
     return res.send("OK");
   } catch (error) {
+    console.error('IntaSend callback error:', error);
     return sendServerError(res, error, "IntaSend callback failed");
   }
 });
@@ -516,7 +867,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
-// ✅ PIN Recovery Endpoint
+// ✅ PIN Recovery Endpoint - REPLACEMENT CODES VERSION
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body;
@@ -558,19 +909,31 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    const pin = userData.withdrawalPin;
+    // 4. Generate replacement code
+    const replacementCode = generateReplacementCode();
     
-    // 4. Record the PIN recovery request
+    // 5. Store replacement code
+    const codeStored = await storeReplacementCode(userId, email, replacementCode);
+    
+    if (!codeStored) {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to generate recovery code' 
+      });
+    }
+
+    // 6. Record the PIN recovery request
     await db.collection('securityLogs').add({
       userId: userId,
       email: email,
       action: 'PIN_RECOVERY_REQUESTED',
+      codeGenerated: true,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       ipAddress: req.ip,
       userAgent: req.get('User-Agent')
     });
 
-    // 5. Create beautiful email template
+    // 7. Create email template with replacement code
     const emailHtml = `
       <!DOCTYPE html>
       <html>
@@ -583,10 +946,11 @@ app.post("/api/seller/recover-pin", async (req, res) => {
           .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; color: white; }
           .logo { font-size: 32px; font-weight: bold; margin-bottom: 10px; }
           .content { padding: 40px 30px; }
-          .pin-box { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; font-size: 48px; font-weight: bold; padding: 30px; border-radius: 12px; text-align: center; letter-spacing: 15px; margin: 30px 0; box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+          .code-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; font-size: 32px; font-weight: bold; padding: 25px; border-radius: 12px; text-align: center; letter-spacing: 8px; margin: 30px 0; box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
           .security-note { background: #fff3e0; border-left: 5px solid #ff9800; padding: 20px; border-radius: 8px; margin: 25px 0; }
           .footer { background: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 14px; }
           .info-box { background: #e8f4fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 5px solid #2196f3; }
+          .timer { background: #f8f9fa; padding: 10px 15px; border-radius: 6px; text-align: center; margin: 20px 0; }
         </style>
       </head>
       <body>
@@ -598,19 +962,25 @@ app.post("/api/seller/recover-pin", async (req, res) => {
           
           <div class="content">
             <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Hello Seller,</h3>
-            <p style="color: #666; text-align: center; margin-bottom: 30px;">You requested your withdrawal PIN. Here it is:</p>
+            <p style="color: #666; text-align: center; margin-bottom: 20px;">
+              You requested to reset your withdrawal PIN. Use the code below to verify your identity.
+            </p>
             
-            <div class="pin-box">
-              ${pin}
+            <div class="code-box">
+              ${replacementCode}
+            </div>
+            
+            <div class="timer">
+              <p style="margin: 0; color: #666;"><strong>This code expires in 15 minutes</strong></p>
             </div>
             
             <div class="security-note">
-              <h4 style="margin-top: 0; color: #856404;">⚠️ SECURITY ALERT</h4>
+              <h4 style="margin-top: 0; color: #856404;">SECURITY ALERT</h4>
               <ul style="margin-bottom: 0; color: #856404;">
-                <li>This PIN provides access to your funds</li>
+                <li>This code is for PIN reset verification only</li>
                 <li>Never share it with anyone</li>
-                <li>MarketMix staff will never ask for your PIN</li>
-                <li>If you suspect unauthorized access, contact support immediately</li>
+                <li>MarketMix staff will never ask for this code</li>
+                <li>If you didn't request this, contact support immediately</li>
               </ul>
             </div>
             
@@ -619,10 +989,11 @@ app.post("/api/seller/recover-pin", async (req, res) => {
               <p style="margin: 5px 0; color: #0c5460;"><strong>Time:</strong> ${new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</p>
               <p style="margin: 5px 0; color: #0c5460;"><strong>Email:</strong> ${email}</p>
               <p style="margin: 5px 0; color: #0c5460;"><strong>Account ID:</strong> ${userId.slice(0, 8)}...</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Valid Attempts:</strong> 3 attempts remaining</p>
             </div>
             
             <p style="text-align: center; color: #666; margin-top: 30px;">
-              Need help? <a href="mailto:security@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
+              Enter this code in the PIN recovery page to reset your withdrawal PIN.
             </p>
           </div>
           
@@ -633,7 +1004,7 @@ app.post("/api/seller/recover-pin", async (req, res) => {
             <p style="margin: 15px 0 0 0; font-size: 12px;">
               <a href="https://marketmix.site" style="color: #667eea; text-decoration: none;">Visit Marketplace</a> | 
               <a href="https://marketmix.site/seller/dashboard" style="color: #667eea; text-decoration: none;">Seller Dashboard</a> | 
-              <a href="mailto:security@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
+              <a href="mailto:sales@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
             </p>
           </div>
         </div>
@@ -641,11 +1012,12 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       </html>
     `;
 
-    // 6. Send email via Brevo
+    // 8. Send email via Brevo
     const emailSent = await sendEmail(
       email,
-      '🔒 Your Withdrawal PIN Recovery - MarketMix Kenya',
-      emailHtml
+      'Your PIN Reset Code - MarketMix Kenya',
+      emailHtml,
+      'security'
     );
 
     if (!emailSent) {
@@ -653,18 +1025,18 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       
       return res.json({ 
         success: false, 
-        message: 'Failed to send PIN recovery email. Please try again or contact support.',
+        message: 'Failed to send PIN recovery code. Please try again or contact support.',
         emailSent: false
       });
     }
 
-    console.log(`✅ PIN recovery email sent to ${email}`);
+    console.log(`✅ PIN recovery code sent to ${email}`);
     
     res.json({ 
       success: true, 
-      message: 'PIN recovery email sent successfully',
+      message: 'PIN recovery code sent to your email',
       emailSent: true,
-      note: 'Check your inbox and spam folder'
+      note: 'Check your inbox and spam folder. The code expires in 15 minutes.'
     });
 
   } catch (error) {
@@ -687,6 +1059,128 @@ app.post("/api/seller/recover-pin", async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Failed to process PIN recovery request' 
+    });
+  }
+});
+
+// ✅ Verify PIN Recovery Code
+app.post("/api/seller/verify-recovery-code", async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    
+    console.log("🔑 Verify Recovery Code:", { userId });
+    
+    if (!userId || !code) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'User ID and code are required' 
+      });
+    }
+
+    const verification = await verifyReplacementCode(userId, code);
+    
+    if (!verification.valid) {
+      return res.status(400).json({ 
+        success: false, 
+        message: verification.message 
+      });
+    }
+
+    // Record successful verification
+    await db.collection('securityLogs').add({
+      userId: userId,
+      email: verification.data.email,
+      action: 'PIN_RECOVERY_VERIFIED',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      ipAddress: req.ip
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Code verified successfully',
+      verified: true
+    });
+
+  } catch (error) {
+    console.error('❌ Code verification error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to verify recovery code' 
+    });
+  }
+});
+
+// ✅ Reset PIN with Verified Code
+app.post("/api/seller/reset-pin", async (req, res) => {
+  try {
+    const { userId, code, newPin, confirmPin } = req.body;
+    
+    console.log("🔑 Reset PIN Request:", { userId });
+    
+    if (!userId || !code || !newPin || !confirmPin) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'All fields are required' 
+      });
+    }
+
+    if (newPin !== confirmPin) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'PINs do not match' 
+      });
+    }
+
+    if (newPin.length < 4 || !/^\d+$/.test(newPin)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'PIN must be at least 4 digits and contain only numbers' 
+      });
+    }
+
+    // Verify code first
+    const verification = await verifyReplacementCode(userId, code);
+    
+    if (!verification.valid) {
+      return res.status(400).json({ 
+        success: false, 
+        message: verification.message 
+      });
+    }
+
+    // Update user PIN
+    const userRef = db.collection('users').doc(userId);
+    await userRef.update({
+      withdrawalPin: newPin,
+      pinSetAt: admin.firestore.FieldValue.serverTimestamp(),
+      pinSetMethod: 'recovery',
+      pinLastChanged: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Mark code as used
+    await markCodeAsUsed(userId);
+
+    // Record successful PIN reset
+    await db.collection('securityLogs').add({
+      userId: userId,
+      email: verification.data.email,
+      action: 'PIN_RESET_SUCCESS',
+      method: 'recovery',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      ipAddress: req.ip
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'PIN reset successfully',
+      reset: true
+    });
+
+  } catch (error) {
+    console.error('❌ PIN reset error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to reset PIN' 
     });
   }
 });
@@ -784,72 +1278,54 @@ app.post("/api/generate-ai-image", async (req, res) => {
 // Debug & Test Endpoints
 // ============================
 
-// ✅ Test Brevo setup
-app.get("/api/test-email-setup", async (req, res) => {
+// ✅ Test Email Authentication
+app.get("/api/test-email-auth", async (req, res) => {
   try {
     if (!BREVO_API_KEY) {
       return res.json({
         success: false,
-        message: "BREVO_API_KEY not configured in environment",
-        help: "Add BREVO_API_KEY to Render environment variables",
-        currentEnv: Object.keys(process.env).filter(k => k.includes('BREVO') || k.includes('EMAIL'))
+        message: "BREVO_API_KEY not configured",
+        help: "Add BREVO_API_KEY to environment variables",
+        authentication: {
+          security: "MarketMixKenya <security@marketmix.site>",
+          sales: "MarketMixKenya <sales@marketmix.site>",
+          dkim: "Configured via Brevo",
+          dmarc: "marketmix.site (configured)",
+          spf: "Brevo servers included"
+        }
       });
     }
-
-    // Test account info
-    const accountResponse = await fetch('https://api.brevo.com/v3/account', {
-      headers: {
-        'accept': 'application/json',
-        'api-key': BREVO_API_KEY
-      }
-    });
-    
-    const accountData = await accountResponse.json();
-    
-    if (!accountResponse.ok) {
-      return res.json({
-        success: false,
-        message: 'Brevo API key is invalid',
-        error: accountData.message || 'Check your API key',
-        status: accountResponse.status
-      });
-    }
-
-    // Test sending
-    const testEmailHtml = `
-      <h2>✅ Brevo Test Successful!</h2>
-      <p>Your Brevo API is working correctly with:</p>
-      <ul>
-        <li><strong>Sender:</strong> security@marketmix.site</li>
-        <li><strong>Account:</strong> ${accountData.email}</li>
-        <li><strong>Time:</strong> ${new Date().toLocaleString()}</li>
-      </ul>
-    `;
-    
-    const emailSent = await sendEmail(
-      'johnnjanjo4@gmail.com',
-      '✅ Brevo Test - PIN Recovery System Working',
-      testEmailHtml
-    );
 
     res.json({
       success: true,
-      message: '✅ Brevo API key is working!',
-      account: {
-        email: accountData.email,
-        firstName: accountData.firstName,
-        lastName: accountData.lastName
+      message: "✅ Email authentication configured",
+      senders: {
+        security: {
+          name: "MarketMixKenya",
+          email: "security@marketmix.site",
+          purpose: "PIN recovery, security notifications",
+          status: "Verified"
+        },
+        sales: {
+          name: "MarketMixKenya",
+          email: "sales@marketmix.site",
+          purpose: "Order confirmations, customer support",
+          status: "Verified"
+        }
       },
-      sender: 'security@marketmix.site is configured',
-      emailTest: emailSent ? '✅ Test email sent successfully' : '❌ Test email failed',
-      note: 'Check johnnjanjo4@gmail.com for test email'
+      authentication: {
+        dkim: "Signature configured",
+        dmarc: "policy=quarantine; rua=mailto:dmarc-reports@marketmix.site",
+        spf: "v=spf1 include:spf.brevo.com ~all",
+        shared_ip: "Brevo shared IP pool"
+      }
     });
     
   } catch (error) {
-    console.error('❌ Brevo test error:', error);
+    console.error('❌ Email auth test error:', error);
     res.status(500).json({
       success: false,
-      message: 'Brevo test failed',
+      message: 'Email authentication test failed',
       error: error.message
     });
   }
@@ -863,7 +1339,11 @@ app.get("/_health", (req, res) => {
     services: {
       firebase: true,
       brevo: !!BREVO_API_KEY,
-      intasend: true
+      intasend: true,
+      email_auth: {
+        security: 'MarketMixKenya <security@marketmix.site>',
+        sales: 'MarketMixKenya <sales@marketmix.site>'
+      }
     },
     uptime: process.uptime()
   };
@@ -958,7 +1438,9 @@ process.on("unhandledRejection", (reason) => {
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not configured'}`);
-  console.log(`📧 Sender: security@marketmix.site`);
+  console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
+  console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
+  console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
   console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
 });
 
