@@ -1,14 +1,10 @@
-/* your entire original header & code preserved exactly as provided by you above */
-/* Full replacement: Express backend for Campus Store with live order-based withdrawal check + IntaSend B2C
-
-  Additions & safety features included (non-destructive):
-  - Stealth in-memory keep-alive loop using Node's http.request + jitter (prevents free-host cold sleeps)
-  - Toggleable via env: KEEP_ALIVE=true (defaults to enabled in production when not explicitly disabled)
-  - Short request timeout & silent error handling so it never interferes with real handlers
-  - Graceful shutdown clearing keep-alive interval
-  - Unref() on interval so it doesn't keep process alive on shutdown
-  - Global uncaughtException/unhandledRejection logging (no crash swallowing)
-  - Minimal changes to your original logic; routes unchanged
+/* Full replacement: Express backend for Campus Store with Brevo Email Integration
+   Features:
+   - Brevo transactional email for PIN recovery (environment variable only)
+   - Real-time fee listener from Firestore
+   - IntaSend B2C withdrawals
+   - Hugging Face image generation
+   - Stealth keep-alive for Render
 */
 
 const express = require("express");
@@ -18,11 +14,8 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
-const Buffer = require('buffer').Buffer; // Ensure Buffer is available for Base64 conversion
-
-// ---- ADDED: node-fetch for backend HF calls (safe, server-side)
-const fetch = require("node-fetch"); // npm i node-fetch@2
-const nodemailer = require('nodemailer'); // For sending PIN recovery emails
+const Buffer = require('buffer').Buffer;
+const fetch = require("node-fetch");
 
 dotenv.config();
 
@@ -117,48 +110,96 @@ const intasend = new IntaSend(
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
 
 // ============================
-// Email transporter setup
+// Brevo Email Service
 // ============================
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
-  }
-});
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
-// Fallback email config if SMTP not available
 const sendEmail = async (to, subject, html) => {
   try {
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
-      console.log('Email credentials not configured. Email would have been sent to:', to);
-      console.log('Subject:', subject);
-      return true;
+    console.log('📧 Attempting to send email to:', to);
+    console.log('📧 Subject:', subject);
+    
+    if (!BREVO_API_KEY) {
+      console.log('❌ BREVO_API_KEY not configured in environment');
+      console.log('📧 Email would have been sent to:', to);
+      return false;
     }
     
-    const mailOptions = {
-      from: `"Marketplace Security" <${process.env.EMAIL_USER}>`,
-      to,
-      subject,
-      html
-    };
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: {
+          name: 'MarketMix Kenya',
+          email: 'security@marketmix.site'
+        },
+        to: [{
+          email: to,
+          name: to.split('@')[0] || 'User'
+        }],
+        subject: subject,
+        htmlContent: html,
+        tags: ['pin-recovery', 'transactional']
+      })
+    });
 
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`📧 Email sent to ${to}: ${info.messageId}`);
+    const data = await response.json();
+    
+    if (!response.ok) {
+      console.error('❌ Brevo API error:', JSON.stringify(data, null, 2));
+      throw new Error(data.message || `Brevo API error: ${response.status}`);
+    }
+
+    console.log(`✅ Email sent successfully!`);
+    console.log(`📧 Message ID: ${data.messageId}`);
+    console.log(`📧 To: ${to}`);
+    console.log(`📧 From: security@marketmix.site`);
     return true;
+    
   } catch (error) {
-    console.error('❌ Email sending failed:', error);
+    console.error('❌ Email sending failed:', error.message);
     return false;
   }
 };
 
+// Test Brevo setup on startup
+(async () => {
+  if (BREVO_API_KEY) {
+    try {
+      const response = await fetch('https://api.brevo.com/v3/account', {
+        headers: {
+          'accept': 'application/json',
+          'api-key': BREVO_API_KEY
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log(`✅ Brevo API connected successfully`);
+        console.log(`📧 Account: ${data.email}`);
+        console.log(`📧 Sender: security@marketmix.site`);
+      } else {
+        console.warn('⚠️ Brevo API key may be invalid');
+      }
+    } catch (error) {
+      console.warn('⚠️ Could not verify Brevo API key on startup:', error.message);
+    }
+  } else {
+    console.warn('⚠️ BREVO_API_KEY not set in environment - PIN recovery emails will not be sent');
+  }
+})();
+
 // ============================
 // Fee Constants & Helpers
 // ============================
-const WITHDRAWAL_THRESHOLD = 100.0; // 100 KSH
-const FIXED_FEE_BELOW_THRESHOLD = 10.0; // 10 KSH fixed fee for < 100 KSH
-const FIXED_FEE_ABOVE_THRESHOLD = 20.0; // 20 KSH fixed fee for >= 100 KSH
-const AGENCY_FEE_RATE = 0.035; // 3.5% agency fee
+const WITHDRAWAL_THRESHOLD = 100.0;
+const FIXED_FEE_BELOW_THRESHOLD = 10.0;
+const FIXED_FEE_ABOVE_THRESHOLD = 20.0;
+const AGENCY_FEE_RATE = 0.035;
 
 function getTieredFixedFee(amount) {
   return amount < WITHDRAWAL_THRESHOLD
@@ -187,7 +228,7 @@ function sendServerError(res, err, msg = "Internal server error") {
 }
 
 // ============================
-// Routes (UNCHANGED logic, kept as-is but defensive)
+// Routes
 // ============================
 
 // ✅ STK Push
@@ -342,7 +383,6 @@ app.post("/api/seller/withdraw", async (req, res) => {
 
       if (!items) return;
 
-      // ✅ Safe handler for array, object, or single item
       if (Array.isArray(items)) {
         items.forEach((item) => {
           if (item?.sellerId === sellerId) {
@@ -502,7 +542,7 @@ app.post("/api/seller/recover-pin", async (req, res) => {
 
     const userData = userDoc.data();
     
-    // 2. Check if email matches (security measure)
+    // 2. Check if email matches
     if (userData.email && userData.email !== email) {
       return res.status(403).json({ 
         success: false, 
@@ -518,7 +558,9 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    // 4. Record the PIN recovery request (for security audit)
+    const pin = userData.withdrawalPin;
+    
+    // 4. Record the PIN recovery request
     await db.collection('securityLogs').add({
       userId: userId,
       email: email,
@@ -528,7 +570,7 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       userAgent: req.get('User-Agent')
     });
 
-    // 5. Generate HTML email template
+    // 5. Create beautiful email template
     const emailHtml = `
       <!DOCTYPE html>
       <html>
@@ -536,114 +578,99 @@ app.post("/api/seller/recover-pin", async (req, res) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }
-          .container { max-width: 600px; margin: 0 auto; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; }
-          .content { background: white; border-radius: 10px; padding: 40px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-          .header { text-align: center; margin-bottom: 30px; }
-          .logo { color: #667eea; font-size: 28px; font-weight: bold; margin-bottom: 10px; }
-          .pin-display { 
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
-            color: white; 
-            font-size: 36px; 
-            font-weight: bold; 
-            padding: 25px; 
-            border-radius: 10px; 
-            text-align: center; 
-            letter-spacing: 10px; 
-            margin: 30px 0;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-          }
-          .security-alert { 
-            background: #fff3e0; 
-            border-left: 5px solid #ff9800; 
-            padding: 15px; 
-            margin: 20px 0; 
-            border-radius: 5px;
-          }
-          .footer { 
-            margin-top: 30px; 
-            padding-top: 20px; 
-            border-top: 1px solid #eee; 
-            text-align: center; 
-            color: #666; 
-            font-size: 12px;
-          }
-          .warning-icon { color: #ff9800; margin-right: 10px; }
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background: #f8f9fa; }
+          .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; color: white; }
+          .logo { font-size: 32px; font-weight: bold; margin-bottom: 10px; }
+          .content { padding: 40px 30px; }
+          .pin-box { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; font-size: 48px; font-weight: bold; padding: 30px; border-radius: 12px; text-align: center; letter-spacing: 15px; margin: 30px 0; box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+          .security-note { background: #fff3e0; border-left: 5px solid #ff9800; padding: 20px; border-radius: 8px; margin: 25px 0; }
+          .footer { background: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 14px; }
+          .info-box { background: #e8f4fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 5px solid #2196f3; }
         </style>
       </head>
       <body>
         <div class="container">
+          <div class="header">
+            <div class="logo">MarketMix Kenya</div>
+            <h2 style="margin: 10px 0 0 0; font-weight: 300;">Withdrawal PIN Recovery</h2>
+          </div>
+          
           <div class="content">
-            <div class="header">
-              <div class="logo">MARKETPLACE</div>
-              <h1>Withdrawal PIN Recovery</h1>
-              <p>Here is your requested PIN information</p>
+            <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Hello Seller,</h3>
+            <p style="color: #666; text-align: center; margin-bottom: 30px;">You requested your withdrawal PIN. Here it is:</p>
+            
+            <div class="pin-box">
+              ${pin}
             </div>
             
-            <div style="text-align: center; margin-bottom: 20px;">
-              <p style="color: #666; font-size: 16px;">Your withdrawal PIN is:</p>
+            <div class="security-note">
+              <h4 style="margin-top: 0; color: #856404;">⚠️ SECURITY ALERT</h4>
+              <ul style="margin-bottom: 0; color: #856404;">
+                <li>This PIN provides access to your funds</li>
+                <li>Never share it with anyone</li>
+                <li>MarketMix staff will never ask for your PIN</li>
+                <li>If you suspect unauthorized access, contact support immediately</li>
+              </ul>
             </div>
             
-            <div class="pin-display">
-              ${userData.withdrawalPin}
+            <div class="info-box">
+              <h4 style="margin-top: 0; color: #0c5460;">Request Details</h4>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Time:</strong> ${new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Email:</strong> ${email}</p>
+              <p style="margin: 5px 0; color: #0c5460;"><strong>Account ID:</strong> ${userId.slice(0, 8)}...</p>
             </div>
             
-            <div class="security-alert">
-              <p style="margin: 0;">
-                <strong>⚠️ IMPORTANT SECURITY NOTICE</strong><br>
-                • This PIN provides access to your funds<br>
-                • Never share it with anyone<br>
-                • Marketplace staff will never ask for your PIN<br>
-                • If you suspect unauthorized access, contact support immediately
-              </p>
-            </div>
-            
-            <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0;">
-              <p style="margin: 0; color: #666; font-size: 14px;">
-                <strong>Request Details:</strong><br>
-                • Time: ${new Date().toLocaleString()}<br>
-                • Email: ${email}
-              </p>
-            </div>
-            
-            <div class="footer">
-              <p>This email was sent in response to your PIN recovery request.</p>
-              <p>If you didn't request this, please secure your account immediately.</p>
-              <p style="margin-top: 20px;">
-                <a href="https://yourmarketplace.com/seller/dashboard" style="color: #667eea; text-decoration: none;">Go to Dashboard</a> | 
-                <a href="https://yourmarketplace.com/contact" style="color: #667eea; text-decoration: none;">Contact Support</a> | 
-                <a href="https://yourmarketplace.com" style="color: #667eea; text-decoration: none;">Visit Marketplace</a>
-              </p>
-            </div>
+            <p style="text-align: center; color: #666; margin-top: 30px;">
+              Need help? <a href="mailto:security@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
+            </p>
+          </div>
+          
+          <div class="footer">
+            <p style="margin: 0 0 10px 0;"><strong>MarketMix Kenya</strong></p>
+            <p style="margin: 0 0 10px 0; font-size: 12px;">This email was sent from <strong>security@marketmix.site</strong></p>
+            <p style="margin: 0; font-size: 12px;">If you didn't request this, please secure your account immediately.</p>
+            <p style="margin: 15px 0 0 0; font-size: 12px;">
+              <a href="https://marketmix.site" style="color: #667eea; text-decoration: none;">Visit Marketplace</a> | 
+              <a href="https://marketmix.site/seller/dashboard" style="color: #667eea; text-decoration: none;">Seller Dashboard</a> | 
+              <a href="mailto:security@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
+            </p>
           </div>
         </div>
       </body>
       </html>
     `;
 
-    // 6. Send email with PIN
+    // 6. Send email via Brevo
     const emailSent = await sendEmail(
       email,
-      '🔒 Your Withdrawal PIN Recovery Request',
+      '🔒 Your Withdrawal PIN Recovery - MarketMix Kenya',
       emailHtml
     );
 
     if (!emailSent) {
-      return res.status(500).json({ 
+      console.log(`⚠️ Email failed to send for ${email}`);
+      
+      return res.json({ 
         success: false, 
-        message: 'Failed to send PIN recovery email. Please contact support.' 
+        message: 'Failed to send PIN recovery email. Please try again or contact support.',
+        emailSent: false
       });
     }
 
+    console.log(`✅ PIN recovery email sent to ${email}`);
+    
     res.json({ 
       success: true, 
-      message: 'PIN recovery email sent successfully' 
+      message: 'PIN recovery email sent successfully',
+      emailSent: true,
+      note: 'Check your inbox and spam folder'
     });
 
   } catch (error) {
-    console.error('PIN recovery error:', error);
+    console.error('❌ PIN recovery error:', error);
     
-    // Log the error for security monitoring
+    // Log the error
     try {
       await db.collection('securityLogs').add({
         userId: req.body?.userId || 'unknown',
@@ -690,13 +717,7 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// ---------------------- CORRECTED & STABILIZED: Hugging Face image generation route ----------------------
-/*
-  This route is now extremely defensive:
-  1. Guarantees a JSON error body on server crash or provider failure (Fixes frontend JSON.parse error).
-  2. Uses wait_for_model: true to prevent 503 errors when the model is asleep.
-  3. Returns a Base64 Data URI in a JSON body (required by the frontend utility).
-*/
+// ✅ Hugging Face image generation
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
@@ -704,7 +725,6 @@ app.post("/api/generate-ai-image", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid prompt" });
     }
 
-    // CRITICAL: Ensure HF_API_KEY is present
     if (!process.env.HF_API_KEY) {
       console.error("Missing HF_API_KEY in environment");
       return res.status(500).json({ success: false, message: "Server misconfiguration: HF_API_KEY is missing." });
@@ -717,11 +737,11 @@ app.post("/api/generate-ai-image", async (req, res) => {
         headers: {
           "Authorization": `Bearer ${process.env.HF_API_KEY}`,
           "Content-Type": "application/json",
-          "Accept": "image/png" // Explicitly request PNG
+          "Accept": "image/png"
         },
         body: JSON.stringify({ 
              inputs: prompt,
-             options: { wait_for_model: true } // Crucial for cold-start prevention
+             options: { wait_for_model: true }
         })
       }
     );
@@ -731,7 +751,7 @@ app.post("/api/generate-ai-image", async (req, res) => {
       let bodyText = "Hugging Face call failed.";
       try {
         bodyText = await hfResponse.text();
-      } catch (e) { /* silent fail */ }
+      } catch (e) { }
       
       console.error(`Hugging Face error ${status}:`, bodyText.slice(0, 300));
       return res.status(502).json({
@@ -744,31 +764,111 @@ app.post("/api/generate-ai-image", async (req, res) => {
 
     const contentType = hfResponse.headers.get("content-type") || "image/png";
     const arrBuf = await hfResponse.arrayBuffer();
-    
-    // ⭐ STABILITY FIX: Convert ArrayBuffer to Buffer safely
     const imageBuffer = Buffer.from(arrBuf);
-    
-    // Convert the image buffer to Base64 Data URI
     const base64Image = imageBuffer.toString('base64');
     const imageUrl = `data:${contentType};base64,${base64Image}`;
 
-    // Send the Data URI back in a JSON object
     return res.json({ imageUrl: imageUrl, success: true });
     
   } catch (err) {
-    console.error("❌ AI generation error in server.js catch block:", err);
-    // ⭐ CRITICAL FIX: Ensure that even the generic catch returns a valid JSON response body
+    console.error("❌ AI generation error:", err);
     return res.status(500).json({ 
         success: false, 
-        message: "AI generation failed due to a server-side error (500).", 
+        message: "AI generation failed due to a server-side error.", 
         detail: err.message
     });
   }
 });
-// ------------------------------------------------------------------------
+
+// ============================
+// Debug & Test Endpoints
+// ============================
+
+// ✅ Test Brevo setup
+app.get("/api/test-email-setup", async (req, res) => {
+  try {
+    if (!BREVO_API_KEY) {
+      return res.json({
+        success: false,
+        message: "BREVO_API_KEY not configured in environment",
+        help: "Add BREVO_API_KEY to Render environment variables",
+        currentEnv: Object.keys(process.env).filter(k => k.includes('BREVO') || k.includes('EMAIL'))
+      });
+    }
+
+    // Test account info
+    const accountResponse = await fetch('https://api.brevo.com/v3/account', {
+      headers: {
+        'accept': 'application/json',
+        'api-key': BREVO_API_KEY
+      }
+    });
+    
+    const accountData = await accountResponse.json();
+    
+    if (!accountResponse.ok) {
+      return res.json({
+        success: false,
+        message: 'Brevo API key is invalid',
+        error: accountData.message || 'Check your API key',
+        status: accountResponse.status
+      });
+    }
+
+    // Test sending
+    const testEmailHtml = `
+      <h2>✅ Brevo Test Successful!</h2>
+      <p>Your Brevo API is working correctly with:</p>
+      <ul>
+        <li><strong>Sender:</strong> security@marketmix.site</li>
+        <li><strong>Account:</strong> ${accountData.email}</li>
+        <li><strong>Time:</strong> ${new Date().toLocaleString()}</li>
+      </ul>
+    `;
+    
+    const emailSent = await sendEmail(
+      'johnnjanjo4@gmail.com',
+      '✅ Brevo Test - PIN Recovery System Working',
+      testEmailHtml
+    );
+
+    res.json({
+      success: true,
+      message: '✅ Brevo API key is working!',
+      account: {
+        email: accountData.email,
+        firstName: accountData.firstName,
+        lastName: accountData.lastName
+      },
+      sender: 'security@marketmix.site is configured',
+      emailTest: emailSent ? '✅ Test email sent successfully' : '❌ Test email failed',
+      note: 'Check johnnjanjo4@gmail.com for test email'
+    });
+    
+  } catch (error) {
+    console.error('❌ Brevo test error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Brevo test failed',
+      error: error.message
+    });
+  }
+});
 
 // ✅ Health check
-app.get("/_health", (req, res) => res.json({ ok: true, timestamp: Date.now() }));
+app.get("/_health", (req, res) => {
+  const health = {
+    ok: true,
+    timestamp: Date.now(),
+    services: {
+      firebase: true,
+      brevo: !!BREVO_API_KEY,
+      intasend: true
+    },
+    uptime: process.uptime()
+  };
+  res.json(health);
+});
 
 // 404 fallback
 app.use((req, res) =>
@@ -776,21 +876,17 @@ app.use((req, res) =>
 );
 
 // ============================
-// Global error / process handlers
+// Global error handlers
 // ============================
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
-  // optionally: notify monitoring service here
 });
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled Rejection:", reason);
-  // optionally: notify monitoring service here
 });
 
 // ============================
-// Stealth keep-alive (in-memory http request, with jitter)
-// - Enabled automatically in production unless KEEP_ALIVE=0
-// - You can explicitly enable in non-production with KEEP_ALIVE=true
+// Stealth keep-alive
 // ============================
 (function setupKeepAlive() {
   const explicitDisable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
@@ -803,15 +899,14 @@ process.on("unhandledRejection", (reason) => {
     return;
   }
 
-  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000; // default 4 minutes
-  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000; // +/- 30s jitter
-  const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000; // 1s timeout
+  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
+  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
+  const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
 
   let keepAliveInterval = null;
 
   const scheduleNext = () => {
-    // compute next delay with jitter
-    const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS; // -J..+J
+    const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS;
     const delay = Math.max(1000, BASE_INTERVAL_MS + jitter);
 
     keepAliveInterval = setTimeout(() => {
@@ -825,7 +920,6 @@ process.on("unhandledRejection", (reason) => {
         };
 
         const req = http.request(options, (res) => {
-          // consume and discard any data so sockets are clean
           res.on("data", () => {});
           res.on("end", () => {});
         });
@@ -833,28 +927,20 @@ process.on("unhandledRejection", (reason) => {
         req.on("timeout", () => {
           try { req.destroy(); } catch (e) {}
         });
-        req.on("error", () => {
-          // intentionally swallow: keep-alive must not crash or log noisy errors
-        });
+        req.on("error", () => {});
 
-        // end the request immediately — server will handle quickly
         req.end();
       } catch (err) {
-        // swallow: keep-alive must be silent
       } finally {
-        // schedule next run
         scheduleNext();
       }
     }, delay);
 
-    // allow process to exit if nothing else is keeping it alive
     if (typeof keepAliveInterval.unref === "function") keepAliveInterval.unref();
   };
 
-  // start the loop
   scheduleNext();
 
-  // clear on graceful shutdown
   const clear = () => {
     try {
       if (keepAliveInterval) clearTimeout(keepAliveInterval);
@@ -869,9 +955,14 @@ process.on("unhandledRejection", (reason) => {
 // ============================
 // Start server
 // ============================
-const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not configured'}`);
+  console.log(`📧 Sender: security@marketmix.site`);
+  console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
+});
 
-// Graceful shutdown for the server itself
+// Graceful shutdown
 const shutdown = async () => {
   console.log("Shutting down server...");
   try {
@@ -879,7 +970,6 @@ const shutdown = async () => {
       console.log("Server closed");
       process.exit(0);
     });
-    // force exit if not closed in time
     setTimeout(() => process.exit(1), 5000).unref();
   } catch (e) {
     console.error("Error during shutdown:", e);
