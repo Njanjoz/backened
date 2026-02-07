@@ -1,12 +1,14 @@
-/* Full replacement: Express backend for Campus Store with Brevo Email Integration
-   Features:
-   - Brevo transactional email for PIN recovery (REPLACEMENT CODES ONLY)
-   - Automated order confirmation emails after purchase
-   - Real-time fee listener from Firestore
-   - IntaSend B2C withdrawals
-   - Hugging Face image generation
-   - Stealth keep-alive for Render
-*/
+// server.js
+// Full Express backend for Campus Store with Brevo Email Integration & Subscription Support
+// Features:
+// - Brevo transactional email for PIN recovery (REPLACEMENT CODES ONLY)
+// - Automated order confirmation emails after purchase
+// - Real-time fee listener from Firestore
+// - IntaSend B2C withdrawals
+// - Hugging Face image generation
+// - Subscription payment handling (M-Pesa STK Push)
+// - Subscription status polling and confirmation
+// - Stealth keep-alive for Render
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -29,6 +31,8 @@ const PORT = Number(process.env.PORT) || 3001;
 const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
@@ -59,6 +63,7 @@ app.use(
 // ============================
 app.use(bodyParser.json());
 
+// Request logging middleware
 app.use((req, res, next) => {
   try {
     console.log(
@@ -734,10 +739,161 @@ function sendServerError(res, err, msg = "Internal server error") {
 }
 
 // ============================
+// NEW: Subscription Helper Functions
+// ============================
+
+// Validate subscription payment data
+const validateSubscriptionPayment = (data) => {
+  const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data;
+  
+  if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
+    return { valid: false, message: "Missing required fields" };
+  }
+  
+  const amt = parsePositiveNumber(amount);
+  if (!amt) return { valid: false, message: "Invalid amount" };
+  
+  if (!isValidPhone(phoneNumber)) {
+    return { valid: false, message: "Invalid phone number format. Use 2547XXXXXXXX or 2541XXXXXXXX" };
+  }
+  
+  if (!email.includes("@")) return { valid: false, message: "Invalid email" };
+  
+  return { valid: true, data: { ...data, amount: amt } };
+};
+
+// Create subscription record in Firestore
+const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
+  try {
+    const subscriptionRef = db.collection('subscriptions').doc(subscriptionData.orderId);
+    
+    const subscriptionRecord = {
+      sellerId: subscriptionData.sellerId,
+      planId: subscriptionData.planId,
+      planName: subscriptionData.planName,
+      amount: subscriptionData.amount,
+      invoiceId: invoiceId,
+      status: 'pending',
+      paymentMethod: 'mpesa',
+      phoneNumber: subscriptionData.phoneNumber,
+      email: subscriptionData.email,
+      fullName: subscriptionData.fullName,
+      orderId: subscriptionData.orderId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: null,
+      paymentStatus: 'pending',
+      mpesaReference: null
+    };
+    
+    await subscriptionRef.set(subscriptionRecord);
+    return subscriptionRef.id;
+  } catch (error) {
+    console.error('Failed to create subscription record:', error);
+    throw error;
+  }
+};
+
+// Get subscription status from IntaSend
+const getSubscriptionPaymentStatus = async (invoiceId) => {
+  try {
+    // This would normally call IntaSend API to check payment status
+    // For now, we'll simulate by checking Firestore
+    const subscriptionSnapshot = await db.collection('subscriptions')
+      .where('invoiceId', '==', invoiceId)
+      .limit(1)
+      .get();
+    
+    if (subscriptionSnapshot.empty) {
+      return { success: false, message: 'Subscription not found' };
+    }
+    
+    const subscription = subscriptionSnapshot.docs[0].data();
+    return { 
+      success: true, 
+      data: {
+        paymentStatus: subscription.paymentStatus || 'pending',
+        mpesaReference: subscription.mpesaReference,
+        status: subscription.status
+      }
+    };
+  } catch (error) {
+    console.error('Failed to get subscription status:', error);
+    return { success: false, message: 'Failed to check payment status' };
+  }
+};
+
+// Activate subscription after payment
+const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
+  try {
+    const { orderId, planId, sellerId, sellerEmail } = subscriptionData;
+    
+    // Calculate expiration date (30 days from now)
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 30);
+    
+    // Update subscription record
+    const subscriptionRef = db.collection('subscriptions').doc(orderId);
+    await subscriptionRef.update({
+      status: 'active',
+      paymentStatus: 'paid',
+      mpesaReference: mpesaReference,
+      activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: expiresAt,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    // Update seller's subscription status
+    const sellerRef = db.collection('users').doc(sellerId);
+    await sellerRef.update({
+      subscriptionPlan: planId,
+      subscriptionStatus: 'active',
+      subscriptionActive: true,
+      subscriptionExpiresAt: expiresAt,
+      subscriptionStartedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastSubscriptionPayment: {
+        amount: subscriptionData.amount,
+        date: admin.firestore.FieldValue.serverTimestamp(),
+        reference: mpesaReference,
+        orderId: orderId
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    // Create subscription payment record
+    await db.collection('subscriptionPayments').add({
+      sellerId,
+      planId,
+      amount: subscriptionData.amount,
+      mpesaReference,
+      orderId,
+      status: 'completed',
+      sellerEmail,
+      paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: expiresAt
+    });
+    
+    // Log subscription activation
+    await db.collection('subscriptionLogs').add({
+      sellerId,
+      action: 'subscription_activated',
+      planId,
+      amount: subscriptionData.amount,
+      orderId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Failed to activate subscription:', error);
+    throw error;
+  }
+};
+
+// ============================
 // Routes
 // ============================
 
-// ✅ STK Push
+// ✅ STK Push for Regular Orders
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body;
@@ -799,6 +955,121 @@ app.post("/api/stk-push", async (req, res) => {
   }
 });
 
+// ✅ NEW: Subscription Payment Endpoint
+app.post("/api/subscription-payment", async (req, res) => {
+  try {
+    console.log("📦 Subscription payment request:", req.body);
+    
+    const validation = validateSubscriptionPayment(req.body);
+    if (!validation.valid) {
+      return res.status(400).json({ success: false, message: validation.message });
+    }
+    
+    const subscriptionData = validation.data;
+    const { amount, phoneNumber, fullName, email, orderId } = subscriptionData;
+    
+    const [firstName, ...rest] = fullName.trim().split(" ");
+    const lastName = rest.join(" ") || "N/A";
+
+    let intasendResponse;
+    try {
+      intasendResponse = await intasend.collection().mpesaStkPush({
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        phone_number: phoneNumber,
+        amount: amount,
+        host: BACKEND_HOST,
+        api_ref: orderId,
+      });
+    } catch (intasendErr) {
+      console.error(
+        "❌ IntaSend Subscription STK Push failed:",
+        intasendErr?.response || intasendErr
+      );
+      return res
+        .status(502)
+        .json({ success: false, message: "Payment provider error" });
+    }
+
+    // Create subscription record
+    const invoiceId = intasendResponse?.invoice?.invoice_id;
+    await createSubscriptionRecord(subscriptionData, invoiceId);
+
+    return res.json({ 
+      success: true, 
+      data: intasendResponse,
+      message: "Subscription payment initiated successfully" 
+    });
+  } catch (error) {
+    console.error("❌ Subscription payment error:", error);
+    return sendServerError(res, error, "Subscription payment failed");
+  }
+});
+
+// ✅ NEW: Subscription Status Check Endpoint
+app.get("/api/subscription-status/:invoiceId", async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    
+    if (!invoiceId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Missing invoice ID" 
+      });
+    }
+    
+    const status = await getSubscriptionPaymentStatus(invoiceId);
+    
+    if (!status.success) {
+      return res.status(404).json(status);
+    }
+    
+    return res.json(status);
+  } catch (error) {
+    console.error("❌ Subscription status check error:", error);
+    return sendServerError(res, error, "Failed to check subscription status");
+  }
+});
+
+// ✅ NEW: Confirm Subscription Endpoint
+app.post("/api/confirm-subscription", async (req, res) => {
+  try {
+    const { orderId, mpesaReference, planId, sellerId, sellerEmail } = req.body;
+    
+    console.log("✅ Confirming subscription:", { orderId, mpesaReference });
+    
+    if (!orderId || !mpesaReference || !planId || !sellerId || !sellerEmail) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Missing required fields" 
+      });
+    }
+    
+    // Activate the subscription
+    await activateSellerSubscription({
+      orderId,
+      planId,
+      sellerId,
+      sellerEmail,
+      amount: req.body.amount // Optional, can be fetched from subscription record
+    }, mpesaReference);
+    
+    return res.json({ 
+      success: true, 
+      message: "Subscription activated successfully",
+      data: {
+        orderId,
+        activated: true,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error("❌ Confirm subscription error:", error);
+    return sendServerError(res, error, "Failed to confirm subscription");
+  }
+});
+
 // ✅ IntaSend callback - UPDATED WITH EMAIL CONFIRMATION
 app.post("/api/intasend-callback", async (req, res) => {
   try {
@@ -809,68 +1080,105 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (state === "COMPLETE") status = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) status = "failed";
 
-    // Get order data before updating
-    const orderRef = db.collection("orders").doc(api_ref);
-    const orderSnap = await orderRef.get();
+    // Check if this is a subscription payment or regular order
+    const isSubscription = api_ref.startsWith('SUB_');
     
-    if (!orderSnap.exists) {
-      console.error(`Order ${api_ref} not found`);
-      return res.status(404).send("Order not found");
-    }
-
-    const orderData = orderSnap.data();
-    
-    // Update the order status
-    await orderRef.update({
-      paymentStatus: status,
-      mpesaReference: mpesa_reference || null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    console.log(`Order ${api_ref} updated to status: ${status}`);
-
-    // If payment is successful, send confirmation email
-    if (state === "COMPLETE") {
-      console.log(`Payment successful for order ${api_ref}, sending confirmation email...`);
+    if (isSubscription) {
+      // Handle subscription payment callback
+      const subscriptionRef = db.collection('subscriptions').doc(api_ref);
+      const subscriptionSnap = await subscriptionRef.get();
       
-      // Get user email
-      let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
-      
-      if (!userEmail && orderData.userId) {
-        try {
-          const userDoc = await db.collection('users').doc(orderData.userId).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            userEmail = userData.email;
+      if (subscriptionSnap.exists) {
+        await subscriptionRef.update({
+          paymentStatus: status,
+          mpesaReference: mpesa_reference || null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        
+        console.log(`Subscription ${api_ref} updated to status: ${status}`);
+        
+        // If payment successful, activate subscription
+        if (state === "COMPLETE") {
+          const subscriptionData = subscriptionSnap.data();
+          try {
+            await activateSellerSubscription({
+              orderId: api_ref,
+              planId: subscriptionData.planId,
+              sellerId: subscriptionData.sellerId,
+              sellerEmail: subscriptionData.email,
+              amount: subscriptionData.amount
+            }, mpesa_reference);
+            
+            console.log(`✅ Subscription ${api_ref} activated successfully`);
+          } catch (activationError) {
+            console.error('Failed to activate subscription:', activationError);
           }
-        } catch (userErr) {
-          console.error('Failed to fetch user email:', userErr);
         }
       }
+    } else {
+      // Handle regular order callback
+      const orderRef = db.collection("orders").doc(api_ref);
+      const orderSnap = await orderRef.get();
       
-      if (userEmail) {
-        console.log(`Sending order confirmation to ${userEmail} for order ${api_ref}`);
+      if (!orderSnap.exists) {
+        console.error(`Order ${api_ref} not found`);
+        return res.status(404).send("Order not found");
+      }
+
+      const orderData = orderSnap.data();
+      
+      // Update the order status
+      await orderRef.update({
+        paymentStatus: status,
+        mpesaReference: mpesa_reference || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log(`Order ${api_ref} updated to status: ${status}`);
+
+      // If payment is successful, send confirmation email
+      if (state === "COMPLETE") {
+        console.log(`Payment successful for order ${api_ref}, sending confirmation email...`);
         
-        // Send order confirmation email asynchronously
-        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
-          .then(success => {
-            if (success) {
-              console.log(`✅ Order confirmation email sent for ${api_ref}`);
-              
-              // Update order with email sent flag
-              orderRef.update({
-                confirmationEmailSent: true,
-                confirmationSentAt: admin.firestore.FieldValue.serverTimestamp()
-              }).catch(e => console.error('Failed to update email flag:', e));
-            } else {
-              console.log(`❌ Failed to send confirmation email for ${api_ref}`);
+        // Get user email
+        let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
+        
+        if (!userEmail && orderData.userId) {
+          try {
+            const userDoc = await db.collection('users').doc(orderData.userId).get();
+            if (userDoc.exists) {
+              const userData = userDoc.data();
+              userEmail = userData.email;
             }
-          })
-          .catch(emailErr => {
-            console.error('Email sending error:', emailErr);
-          });
-      } else {
-        console.log(`⚠️ No email found for order ${api_ref}, skipping confirmation email`);
+          } catch (userErr) {
+            console.error('Failed to fetch user email:', userErr);
+          }
+        }
+        
+        if (userEmail) {
+          console.log(`Sending order confirmation to ${userEmail} for order ${api_ref}`);
+          
+          // Send order confirmation email asynchronously
+          sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+            .then(success => {
+              if (success) {
+                console.log(`✅ Order confirmation email sent for ${api_ref}`);
+                
+                // Update order with email sent flag
+                orderRef.update({
+                  confirmationEmailSent: true,
+                  confirmationSentAt: admin.firestore.FieldValue.serverTimestamp()
+                }).catch(e => console.error('Failed to update email flag:', e));
+              } else {
+                console.log(`❌ Failed to send confirmation email for ${api_ref}`);
+              }
+            })
+            .catch(emailErr => {
+              console.error('Email sending error:', emailErr);
+            });
+        } else {
+          console.log(`⚠️ No email found for order ${api_ref}, skipping confirmation email`);
+        }
       }
     }
 
@@ -1655,6 +1963,7 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
   console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`🖼️ Logo Image: https://i.ibb.co/JjSrxbPz/icon-png-1.png`);
+  console.log(`💰 Subscription System: ✅ Ready`);
 });
 
 // Graceful shutdown
