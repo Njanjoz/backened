@@ -3,6 +3,7 @@
 // Features:
 // - Brevo transactional email for PIN recovery (REPLACEMENT CODES ONLY)
 // - Automated order confirmation emails after purchase
+// - Proposal status emails (approval/rejection)
 // - Real-time fee listener from Firestore
 // - IntaSend B2C withdrawals
 // - Hugging Face image generation
@@ -129,6 +130,8 @@ const sendEmail = async (to, subject, html, type = 'security') => {
     if (!BREVO_API_KEY) {
       console.log('❌ BREVO_API_KEY not configured in environment');
       console.log('📧 Email would have been sent to:', to);
+      console.log('📧 Sender:', type === 'sales' ? 'MarketMixKenya <sales@marketmix.site>' : 'MarketMixKenya <security@marketmix.site>');
+      console.log('📧 Subject:', subject);
       return false;
     }
     
@@ -173,6 +176,7 @@ const sendEmail = async (to, subject, html, type = 'security') => {
     console.log(`📧 Message ID: ${data.messageId}`);
     console.log(`📧 To: ${to}`);
     console.log(`📧 From: ${sender.name} <${sender.email}>`);
+    console.log(`📧 Type: ${type}`);
     return true;
     
   } catch (error) {
@@ -209,6 +213,143 @@ const sendEmail = async (to, subject, html, type = 'security') => {
     console.warn('⚠️ BREVO_API_KEY not set in environment - emails will not be sent');
   }
 })();
+
+// ============================
+// NEW: Proposal Status Email Function
+// ============================
+const sendProposalStatusEmail = async (emailData) => {
+  try {
+    console.log(`📧 Sending proposal status email to: ${emailData.to}`);
+    console.log(`📧 Proposal ID: ${emailData.proposalId}`);
+    console.log(`📧 Status: ${emailData.status}`);
+    
+    if (!BREVO_API_KEY) {
+      console.log('❌ BREVO_API_KEY not configured - skipping email');
+      return false;
+    }
+    
+    // Format email using provided HTML from frontend
+    const emailHtml = emailData.html || `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6; 
+      color: #1f2937; 
+      margin: 0; 
+      padding: 0; 
+      background: #f9fafb;
+    }
+    .container { 
+      max-width: 600px; 
+      margin: 0 auto; 
+      background: white; 
+      border-radius: 16px; 
+      overflow: hidden; 
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08); 
+      border: 1px solid #e5e7eb;
+    }
+    .header {
+      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+      padding: 32px 24px;
+      text-align: center;
+      color: white;
+    }
+    .content {
+      padding: 32px 24px;
+    }
+    .footer {
+      background: #f8f9fa;
+      padding: 24px;
+      text-align: center;
+      border-top: 1px solid #e9ecef;
+      color: #6c757d;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div style="font-size: 24px; font-weight: bold; margin-bottom: 8px;">MarketMix Kenya</div>
+      <h2 style="margin: 8px 0 0 0; font-weight: 300; font-size: 16px; opacity: 0.9;">Lipa Mdogo Mdogo Installment Update</h2>
+    </div>
+    
+    <div class="content">
+      <h3 style="color: #1f2937; margin-bottom: 8px; font-size: 18px;">Hello ${emailData.studentName || 'Student'},</h3>
+      <p style="color: #4b5563; margin-bottom: 20px;">Your installment proposal has been reviewed.</p>
+      
+      <div style="background: ${emailData.status === 'approved' ? '#f0fdf4' : '#fef2f2'}; 
+                  border-left: 4px solid ${emailData.status === 'approved' ? '#10b981' : '#ef4444'}; 
+                  padding: 16px; 
+                  border-radius: 8px; 
+                  margin: 20px 0;">
+        <h4 style="margin-top: 0; color: ${emailData.status === 'approved' ? '#065f46' : '#7c2d12'}; 
+                   margin-bottom: 8px; font-size: 14px;">
+          Status: ${emailData.status === 'approved' ? 'APPROVED ✅' : 'REJECTED ❌'}
+        </h4>
+        ${emailData.notes ? `<p style="color: #374151; margin: 0; font-size: 14px; line-height: 1.5;">${emailData.notes.replace(/\n/g, '<br>')}</p>` : ''}
+      </div>
+      
+      <div style="background: #f8fafc; border-radius: 10px; padding: 20px; margin: 20px 0; border: 1px solid #e2e8f0;">
+        <p style="margin: 0 0 10px 0; font-size: 14px;"><strong>Proposal Details:</strong></p>
+        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>ID:</strong> ${emailData.proposalId?.substring(0, 8) || 'N/A'}</p>
+        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>Amount:</strong> KSH ${parseFloat(emailData.amount || 0).toLocaleString()}</p>
+        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>Institution:</strong> ${emailData.institution || 'N/A'}</p>
+      </div>
+    </div>
+    
+    <div class="footer">
+      <p style="margin: 0 0 8px 0; font-weight: 500;">MarketMix Kenya © ${new Date().getFullYear()}</p>
+      <p style="margin: 0; font-size: 12px;">This email was sent from <strong>MarketMixKenya &lt;sales@marketmix.site&gt;</strong></p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+    // Send email via MarketMixKenya <sales@marketmix.site>
+    const emailSent = await sendEmail(
+      emailData.to,
+      emailData.subject || `Your Installment Proposal Update - MarketMix Kenya`,
+      emailHtml,
+      'sales'
+    );
+
+    if (emailSent) {
+      // Log the email in Firestore
+      try {
+        await db.collection('proposalStatusEmails').add({
+          proposalId: emailData.proposalId,
+          studentEmail: emailData.to,
+          studentName: emailData.studentName,
+          status: emailData.status,
+          notes: emailData.notes || '',
+          amount: emailData.amount || 0,
+          institution: emailData.institution || '',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          sender: 'MarketMixKenya <sales@marketmix.site>',
+          authenticated: true,
+          dmarc: 'configured',
+          dkim: 'signed'
+        });
+        
+        console.log(`✅ Proposal status email logged for ${emailData.proposalId}`);
+      } catch (logErr) {
+        console.error('Failed to log proposal status email:', logErr);
+      }
+    }
+    
+    return emailSent;
+    
+  } catch (error) {
+    console.error('❌ Proposal status email failed:', error.message);
+    return false;
+  }
+};
 
 // ============================
 // PIN Recovery System (Replacement Codes)
@@ -892,6 +1033,64 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
 // ============================
 // Routes
 // ============================
+
+// ✅ NEW: Proposal Status Email Endpoint
+app.post("/api/send-proposal-status", async (req, res) => {
+  try {
+    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body;
+    
+    console.log(`📧 Proposal status email request received`);
+    console.log(`📧 To: ${to}`);
+    console.log(`📧 Proposal ID: ${proposalId}`);
+    console.log(`📧 Status: ${status}`);
+    
+    if (!to || !proposalId || !status) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields: to, proposalId, status' 
+      });
+    }
+
+    const emailData = {
+      to,
+      subject: subject || `Your Installment Proposal Has Been ${status === 'approved' ? 'Approved' : 'Rejected'} - MarketMix Kenya`,
+      html,
+      proposalId,
+      studentName,
+      status,
+      notes,
+      amount,
+      institution
+    };
+
+    const emailSent = await sendProposalStatusEmail(emailData);
+    
+    if (emailSent) {
+      res.json({ 
+        success: true, 
+        message: 'Proposal status email sent successfully',
+        data: {
+          to,
+          proposalId,
+          status,
+          sentAt: new Date().toISOString(),
+          sender: 'MarketMixKenya <sales@marketmix.site>'
+        }
+      });
+    } else {
+      res.status(500).json({ 
+        success: false, 
+        message: 'Failed to send proposal status email' 
+      });
+    }
+  } catch (error) {
+    console.error('❌ Send proposal status email error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error while sending email' 
+    });
+  }
+});
 
 // ✅ STK Push for Regular Orders
 app.post("/api/stk-push", async (req, res) => {
@@ -1829,7 +2028,7 @@ app.get("/api/test-email-auth", async (req, res) => {
         sales: {
           name: "MarketMixKenya",
           email: "sales@marketmix.site",
-          purpose: "Order confirmations, customer support",
+          purpose: "Order confirmations, customer support, proposal status",
           status: "Verified"
         }
       },
@@ -1851,6 +2050,51 @@ app.get("/api/test-email-auth", async (req, res) => {
   }
 });
 
+// ✅ Test Proposal Status Email
+app.post("/api/test-proposal-email", async (req, res) => {
+  try {
+    const testEmail = req.body.email || 'test@example.com';
+    
+    const testData = {
+      to: testEmail,
+      proposalId: 'TEST_' + Date.now(),
+      studentName: 'Test Student',
+      status: 'approved',
+      notes: 'This is a test email from the MarketMix proposal status system.',
+      amount: 15000,
+      institution: 'University of Nairobi'
+    };
+
+    console.log(`📧 Sending test proposal email to: ${testEmail}`);
+    
+    const emailSent = await sendProposalStatusEmail(testData);
+    
+    if (emailSent) {
+      res.json({
+        success: true,
+        message: 'Test proposal status email sent successfully',
+        data: {
+          to: testEmail,
+          sentAt: new Date().toISOString(),
+          sender: 'MarketMixKenya <sales@marketmix.site>'
+        }
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to send test email'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Test proposal email error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Test email failed',
+      error: error.message
+    });
+  }
+});
+
 // ✅ Health check
 app.get("/_health", (req, res) => {
   const health = {
@@ -1862,8 +2106,17 @@ app.get("/_health", (req, res) => {
       intasend: true,
       email_auth: {
         security: 'MarketMixKenya <security@marketmix.site>',
-        sales: 'MarketMixKenya <sales@marketmix.site>'
+        sales: 'MarketMixKenya <sales@marketmix.site>',
+        proposal_status: '✅ Ready'
       }
+    },
+    endpoints: {
+      proposal_status: '/api/send-proposal-status',
+      stk_push: '/api/stk-push',
+      subscription_payment: '/api/subscription-payment',
+      seller_withdrawal: '/api/seller/withdraw',
+      pin_recovery: '/api/seller/recover-pin',
+      order_confirmation: 'Automatic on payment'
     },
     uptime: process.uptime()
   };
@@ -1960,10 +2213,19 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not configured'}`);
   console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
   console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
+  console.log(`📧 Proposal Status Emails: ✅ Enabled`);
   console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
   console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`🖼️ Logo Image: https://i.ibb.co/JjSrxbPz/icon-png-1.png`);
   console.log(`💰 Subscription System: ✅ Ready`);
+  console.log(`📋 Proposal Management: ✅ Email notifications enabled`);
+  console.log(`📊 Available Endpoints:`);
+  console.log(`   POST /api/send-proposal-status - Send proposal approval/rejection emails`);
+  console.log(`   POST /api/stk-push - M-Pesa STK Push`);
+  console.log(`   POST /api/subscription-payment - Subscription payments`);
+  console.log(`   POST /api/seller/withdraw - Seller withdrawals`);
+  console.log(`   POST /api/seller/recover-pin - PIN recovery`);
+  console.log(`   GET /_health - Health check`);
 });
 
 // Graceful shutdown
