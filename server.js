@@ -9,7 +9,7 @@
 // - Hugging Face image generation
 // - Subscription payment handling (M-Pesa STK Push)
 // - Subscription status polling and confirmation
-// - Stealth keep-alive for Render
+// - Smart keep-alive with overnight pause (11pm - 5am)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -1224,7 +1224,7 @@ app.post("/api/confirm-subscription", async (req, res) => {
 });
 
 // ============================================================
-// ✅ CRITICAL FIX: IntaSend callback - UPDATED for wallet deposits
+// ✅ CRITICAL FIX: IntaSend callback - FIXED amount handling
 // ============================================================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
@@ -1236,6 +1236,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       state,
       mpesa_reference,
       invoice_id,
+      value: req.body.value, // Log the actual amount from callback
       timestamp: new Date().toISOString()
     });
 
@@ -1282,6 +1283,9 @@ app.post("/api/intasend-callback", async (req, res) => {
     const orderRef = db.collection("orders").doc(api_ref);
     let orderSnap = await orderRef.get();
     
+    // ✅ FIX: Get the actual amount from the callback
+    const callbackAmount = parseFloat(req.body.value);
+    
     // Auto-create order for wallet deposits if not exists
     if (!orderSnap.exists && isWalletDeposit) {
       console.log(`📝 Auto-creating wallet order: ${api_ref}`);
@@ -1289,13 +1293,15 @@ app.post("/api/intasend-callback", async (req, res) => {
       const parts = api_ref.split('_');
       const sellerId = parts[1];
       
-      // ✅ FIX: Get amount from the stored order data or use a safe default
-      // The amount should have been stored when the STK push was initiated
-      let amount = 10; // Safe fallback
+      // ✅ FIX: Use the actual amount from callback, not hardcoded 10
+      let amount = 1; // Default minimum
       
-      // Try to get amount from the original STK push request that would have been stored
-      // This requires that the amount was stored when creating the order
-      console.log(`⚠️ No amount found for wallet deposit, using fallback: ${amount}`);
+      if (callbackAmount && callbackAmount > 0 && callbackAmount <= 500000) {
+        amount = callbackAmount;
+        console.log(`✅ Using amount from callback: KSH ${amount}`);
+      } else {
+        console.log(`⚠️ Invalid callback amount: ${callbackAmount}, using default: ${amount}`);
+      }
       
       await orderRef.set({
         orderId: api_ref,
@@ -1331,7 +1337,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
 
     // ============================================================
-    // 🔥 CRITICAL FIX: Handle wallet deposit - USE CORRECT AMOUNT
+    // 🔥 FIXED: Handle wallet deposit with correct amount
     // ============================================================
     if (isWalletDeposit && state === "COMPLETE") {
       console.log(`💰 Processing wallet deposit: ${api_ref}`);
@@ -1339,13 +1345,18 @@ app.post("/api/intasend-callback", async (req, res) => {
       const parts = api_ref.split('_');
       const sellerId = parts[1];
       
-      // ✅ FIX: Get amount from orderData.totalAmount ONLY
-      // NEVER parse amount from api_ref parts (that contains timestamp)
-      let amount = orderData.totalAmount;
+      // ✅ FIX: Get amount from callback first, then orderData
+      let amount = callbackAmount;
       
-      // Validate amount is reasonable (not a timestamp)
+      // If callback amount is invalid, try orderData
       if (!amount || amount <= 0 || amount > 500000) {
-        console.error(`❌ Invalid amount detected: ${amount} - marking transaction as failed`);
+        amount = orderData.totalAmount;
+        console.log(`⚠️ Using amount from orderData: ${amount}`);
+      }
+      
+      // Final validation
+      if (!amount || amount <= 0 || amount > 500000) {
+        console.error(`❌ Invalid amount: ${amount} - marking transaction as failed`);
         await orderRef.update({
           paymentStatus: 'failed',
           errorMessage: 'Invalid amount detected'
@@ -1355,7 +1366,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       
       console.log(`✅ Processing deposit amount: KSH ${amount}`);
       
-      // ✅ CRITICAL: Use .doc(api_ref).set() to ensure Document ID = paymentRef
+      // Create adTransaction with correct amount
       const adTxRef = db.collection('adTransactions').doc(api_ref);
       
       await adTxRef.set({
@@ -1365,7 +1376,7 @@ app.post("/api/intasend-callback", async (req, res) => {
         sellerName: orderData.sellerName || null,
         sellerPhone: orderData.sellerPhone || null,
         type: 'deposit',
-        amount: amount,  // ✅ This is now the correct amount (1.00)
+        amount: amount,
         status: 'completed',
         paymentMethod: 'mpesa',
         mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
@@ -1376,7 +1387,7 @@ app.post("/api/intasend-callback", async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       
-      console.log(`✅ AdTransaction created/updated with ID: ${api_ref}, amount: ${amount}`);
+      console.log(`✅ AdTransaction created with amount: ${amount}`);
       
       // Update seller's wallet balance
       const walletRef = db.collection('sellerAdCredits').doc(sellerId);
@@ -1461,7 +1472,7 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ Ad Transaction lookup by paymentRef - NOW WORKS because doc ID = paymentRef
+// ✅ Ad Transaction lookup by paymentRef
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   try {
     const paymentRef = req.params.paymentRef;
@@ -1471,7 +1482,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
 
     console.log(`🔍 Looking up ad transaction: ${paymentRef}`);
 
-    // ✅ Direct document lookup by ID (since we now use paymentRef as document ID)
+    // Direct document lookup by ID
     const adTxDoc = await db.collection('adTransactions').doc(paymentRef).get();
 
     if (adTxDoc.exists) {
@@ -1494,8 +1505,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       if (orderData.paymentStatus === 'paid' && orderData.isWalletDeposit) {
         console.log(`🔄 Creating missing adTransaction for ${paymentRef}`);
         
-        // ✅ FIX: Use orderData.totalAmount for correct amount
-        const correctAmount = orderData.totalAmount || 10;
+        const correctAmount = orderData.totalAmount || 1;
         
         await db.collection('adTransactions').doc(paymentRef).set({
           paymentRef: paymentRef,
@@ -2186,8 +2196,10 @@ process.on("unhandledRejection", (reason) => {
   console.error("Unhandled Rejection:", reason);
 });
 
-// Stealth keep-alive
-(function setupKeepAlive() {
+// ============================================================
+// SMART KEEP-ALIVE with overnight pause (11pm - 5am EAT)
+// ============================================================
+(function setupSmartKeepAlive() {
   const explicitDisable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
   const explicitEnable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
   const isProd = process.env.NODE_ENV === "production";
@@ -2198,57 +2210,111 @@ process.on("unhandledRejection", (reason) => {
     return;
   }
 
-  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
-  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
+  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000; // 4 minutes
+  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000; // 30 seconds
   const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
+  
+  // Overnight pause: 11 PM to 5 AM East African Time (UTC+3)
+  const PAUSE_START_HOUR = 23; // 11 PM
+  const PAUSE_END_HOUR = 5;    // 5 AM
 
-  let keepAliveInterval = null;
+  let keepAliveTimeout = null;
+  let isPaused = false;
+
+  // Check if current time is within overnight pause period (EAT)
+  const isOvernightPause = () => {
+    const now = new Date();
+    // Convert to East African Time (UTC+3)
+    const eatHour = (now.getUTCHours() + 3) % 24;
+    
+    if (PAUSE_START_HOUR <= PAUSE_END_HOUR) {
+      // Example: 23 to 5 (wraps around midnight)
+      return eatHour >= PAUSE_START_HOUR || eatHour < PAUSE_END_HOUR;
+    } else {
+      return eatHour >= PAUSE_START_HOUR && eatHour < PAUSE_END_HOUR;
+    }
+  };
 
   const scheduleNext = () => {
+    // Clear any existing timeout
+    if (keepAliveTimeout) {
+      clearTimeout(keepAliveTimeout);
+      keepAliveTimeout = null;
+    }
+
+    const isPauseTime = isOvernightPause();
+    
+    if (isPauseTime) {
+      if (!isPaused) {
+        isPaused = true;
+        const now = new Date();
+        const eatHour = (now.getUTCHours() + 3) % 24;
+        console.log(`🌙 Entering overnight pause mode (${eatHour}:00 EAT) - No pings until 5 AM`);
+      }
+      // Check again in 5 minutes during pause
+      keepAliveTimeout = setTimeout(scheduleNext, 5 * 60 * 1000);
+      if (keepAliveTimeout.unref) keepAliveTimeout.unref();
+      return;
+    }
+
+    if (isPaused) {
+      isPaused = false;
+      console.log(`☀️ Exiting overnight pause mode - Resuming keep-alive pings`);
+    }
+
+    // Calculate next ping time with jitter
     const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS;
     const delay = Math.max(1000, BASE_INTERVAL_MS + jitter);
 
-    keepAliveInterval = setTimeout(() => {
-      try {
-        const options = {
-          host: "127.0.0.1",
-          port: PORT,
-          path: "/_health",
-          method: "GET",
-          timeout: REQUEST_TIMEOUT_MS,
-        };
+    keepAliveTimeout = setTimeout(() => {
+      // Double-check we're not in pause period before pinging
+      if (!isOvernightPause()) {
+        try {
+          const options = {
+            host: "127.0.0.1",
+            port: PORT,
+            path: "/_health",
+            method: "GET",
+            timeout: REQUEST_TIMEOUT_MS,
+          };
 
-        const req = http.request(options, (res) => {
-          res.on("data", () => {});
-          res.on("end", () => {});
-        });
+          const req = http.request(options, (res) => {
+            res.on("data", () => {});
+            res.on("end", () => {});
+          });
 
-        req.on("timeout", () => {
-          try { req.destroy(); } catch (e) {}
-        });
-        req.on("error", () => {});
-
-        req.end();
-      } catch (err) {
-      } finally {
-        scheduleNext();
+          req.on("timeout", () => {
+            try { req.destroy(); } catch (e) {}
+          });
+          req.on("error", () => {});
+          req.end();
+        } catch (err) {
+          // Silent fail
+        }
       }
+      scheduleNext();
     }, delay);
 
-    if (typeof keepAliveInterval.unref === "function") keepAliveInterval.unref();
+    if (keepAliveTimeout.unref) keepAliveTimeout.unref();
   };
 
+  // Start the keep-alive schedule
   scheduleNext();
 
-  const clear = () => {
-    try {
-      if (keepAliveInterval) clearTimeout(keepAliveInterval);
-    } catch (e) {}
-  };
-  process.on("SIGINT", clear);
-  process.on("SIGTERM", clear);
+  // Log schedule on startup
+  console.log(`🌀 Smart keep-alive initialized with overnight pause (${PAUSE_START_HOUR}:00 - ${PAUSE_END_HOUR}:00 EAT)`);
+  console.log(`   Ping interval: ~${BASE_INTERVAL_MS / 1000}s ±${JITTER_MS / 1000}s`);
+  console.log(`   Overnight pause: 11 PM - 5 AM (East African Time)`);
 
-  console.log(`🌀 Stealth keep-alive initialized. Interval ~${BASE_INTERVAL_MS}ms ±${JITTER_MS}ms`);
+  // Cleanup on shutdown
+  const cleanup = () => {
+    if (keepAliveTimeout) {
+      clearTimeout(keepAliveTimeout);
+      keepAliveTimeout = null;
+    }
+  };
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
 })();
 
 // Start server
@@ -2271,6 +2337,7 @@ const server = app.listen(PORT, () => {
   console.log(`   POST /api/seller/recover-pin - PIN recovery`);
   console.log(`   GET /api/ad-transaction/:paymentRef - Check wallet deposit status`);
   console.log(`   GET /_health - Health check`);
+  console.log(`🌀 Smart keep-alive: Active (pauses 11 PM - 5 AM EAT)`);
 });
 
 // Graceful shutdown
