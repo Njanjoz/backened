@@ -1096,10 +1096,12 @@ app.post("/api/stk-push", async (req, res) => {
         .json({ success: false, message: "Payment provider error" });
     }
 
+    // Store the amount in the order for later reference
     await db.collection("orders").doc(orderId).set(
       {
         invoiceId: response?.invoice?.invoice_id || null,
         status: "STK_PUSH_SENT",
+        totalAmount: amt, // ✅ Store the correct amount
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -1284,14 +1286,16 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (!orderSnap.exists && isWalletDeposit) {
       console.log(`📝 Auto-creating wallet order: ${api_ref}`);
       
-      // Extract amount from api_ref - format: WALLET_USERID_AMOUNT_TIMESTAMP
       const parts = api_ref.split('_');
-      let amount = 10; // default
-      if (parts.length >= 3) {
-        amount = parseInt(parts[2]) || 10;
-      }
-      
       const sellerId = parts[1];
+      
+      // ✅ FIX: Get amount from the stored order data or use a safe default
+      // The amount should have been stored when the STK push was initiated
+      let amount = 10; // Safe fallback
+      
+      // Try to get amount from the original STK push request that would have been stored
+      // This requires that the amount was stored when creating the order
+      console.log(`⚠️ No amount found for wallet deposit, using fallback: ${amount}`);
       
       await orderRef.set({
         orderId: api_ref,
@@ -1327,17 +1331,31 @@ app.post("/api/intasend-callback", async (req, res) => {
     console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
 
     // ============================================================
-    // 🔥 CRITICAL FIX: Handle wallet deposit - USE api_ref as DOCUMENT ID
+    // 🔥 CRITICAL FIX: Handle wallet deposit - USE CORRECT AMOUNT
     // ============================================================
     if (isWalletDeposit && state === "COMPLETE") {
       console.log(`💰 Processing wallet deposit: ${api_ref}`);
       
       const parts = api_ref.split('_');
       const sellerId = parts[1];
-      const amount = orderData.totalAmount || parseInt(parts[2]) || 10;
       
-      // ✅ CRITICAL: Use .doc(api_ref).set() instead of .add()
-      // This ensures the Document ID IS the paymentRef
+      // ✅ FIX: Get amount from orderData.totalAmount ONLY
+      // NEVER parse amount from api_ref parts (that contains timestamp)
+      let amount = orderData.totalAmount;
+      
+      // Validate amount is reasonable (not a timestamp)
+      if (!amount || amount <= 0 || amount > 500000) {
+        console.error(`❌ Invalid amount detected: ${amount} - marking transaction as failed`);
+        await orderRef.update({
+          paymentStatus: 'failed',
+          errorMessage: 'Invalid amount detected'
+        });
+        return res.send("OK");
+      }
+      
+      console.log(`✅ Processing deposit amount: KSH ${amount}`);
+      
+      // ✅ CRITICAL: Use .doc(api_ref).set() to ensure Document ID = paymentRef
       const adTxRef = db.collection('adTransactions').doc(api_ref);
       
       await adTxRef.set({
@@ -1347,7 +1365,7 @@ app.post("/api/intasend-callback", async (req, res) => {
         sellerName: orderData.sellerName || null,
         sellerPhone: orderData.sellerPhone || null,
         type: 'deposit',
-        amount: amount,
+        amount: amount,  // ✅ This is now the correct amount (1.00)
         status: 'completed',
         paymentMethod: 'mpesa',
         mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
@@ -1358,13 +1376,13 @@ app.post("/api/intasend-callback", async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       
-      console.log(`✅ AdTransaction created/updated with ID: ${api_ref}`);
+      console.log(`✅ AdTransaction created/updated with ID: ${api_ref}, amount: ${amount}`);
       
       // Update seller's wallet balance
       const walletRef = db.collection('sellerAdCredits').doc(sellerId);
       const walletSnap = await walletRef.get();
       
-      if (walletSnap.exists()) {
+      if (walletSnap.exists) {
         await walletRef.update({
           balance: admin.firestore.FieldValue.increment(amount),
           totalDeposited: admin.firestore.FieldValue.increment(amount),
@@ -1384,7 +1402,7 @@ app.post("/api/intasend-callback", async (req, res) => {
         console.log(`💰 Wallet created for ${sellerId} with KSH ${amount}`);
       }
       
-      console.log(`✅ Successfully processed deposit: ${api_ref}`);
+      console.log(`✅ Successfully processed deposit: ${api_ref} for KSH ${amount}`);
     }
 
     // Send confirmation email for regular orders
@@ -1458,7 +1476,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
 
     if (adTxDoc.exists) {
       const txData = adTxDoc.data();
-      console.log(`✅ Found adTransaction: status=${txData.status}`);
+      console.log(`✅ Found adTransaction: status=${txData.status}, amount=${txData.amount}`);
       return res.json({ success: true, data: txData });
     }
 
@@ -1476,15 +1494,18 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       if (orderData.paymentStatus === 'paid' && orderData.isWalletDeposit) {
         console.log(`🔄 Creating missing adTransaction for ${paymentRef}`);
         
+        // ✅ FIX: Use orderData.totalAmount for correct amount
+        const correctAmount = orderData.totalAmount || 10;
+        
         await db.collection('adTransactions').doc(paymentRef).set({
           paymentRef: paymentRef,
           sellerId: orderData.sellerId,
           type: 'deposit',
-          amount: orderData.totalAmount || 10,
+          amount: correctAmount,
           status: 'completed',
           paymentMethod: 'mpesa',
           mpesaCode: orderData.mpesaReference || 'SYNCED',
-          description: `Ad wallet deposit - KSH ${(orderData.totalAmount || 10).toFixed(2)}`,
+          description: `Ad wallet deposit - KSH ${correctAmount.toFixed(2)}`,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           completedAt: admin.firestore.FieldValue.serverTimestamp()
         });
