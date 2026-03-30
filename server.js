@@ -1469,7 +1469,7 @@ app.post("/api/intasend-callback", async (req, res) => {
   }
 });
 
-// ✅ Transaction lookup
+// ✅ Transaction lookup (for orders by invoiceId)
 app.get("/api/transaction/:invoiceId", async (req, res) => {
   try {
     const invoiceId = req.params.invoiceId;
@@ -1491,6 +1491,52 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
     return res.json({ success: true, data: docs.docs[0].data() });
   } catch (error) {
     return sendServerError(res, error, "Transaction lookup failed");
+  }
+});
+
+// ============================================================
+// ✅ NEW: Ad Transaction lookup by paymentRef (for wallet deposits)
+// ============================================================
+app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
+  try {
+    const paymentRef = req.params.paymentRef;
+    if (!paymentRef) {
+      return res.status(400).json({ success: false, message: "Missing paymentRef" });
+    }
+
+    console.log(`🔍 Looking up ad transaction with paymentRef: ${paymentRef}`);
+
+    // First try to find in adTransactions collection
+    const adTxSnapshot = await db
+      .collection("adTransactions")
+      .where("paymentRef", "==", paymentRef)
+      .limit(1)
+      .get();
+
+    if (!adTxSnapshot.empty) {
+      const txData = adTxSnapshot.docs[0].data();
+      console.log(`✅ Found adTransaction:`, txData);
+      return res.json({ success: true, data: txData });
+    }
+
+    // If not found, check orders collection (for backward compatibility)
+    const orderSnapshot = await db
+      .collection("orders")
+      .where("orderId", "==", paymentRef)
+      .limit(1)
+      .get();
+
+    if (!orderSnapshot.empty) {
+      const orderData = orderSnapshot.docs[0].data();
+      console.log(`✅ Found order:`, orderData);
+      return res.json({ success: true, data: orderData });
+    }
+
+    console.log(`❌ No transaction found for ${paymentRef}`);
+    return res.status(404).json({ success: false, message: "Transaction not found" });
+  } catch (error) {
+    console.error("Ad transaction lookup failed:", error);
+    return res.status(500).json({ success: false, message: "Lookup failed" });
   }
 });
 
@@ -2197,7 +2243,8 @@ app.get("/_health", (req, res) => {
       subscription_payment: '/api/subscription-payment',
       seller_withdrawal: '/api/seller/withdraw',
       pin_recovery: '/api/seller/recover-pin',
-      order_confirmation: 'Automatic on payment'
+      order_confirmation: 'Automatic on payment',
+      ad_transaction: '/api/ad-transaction/:paymentRef'
     },
     uptime: process.uptime()
   };
@@ -2306,6 +2353,7 @@ const server = app.listen(PORT, () => {
   console.log(`   POST /api/subscription-payment - Subscription payments`);
   console.log(`   POST /api/seller/withdraw - Seller withdrawals`);
   console.log(`   POST /api/seller/recover-pin - PIN recovery`);
+  console.log(`   GET /api/ad-transaction/:paymentRef - Check wallet deposit status`);
   console.log(`   GET /_health - Health check`);
 });
 
