@@ -1269,7 +1269,7 @@ app.post("/api/confirm-subscription", async (req, res) => {
   }
 });
 
-// ✅ IntaSend callback - UPDATED WITH EMAIL CONFIRMATION
+// ✅ IntaSend callback - UPDATED WITH WALLET DEPOSIT FIX
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body;
@@ -1281,6 +1281,7 @@ app.post("/api/intasend-callback", async (req, res) => {
 
     // Check if this is a subscription payment or regular order
     const isSubscription = api_ref.startsWith('SUB_');
+    const isWalletDeposit = api_ref && api_ref.startsWith('WALLET_');
     
     if (isSubscription) {
       // Handle subscription payment callback
@@ -1317,10 +1318,33 @@ app.post("/api/intasend-callback", async (req, res) => {
     } else {
       // Handle regular order callback
       const orderRef = db.collection("orders").doc(api_ref);
-      const orderSnap = await orderRef.get();
+      let orderSnap = await orderRef.get();
+      
+      // 🔥 CRITICAL FIX: Auto-create order if it doesn't exist (for wallet deposits)
+      if (!orderSnap.exists && isWalletDeposit) {
+        console.log(`⚠️ Wallet order ${api_ref} not found, creating automatically...`);
+        
+        const sellerId = api_ref.split('_')[1];
+        const amount = 10; // Default amount, can be extracted if needed
+        
+        await orderRef.set({
+          orderId: api_ref,
+          paymentStatus: status,
+          mpesaReference: mpesa_reference || null,
+          totalAmount: amount,
+          state: state,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          isWalletDeposit: true,
+          sellerId: sellerId
+        });
+        
+        orderSnap = await orderRef.get();
+        console.log(`✅ Auto-created wallet order ${api_ref}`);
+      }
       
       if (!orderSnap.exists) {
-        console.error(`Order ${api_ref} not found`);
+        console.error(`Order ${api_ref} not found and not a wallet deposit`);
         return res.status(404).send("Order not found");
       }
 
@@ -1335,8 +1359,65 @@ app.post("/api/intasend-callback", async (req, res) => {
 
       console.log(`Order ${api_ref} updated to status: ${status}`);
 
-      // If payment is successful, send confirmation email
-      if (state === "COMPLETE") {
+      // 🔥 FIX: Handle wallet deposits - update adTransactions and wallet balance
+      if (isWalletDeposit && state === "COMPLETE") {
+        console.log(`💰 Processing wallet deposit for: ${api_ref}`);
+        
+        const sellerId = api_ref.split('_')[1];
+        const amount = orderData.totalAmount || 10;
+        
+        // Check if already processed (idempotency)
+        const existingTx = await db.collection('adTransactions')
+          .where('paymentRef', '==', api_ref)
+          .limit(1)
+          .get();
+        
+        if (existingTx.empty) {
+          console.log(`💰 Creating wallet transaction for ${api_ref}`);
+          
+          // Create adTransaction record
+          await db.collection('adTransactions').add({
+            sellerId: sellerId,
+            type: 'deposit',
+            amount: amount,
+            status: 'completed',
+            paymentMethod: 'mpesa',
+            paymentRef: api_ref,
+            mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
+            description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            completedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          
+          // Update seller's wallet balance
+          const walletRef = db.collection('sellerAdCredits').doc(sellerId);
+          const walletSnap = await walletRef.get();
+          
+          if (walletSnap.exists) {
+            await walletRef.update({
+              balance: (walletSnap.data().balance || 0) + amount,
+              totalDeposited: (walletSnap.data().totalDeposited || 0) + amount,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            console.log(`💰 Wallet updated for seller ${sellerId}: +KSH ${amount}`);
+          } else {
+            await walletRef.set({
+              balance: amount,
+              totalDeposited: amount,
+              totalSpent: 0,
+              reservedBalance: 0,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            console.log(`💰 Wallet created for seller ${sellerId} with KSH ${amount}`);
+          }
+        } else {
+          console.log(`⚠️ Transaction already processed for ${api_ref}, skipping`);
+        }
+      }
+
+      // If payment is successful for regular order, send confirmation email
+      if (!isWalletDeposit && state === "COMPLETE") {
         console.log(`Payment successful for order ${api_ref}, sending confirmation email...`);
         
         // Get user email
