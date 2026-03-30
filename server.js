@@ -215,7 +215,7 @@ const sendEmail = async (to, subject, html, type = 'security') => {
 })();
 
 // ============================
-// NEW: Proposal Status Email Function
+// Proposal Status Email Function
 // ============================
 const sendProposalStatusEmail = async (emailData) => {
   try {
@@ -228,7 +228,6 @@ const sendProposalStatusEmail = async (emailData) => {
       return false;
     }
     
-    // Format email using provided HTML from frontend
     const emailHtml = emailData.html || `
 <!DOCTYPE html>
 <html>
@@ -311,7 +310,6 @@ const sendProposalStatusEmail = async (emailData) => {
 </body>
 </html>`;
 
-    // Send email via MarketMixKenya <sales@marketmix.site>
     const emailSent = await sendEmail(
       emailData.to,
       emailData.subject || `Your Installment Proposal Update - MarketMix Kenya`,
@@ -320,7 +318,6 @@ const sendProposalStatusEmail = async (emailData) => {
     );
 
     if (emailSent) {
-      // Log the email in Firestore
       try {
         await db.collection('proposalStatusEmails').add({
           proposalId: emailData.proposalId,
@@ -355,16 +352,14 @@ const sendProposalStatusEmail = async (emailData) => {
 // PIN Recovery System (Replacement Codes)
 // ============================
 
-// Generate a 6-digit replacement code
 const generateReplacementCode = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
-// Store replacement codes in Firestore with TTL
 const storeReplacementCode = async (userId, email, code) => {
   try {
     const expiryTime = new Date();
-    expiryTime.setMinutes(expiryTime.getMinutes() + 15); // 15 minute expiry
+    expiryTime.setMinutes(expiryTime.getMinutes() + 15);
     
     await db.collection('pinRecoveryCodes').doc(userId).set({
       code,
@@ -385,7 +380,6 @@ const storeReplacementCode = async (userId, email, code) => {
   }
 };
 
-// Verify replacement code
 const verifyReplacementCode = async (userId, code) => {
   try {
     const recoveryDoc = await db.collection('pinRecoveryCodes').doc(userId).get();
@@ -396,25 +390,20 @@ const verifyReplacementCode = async (userId, code) => {
     
     const recoveryData = recoveryDoc.data();
     
-    // Check if expired
     if (recoveryData.expiresAt.toDate() < new Date()) {
       await db.collection('pinRecoveryCodes').doc(userId).delete();
       return { valid: false, message: 'Recovery code has expired' };
     }
     
-    // Check if already used
     if (recoveryData.used) {
       return { valid: false, message: 'Recovery code has already been used' };
     }
     
-    // Check if max attempts reached
     if (recoveryData.attempts >= recoveryData.maxAttempts) {
       return { valid: false, message: 'Too many failed attempts' };
     }
     
-    // Check if code matches
     if (recoveryData.code !== code) {
-      // Increment attempts
       await db.collection('pinRecoveryCodes').doc(userId).update({
         attempts: admin.firestore.FieldValue.increment(1)
       });
@@ -426,7 +415,6 @@ const verifyReplacementCode = async (userId, code) => {
       };
     }
     
-    // Mark as verified (not used yet - will be used when PIN is reset)
     await db.collection('pinRecoveryCodes').doc(userId).update({
       status: 'verified',
       verifiedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -439,7 +427,6 @@ const verifyReplacementCode = async (userId, code) => {
   }
 };
 
-// Mark replacement code as used
 const markCodeAsUsed = async (userId) => {
   try {
     await db.collection('pinRecoveryCodes').doc(userId).update({
@@ -455,7 +442,7 @@ const markCodeAsUsed = async (userId) => {
 };
 
 // ============================
-// Order Confirmation Email System - UPDATED TO MATCH RECEIPT DESIGN
+// Order Confirmation Email System
 // ============================
 
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
@@ -467,7 +454,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       return false;
     }
     
-    // Format date
     const orderDate = orderData.orderDate?.toDate() || new Date();
     const formattedDate = orderDate.toLocaleString('en-KE', {
       timeZone: 'Africa/Nairobi',
@@ -478,14 +464,12 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       minute: '2-digit'
     });
     
-    // Calculate totals
     const itemsTotal = orderData.items?.reduce((sum, item) => 
       sum + ((item.price || 0) * (item.quantity || 1)), 0) || 0;
     
     const deliveryTotal = orderData.sellerGroups?.reduce((sum, group) => 
       sum + (group.deliveryCost || 0), 0) || 0;
     
-    // Create email template matching receipt design
     const emailHtml = `
 <!DOCTYPE html>
 <html>
@@ -710,17 +694,14 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
 </head>
 <body>
   <div class="container">
-    <!-- Watermark -->
     <div class="watermark">
       <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="Watermark">
     </div>
     
-    <!-- Logo -->
     <div class="logo-container">
       <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="MarketMix Logo" class="logo">
     </div>
     
-    <!-- Header -->
     <div class="header">
       <div class="receipt-id">Order #${orderId.substring(0, 8)}</div>
       <div class="title">Thank you for shopping with us</div>
@@ -728,7 +709,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       <div class="status-badge">Payment Confirmed</div>
     </div>
     
-    <!-- Order Summary -->
     <div class="content-box">
       <div class="order-info">
         <div class="info-row">
@@ -774,7 +754,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     
     <div class="divider"></div>
     
-    <!-- Shipping Details -->
     <div class="section-title">Shipping Details</div>
     <div class="shipping-box">
       <div class="shipping-row">
@@ -788,7 +767,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       </div>
     </div>
     
-    <!-- Action Links -->
     <div class="print-section">
       <p style="margin-bottom: 16px; color: #6b7280; font-size: 14px;">
         View your full receipt: 
@@ -800,7 +778,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       </div>
     </div>
     
-    <!-- Footer -->
     <div class="footer">
       <p style="margin: 0;">MarketMix Kenya © ${new Date().getFullYear()} | Receipt generated online</p>
       <p style="margin: 8px 0 0 0; font-size: 10px;">
@@ -811,7 +788,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
 </body>
 </html>`;
 
-    // Send email via MarketMixKenya <sales@marketmix.site>
     const emailSent = await sendEmail(
       userEmail,
       `Order Confirmation #${orderId.substring(0, 8)} - MarketMix Kenya`,
@@ -820,7 +796,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     );
 
     if (emailSent) {
-      // Record email sent status
       try {
         await db.collection('orderEmails').add({
           orderId,
@@ -880,10 +855,9 @@ function sendServerError(res, err, msg = "Internal server error") {
 }
 
 // ============================
-// NEW: Subscription Helper Functions
+// Subscription Helper Functions
 // ============================
 
-// Validate subscription payment data
 const validateSubscriptionPayment = (data) => {
   const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data;
   
@@ -903,7 +877,6 @@ const validateSubscriptionPayment = (data) => {
   return { valid: true, data: { ...data, amount: amt } };
 };
 
-// Create subscription record in Firestore
 const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
   try {
     const subscriptionRef = db.collection('subscriptions').doc(subscriptionData.orderId);
@@ -934,11 +907,8 @@ const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
   }
 };
 
-// Get subscription status from IntaSend
 const getSubscriptionPaymentStatus = async (invoiceId) => {
   try {
-    // This would normally call IntaSend API to check payment status
-    // For now, we'll simulate by checking Firestore
     const subscriptionSnapshot = await db.collection('subscriptions')
       .where('invoiceId', '==', invoiceId)
       .limit(1)
@@ -963,16 +933,13 @@ const getSubscriptionPaymentStatus = async (invoiceId) => {
   }
 };
 
-// Activate subscription after payment
 const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
   try {
     const { orderId, planId, sellerId, sellerEmail } = subscriptionData;
     
-    // Calculate expiration date (30 days from now)
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
     
-    // Update subscription record
     const subscriptionRef = db.collection('subscriptions').doc(orderId);
     await subscriptionRef.update({
       status: 'active',
@@ -983,7 +950,6 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    // Update seller's subscription status
     const sellerRef = db.collection('users').doc(sellerId);
     await sellerRef.update({
       subscriptionPlan: planId,
@@ -1000,7 +966,6 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    // Create subscription payment record
     await db.collection('subscriptionPayments').add({
       sellerId,
       planId,
@@ -1013,7 +978,6 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
       expiresAt: expiresAt
     });
     
-    // Log subscription activation
     await db.collection('subscriptionLogs').add({
       sellerId,
       action: 'subscription_activated',
@@ -1034,15 +998,9 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
 // Routes
 // ============================
 
-// ✅ NEW: Proposal Status Email Endpoint
 app.post("/api/send-proposal-status", async (req, res) => {
   try {
     const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body;
-    
-    console.log(`📧 Proposal status email request received`);
-    console.log(`📧 To: ${to}`);
-    console.log(`📧 Proposal ID: ${proposalId}`);
-    console.log(`📧 Status: ${status}`);
     
     if (!to || !proposalId || !status) {
       return res.status(400).json({ 
@@ -1092,7 +1050,6 @@ app.post("/api/send-proposal-status", async (req, res) => {
   }
 });
 
-// ✅ STK Push for Regular Orders
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body;
@@ -1154,7 +1111,6 @@ app.post("/api/stk-push", async (req, res) => {
   }
 });
 
-// ✅ NEW: Subscription Payment Endpoint
 app.post("/api/subscription-payment", async (req, res) => {
   try {
     console.log("📦 Subscription payment request:", req.body);
@@ -1191,7 +1147,6 @@ app.post("/api/subscription-payment", async (req, res) => {
         .json({ success: false, message: "Payment provider error" });
     }
 
-    // Create subscription record
     const invoiceId = intasendResponse?.invoice?.invoice_id;
     await createSubscriptionRecord(subscriptionData, invoiceId);
 
@@ -1206,7 +1161,6 @@ app.post("/api/subscription-payment", async (req, res) => {
   }
 });
 
-// ✅ NEW: Subscription Status Check Endpoint
 app.get("/api/subscription-status/:invoiceId", async (req, res) => {
   try {
     const { invoiceId } = req.params;
@@ -1231,7 +1185,6 @@ app.get("/api/subscription-status/:invoiceId", async (req, res) => {
   }
 });
 
-// ✅ NEW: Confirm Subscription Endpoint
 app.post("/api/confirm-subscription", async (req, res) => {
   try {
     const { orderId, mpesaReference, planId, sellerId, sellerEmail } = req.body;
@@ -1245,13 +1198,12 @@ app.post("/api/confirm-subscription", async (req, res) => {
       });
     }
     
-    // Activate the subscription
     await activateSellerSubscription({
       orderId,
       planId,
       sellerId,
       sellerEmail,
-      amount: req.body.amount // Optional, can be fetched from subscription record
+      amount: req.body.amount
     }, mpesaReference);
     
     return res.json({ 
@@ -1269,35 +1221,42 @@ app.post("/api/confirm-subscription", async (req, res) => {
   }
 });
 
-// ✅ IntaSend callback - UPDATED WITH WALLET DEPOSIT FIX
+// ============================================================
+// ✅ CRITICAL FIX: IntaSend callback - UPDATED for wallet deposits
+// ============================================================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
-    const { api_ref, state, mpesa_reference } = req.body;
+    const { api_ref, state, mpesa_reference, invoice_id } = req.body;
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
 
-    let status = "pending";
-    if (state === "COMPLETE") status = "paid";
-    if (["FAILED", "CANCELLED"].includes(state)) status = "failed";
+    console.log(`📞 Callback received:`, {
+      api_ref,
+      state,
+      mpesa_reference,
+      invoice_id,
+      timestamp: new Date().toISOString()
+    });
 
-    // Check if this is a subscription payment or regular order
-    const isSubscription = api_ref.startsWith('SUB_');
-    const isWalletDeposit = api_ref && api_ref.startsWith('WALLET_');
+    let paymentStatus = "pending";
+    if (state === "COMPLETE") paymentStatus = "paid";
+    if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
+
+    const isSubscription = api_ref?.startsWith('SUB_');
+    const isWalletDeposit = api_ref?.startsWith('WALLET_');
     
     if (isSubscription) {
-      // Handle subscription payment callback
       const subscriptionRef = db.collection('subscriptions').doc(api_ref);
       const subscriptionSnap = await subscriptionRef.get();
       
       if (subscriptionSnap.exists) {
         await subscriptionRef.update({
-          paymentStatus: status,
+          paymentStatus: paymentStatus,
           mpesaReference: mpesa_reference || null,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         
-        console.log(`Subscription ${api_ref} updated to status: ${status}`);
+        console.log(`✅ Subscription ${api_ref} updated to: ${paymentStatus}`);
         
-        // If payment successful, activate subscription
         if (state === "COMPLETE") {
           const subscriptionData = subscriptionSnap.data();
           try {
@@ -1308,164 +1267,154 @@ app.post("/api/intasend-callback", async (req, res) => {
               sellerEmail: subscriptionData.email,
               amount: subscriptionData.amount
             }, mpesa_reference);
-            
-            console.log(`✅ Subscription ${api_ref} activated successfully`);
+            console.log(`✅ Subscription ${api_ref} activated`);
           } catch (activationError) {
             console.error('Failed to activate subscription:', activationError);
           }
         }
       }
-    } else {
-      // Handle regular order callback
-      const orderRef = db.collection("orders").doc(api_ref);
-      let orderSnap = await orderRef.get();
+      return res.send("OK");
+    }
+    
+    // Handle regular orders and wallet deposits
+    const orderRef = db.collection("orders").doc(api_ref);
+    let orderSnap = await orderRef.get();
+    
+    // Auto-create order for wallet deposits if not exists
+    if (!orderSnap.exists && isWalletDeposit) {
+      console.log(`📝 Auto-creating wallet order: ${api_ref}`);
       
-      // 🔥 CRITICAL FIX: Auto-create order if it doesn't exist (for wallet deposits)
-      if (!orderSnap.exists && isWalletDeposit) {
-        console.log(`⚠️ Wallet order ${api_ref} not found, creating automatically...`);
-        
-        const sellerId = api_ref.split('_')[1];
-        const amount = 10; // Default amount, can be extracted if needed
-        
-        await orderRef.set({
-          orderId: api_ref,
-          paymentStatus: status,
-          mpesaReference: mpesa_reference || null,
-          totalAmount: amount,
-          state: state,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          isWalletDeposit: true,
-          sellerId: sellerId
-        });
-        
-        orderSnap = await orderRef.get();
-        console.log(`✅ Auto-created wallet order ${api_ref}`);
+      // Extract amount from api_ref - format: WALLET_USERID_AMOUNT_TIMESTAMP
+      const parts = api_ref.split('_');
+      let amount = 10; // default
+      if (parts.length >= 3) {
+        amount = parseInt(parts[2]) || 10;
       }
       
-      if (!orderSnap.exists) {
-        console.error(`Order ${api_ref} not found and not a wallet deposit`);
-        return res.status(404).send("Order not found");
-      }
-
-      const orderData = orderSnap.data();
+      const sellerId = parts[1];
       
-      // Update the order status
-      await orderRef.update({
-        paymentStatus: status,
+      await orderRef.set({
+        orderId: api_ref,
+        paymentStatus: paymentStatus,
         mpesaReference: mpesa_reference || null,
+        totalAmount: amount,
+        state: state,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        isWalletDeposit: true,
+        sellerId: sellerId
       });
+      
+      orderSnap = await orderRef.get();
+      console.log(`✅ Auto-created wallet order: ${api_ref} with amount ${amount}`);
+    }
+    
+    if (!orderSnap.exists) {
+      console.error(`❌ Order not found: ${api_ref}`);
+      return res.status(404).send("Order not found");
+    }
 
-      console.log(`Order ${api_ref} updated to status: ${status}`);
+    const orderData = orderSnap.data();
+    
+    // Update order status
+    await orderRef.update({
+      paymentStatus: paymentStatus,
+      mpesaReference: mpesa_reference || null,
+      state: state,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-      // 🔥 FIX: Handle wallet deposits - update adTransactions and wallet balance
-      if (isWalletDeposit && state === "COMPLETE") {
-        console.log(`💰 Processing wallet deposit for: ${api_ref}`);
-        
-        const sellerId = api_ref.split('_')[1];
-        const amount = orderData.totalAmount || 10;
-        
-        // Check if already processed (idempotency)
-        const existingTx = await db.collection('adTransactions')
-          .where('paymentRef', '==', api_ref)
-          .limit(1)
-          .get();
-        
-        if (existingTx.empty) {
-          console.log(`💰 Creating wallet transaction for ${api_ref}`);
-          
-          // Create adTransaction record
-          await db.collection('adTransactions').add({
-            sellerId: sellerId,
-            type: 'deposit',
-            amount: amount,
-            status: 'completed',
-            paymentMethod: 'mpesa',
-            paymentRef: api_ref,
-            mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
-            description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-            completedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          
-          // Update seller's wallet balance
-          const walletRef = db.collection('sellerAdCredits').doc(sellerId);
-          const walletSnap = await walletRef.get();
-          
-          if (walletSnap.exists) {
-            await walletRef.update({
-              balance: (walletSnap.data().balance || 0) + amount,
-              totalDeposited: (walletSnap.data().totalDeposited || 0) + amount,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            console.log(`💰 Wallet updated for seller ${sellerId}: +KSH ${amount}`);
-          } else {
-            await walletRef.set({
-              balance: amount,
-              totalDeposited: amount,
-              totalSpent: 0,
-              reservedBalance: 0,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            console.log(`💰 Wallet created for seller ${sellerId} with KSH ${amount}`);
-          }
-        } else {
-          console.log(`⚠️ Transaction already processed for ${api_ref}, skipping`);
+    console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
+
+    // ============================================================
+    // 🔥 CRITICAL FIX: Handle wallet deposit - USE api_ref as DOCUMENT ID
+    // ============================================================
+    if (isWalletDeposit && state === "COMPLETE") {
+      console.log(`💰 Processing wallet deposit: ${api_ref}`);
+      
+      const parts = api_ref.split('_');
+      const sellerId = parts[1];
+      const amount = orderData.totalAmount || parseInt(parts[2]) || 10;
+      
+      // ✅ CRITICAL: Use .doc(api_ref).set() instead of .add()
+      // This ensures the Document ID IS the paymentRef
+      const adTxRef = db.collection('adTransactions').doc(api_ref);
+      
+      await adTxRef.set({
+        paymentRef: api_ref,
+        sellerId: sellerId,
+        sellerEmail: orderData.sellerEmail || null,
+        sellerName: orderData.sellerName || null,
+        sellerPhone: orderData.sellerPhone || null,
+        type: 'deposit',
+        amount: amount,
+        status: 'completed',
+        paymentMethod: 'mpesa',
+        mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
+        description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      
+      console.log(`✅ AdTransaction created/updated with ID: ${api_ref}`);
+      
+      // Update seller's wallet balance
+      const walletRef = db.collection('sellerAdCredits').doc(sellerId);
+      const walletSnap = await walletRef.get();
+      
+      if (walletSnap.exists()) {
+        await walletRef.update({
+          balance: admin.firestore.FieldValue.increment(amount),
+          totalDeposited: admin.firestore.FieldValue.increment(amount),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`💰 Wallet updated for ${sellerId}: +KSH ${amount}`);
+      } else {
+        await walletRef.set({
+          sellerId: sellerId,
+          balance: amount,
+          totalDeposited: amount,
+          totalSpent: 0,
+          reservedBalance: 0,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`💰 Wallet created for ${sellerId} with KSH ${amount}`);
+      }
+      
+      console.log(`✅ Successfully processed deposit: ${api_ref}`);
+    }
+
+    // Send confirmation email for regular orders
+    if (!isWalletDeposit && state === "COMPLETE") {
+      let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
+      
+      if (!userEmail && orderData.userId) {
+        try {
+          const userDoc = await db.collection('users').doc(orderData.userId).get();
+          if (userDoc.exists) userEmail = userDoc.data().email;
+        } catch (err) {
+          console.error('Failed to fetch user email:', err);
         }
       }
-
-      // If payment is successful for regular order, send confirmation email
-      if (!isWalletDeposit && state === "COMPLETE") {
-        console.log(`Payment successful for order ${api_ref}, sending confirmation email...`);
-        
-        // Get user email
-        let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
-        
-        if (!userEmail && orderData.userId) {
-          try {
-            const userDoc = await db.collection('users').doc(orderData.userId).get();
-            if (userDoc.exists) {
-              const userData = userDoc.data();
-              userEmail = userData.email;
-            }
-          } catch (userErr) {
-            console.error('Failed to fetch user email:', userErr);
-          }
-        }
-        
-        if (userEmail) {
-          console.log(`Sending order confirmation to ${userEmail} for order ${api_ref}`);
-          
-          // Send order confirmation email asynchronously
-          sendOrderConfirmationEmail(orderData, userEmail, api_ref)
-            .then(success => {
-              if (success) {
-                console.log(`✅ Order confirmation email sent for ${api_ref}`);
-                
-                // Update order with email sent flag
-                orderRef.update({
-                  confirmationEmailSent: true,
-                  confirmationSentAt: admin.firestore.FieldValue.serverTimestamp()
-                }).catch(e => console.error('Failed to update email flag:', e));
-              } else {
-                console.log(`❌ Failed to send confirmation email for ${api_ref}`);
-              }
-            })
-            .catch(emailErr => {
-              console.error('Email sending error:', emailErr);
-            });
-        } else {
-          console.log(`⚠️ No email found for order ${api_ref}, skipping confirmation email`);
-        }
+      
+      if (userEmail) {
+        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+          .then(success => {
+            if (success) console.log(`✅ Confirmation email sent for ${api_ref}`);
+            else console.log(`❌ Failed to send email for ${api_ref}`);
+          })
+          .catch(err => console.error('Email error:', err));
       }
     }
 
     return res.send("OK");
+    
   } catch (error) {
-    console.error('IntaSend callback error:', error);
-    return sendServerError(res, error, "IntaSend callback failed");
+    console.error('❌ IntaSend callback error:', error);
+    return res.status(500).send("Callback processing failed");
   }
 });
 
@@ -1494,9 +1443,7 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ============================================================
-// ✅ NEW: Ad Transaction lookup by paymentRef (for wallet deposits)
-// ============================================================
+// ✅ Ad Transaction lookup by paymentRef - NOW WORKS because doc ID = paymentRef
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   try {
     const paymentRef = req.params.paymentRef;
@@ -1504,22 +1451,18 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing paymentRef" });
     }
 
-    console.log(`🔍 Looking up ad transaction with paymentRef: ${paymentRef}`);
+    console.log(`🔍 Looking up ad transaction: ${paymentRef}`);
 
-    // First try to find in adTransactions collection
-    const adTxSnapshot = await db
-      .collection("adTransactions")
-      .where("paymentRef", "==", paymentRef)
-      .limit(1)
-      .get();
+    // ✅ Direct document lookup by ID (since we now use paymentRef as document ID)
+    const adTxDoc = await db.collection('adTransactions').doc(paymentRef).get();
 
-    if (!adTxSnapshot.empty) {
-      const txData = adTxSnapshot.docs[0].data();
-      console.log(`✅ Found adTransaction:`, txData);
+    if (adTxDoc.exists) {
+      const txData = adTxDoc.data();
+      console.log(`✅ Found adTransaction: status=${txData.status}`);
       return res.json({ success: true, data: txData });
     }
 
-    // If not found, check orders collection (for backward compatibility)
+    // Fallback: check orders collection
     const orderSnapshot = await db
       .collection("orders")
       .where("orderId", "==", paymentRef)
@@ -1528,19 +1471,41 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
 
     if (!orderSnapshot.empty) {
       const orderData = orderSnapshot.docs[0].data();
-      console.log(`✅ Found order:`, orderData);
+      console.log(`✅ Found order: paymentStatus=${orderData.paymentStatus}`);
+      
+      if (orderData.paymentStatus === 'paid' && orderData.isWalletDeposit) {
+        console.log(`🔄 Creating missing adTransaction for ${paymentRef}`);
+        
+        await db.collection('adTransactions').doc(paymentRef).set({
+          paymentRef: paymentRef,
+          sellerId: orderData.sellerId,
+          type: 'deposit',
+          amount: orderData.totalAmount || 10,
+          status: 'completed',
+          paymentMethod: 'mpesa',
+          mpesaCode: orderData.mpesaReference || 'SYNCED',
+          description: `Ad wallet deposit - KSH ${(orderData.totalAmount || 10).toFixed(2)}`,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          completedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        const newTx = await db.collection('adTransactions').doc(paymentRef).get();
+        return res.json({ success: true, data: newTx.data() });
+      }
+      
       return res.json({ success: true, data: orderData });
     }
 
     console.log(`❌ No transaction found for ${paymentRef}`);
     return res.status(404).json({ success: false, message: "Transaction not found" });
+    
   } catch (error) {
     console.error("Ad transaction lookup failed:", error);
     return res.status(500).json({ success: false, message: "Lookup failed" });
   }
 });
 
-// ✅ Seller Withdrawal (LIVE from orders + IntaSend B2C)
+// ✅ Seller Withdrawal
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
@@ -1560,13 +1525,10 @@ app.post("/api/seller/withdraw", async (req, res) => {
     if (amount <= minFeeCheck) {
       return res.status(400).json({
         success: false,
-        message: `Requested amount must be greater than the total fee of KSH ${minFeeCheck.toFixed(
-          2
-        )}.`,
+        message: `Requested amount must be greater than the total fee of KSH ${minFeeCheck.toFixed(2)}.`,
       });
     }
 
-    // 🔎 Calculate seller revenue live from paid orders
     const ordersSnap = await db
       .collection("orders")
       .where("involvedSellerIds", "array-contains", sellerId)
@@ -1577,7 +1539,6 @@ app.post("/api/seller/withdraw", async (req, res) => {
     ordersSnap.forEach((doc) => {
       const data = doc.data();
       const items = data.items;
-
       if (!items) return;
 
       if (Array.isArray(items)) {
@@ -1596,17 +1557,9 @@ app.post("/api/seller/withdraw", async (req, res) => {
             totalRevenue += price * qty;
           }
         });
-      } else {
-        const item = items;
-        if (item?.sellerId === sellerId) {
-          const price = Number(item.price) || 0;
-          const qty = Number(item.quantity) || 0;
-          totalRevenue += price * qty;
-        }
       }
     });
 
-    // 💸 Fetch total previously withdrawn amount from ledger
     let totalPreviouslyWithdrawn = 0;
     const sellerLedgerRef = db.collection("sellerLedgers").doc(sellerId);
     const ledgerSnap = await sellerLedgerRef.get();
@@ -1631,9 +1584,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
     if (netPayoutAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: `Net payout is KSH 0.00 or less after the KSH ${feeAmount.toFixed(
-          2
-        )} fee. Increase the withdrawal amount.`,
+        message: `Net payout is KSH 0.00 or less after the KSH ${feeAmount.toFixed(2)} fee.`,
       });
     }
 
@@ -1663,14 +1614,10 @@ app.post("/api/seller/withdraw", async (req, res) => {
         ],
       });
     } catch (intasendErr) {
-      console.error(
-        "❌ IntaSend payout failed:",
-        intasendErr?.response || intasendErr
-      );
+      console.error("❌ IntaSend payout failed:", intasendErr?.response || intasendErr);
       await withdrawalDocRef.update({
         status: "PAYOUT_FAILED",
-        intasendError:
-          intasendErr?.response || intasendErr?.message || String(intasendErr),
+        intasendError: intasendErr?.response || intasendErr?.message || String(intasendErr),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res
@@ -1713,12 +1660,10 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
-// ✅ PIN Recovery Endpoint - REPLACEMENT CODES VERSION
+// PIN Recovery Endpoints
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body;
-    
-    console.log("🔑 PIN Recovery Request:", { email, userId });
     
     if (!email || !userId) {
       return res.status(400).json({ 
@@ -1727,7 +1672,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    // 1. Verify the user exists and email matches
     const userDoc = await db.collection('users').doc(userId).get();
     
     if (!userDoc.exists) {
@@ -1739,7 +1683,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
 
     const userData = userDoc.data();
     
-    // 2. Check if email matches
     if (userData.email && userData.email !== email) {
       return res.status(403).json({ 
         success: false, 
@@ -1747,7 +1690,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    // 3. Check if user has a PIN set
     if (!userData.withdrawalPin) {
       return res.status(400).json({ 
         success: false, 
@@ -1755,10 +1697,7 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    // 4. Generate replacement code
     const replacementCode = generateReplacementCode();
-    
-    // 5. Store replacement code
     const codeStored = await storeReplacementCode(userId, email, replacementCode);
     
     if (!codeStored) {
@@ -1768,7 +1707,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    // 6. Record the PIN recovery request
     await db.collection('securityLogs').add({
       userId: userId,
       email: email,
@@ -1779,7 +1717,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       userAgent: req.get('User-Agent')
     });
 
-    // 7. Create email template with replacement code
     const emailHtml = `
       <!DOCTYPE html>
       <html>
@@ -1858,7 +1795,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       </html>
     `;
 
-    // 8. Send email via Brevo
     const emailSent = await sendEmail(
       email,
       'Your PIN Reset Code - MarketMix Kenya',
@@ -1867,8 +1803,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
     );
 
     if (!emailSent) {
-      console.log(`⚠️ Email failed to send for ${email}`);
-      
       return res.json({ 
         success: false, 
         message: 'Failed to send PIN recovery code. Please try again or contact support.',
@@ -1876,8 +1810,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       });
     }
 
-    console.log(`✅ PIN recovery code sent to ${email}`);
-    
     res.json({ 
       success: true, 
       message: 'PIN recovery code sent to your email',
@@ -1887,21 +1819,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
 
   } catch (error) {
     console.error('❌ PIN recovery error:', error);
-    
-    // Log the error
-    try {
-      await db.collection('securityLogs').add({
-        userId: req.body?.userId || 'unknown',
-        email: req.body?.email || 'unknown',
-        action: 'PIN_RECOVERY_FAILED',
-        error: error.message,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        ipAddress: req.ip
-      });
-    } catch (logError) {
-      console.error('Failed to log security error:', logError);
-    }
-
     res.status(500).json({ 
       success: false, 
       message: 'Failed to process PIN recovery request' 
@@ -1909,12 +1826,9 @@ app.post("/api/seller/recover-pin", async (req, res) => {
   }
 });
 
-// ✅ Verify PIN Recovery Code
 app.post("/api/seller/verify-recovery-code", async (req, res) => {
   try {
     const { userId, code } = req.body;
-    
-    console.log("🔑 Verify Recovery Code:", { userId });
     
     if (!userId || !code) {
       return res.status(400).json({ 
@@ -1932,7 +1846,6 @@ app.post("/api/seller/verify-recovery-code", async (req, res) => {
       });
     }
 
-    // Record successful verification
     await db.collection('securityLogs').add({
       userId: userId,
       email: verification.data.email,
@@ -1956,12 +1869,9 @@ app.post("/api/seller/verify-recovery-code", async (req, res) => {
   }
 });
 
-// ✅ Reset PIN with Verified Code
 app.post("/api/seller/reset-pin", async (req, res) => {
   try {
     const { userId, code, newPin, confirmPin } = req.body;
-    
-    console.log("🔑 Reset PIN Request:", { userId });
     
     if (!userId || !code || !newPin || !confirmPin) {
       return res.status(400).json({ 
@@ -1984,7 +1894,6 @@ app.post("/api/seller/reset-pin", async (req, res) => {
       });
     }
 
-    // Verify code first
     const verification = await verifyReplacementCode(userId, code);
     
     if (!verification.valid) {
@@ -1994,7 +1903,6 @@ app.post("/api/seller/reset-pin", async (req, res) => {
       });
     }
 
-    // Update user PIN
     const userRef = db.collection('users').doc(userId);
     await userRef.update({
       withdrawalPin: newPin,
@@ -2003,10 +1911,8 @@ app.post("/api/seller/reset-pin", async (req, res) => {
       pinLastChanged: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // Mark code as used
     await markCodeAsUsed(userId);
 
-    // Record successful PIN reset
     await db.collection('securityLogs').add({
       userId: userId,
       email: verification.data.email,
@@ -2031,7 +1937,7 @@ app.post("/api/seller/reset-pin", async (req, res) => {
   }
 });
 
-// ✅ Stock update
+// Stock update
 app.post("/api/update-stock", async (req, res) => {
   try {
     const { productId, quantity } = req.body;
@@ -2057,7 +1963,7 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// ✅ Hugging Face image generation
+// Hugging Face image generation
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
@@ -2120,11 +2026,7 @@ app.post("/api/generate-ai-image", async (req, res) => {
   }
 });
 
-// ============================
 // Debug & Test Endpoints
-// ============================
-
-// ✅ Test Email Authentication
 app.get("/api/test-email-auth", async (req, res) => {
   try {
     if (!BREVO_API_KEY) {
@@ -2177,7 +2079,6 @@ app.get("/api/test-email-auth", async (req, res) => {
   }
 });
 
-// ✅ Test Proposal Status Email
 app.post("/api/test-proposal-email", async (req, res) => {
   try {
     const testEmail = req.body.email || 'test@example.com';
@@ -2222,7 +2123,7 @@ app.post("/api/test-proposal-email", async (req, res) => {
   }
 });
 
-// ✅ Health check
+// Health check
 app.get("/_health", (req, res) => {
   const health = {
     ok: true,
@@ -2256,9 +2157,7 @@ app.use((req, res) =>
   res.status(404).json({ success: false, message: "Not Found" })
 );
 
-// ============================
 // Global error handlers
-// ============================
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
 });
@@ -2266,9 +2165,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("Unhandled Rejection:", reason);
 });
 
-// ============================
 // Stealth keep-alive
-// ============================
 (function setupKeepAlive() {
   const explicitDisable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
   const explicitEnable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
@@ -2333,9 +2230,7 @@ process.on("unhandledRejection", (reason) => {
   console.log(`🌀 Stealth keep-alive initialized. Interval ~${BASE_INTERVAL_MS}ms ±${JITTER_MS}ms`);
 })();
 
-// ============================
 // Start server
-// ============================
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not configured'}`);
