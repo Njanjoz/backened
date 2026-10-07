@@ -1,15 +1,14 @@
 // server.js
-// Full Express backend for Campus Store with Brevo Email Integration & Subscription Support
+// Full Express backend for Campus Store + MarketMix Real Estates
 // Features:
-// - Brevo transactional email for PIN recovery (REPLACEMENT CODES ONLY)
-// - Automated order confirmation emails after purchase
-// - Proposal status emails (approval/rejection)
+// - Brevo transactional email (PIN recovery, order confirmations, proposal status, real estate receipts)
 // - Real-time fee listener from Firestore
 // - IntaSend B2C withdrawals
 // - Hugging Face image generation
 // - Subscription payment handling (M-Pesa STK Push)
 // - Subscription status polling and confirmation
 // - Smart keep-alive with overnight pause (11pm - 5am)
+// - Universal cross-site transaction lookup
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -37,6 +36,7 @@ const allowedOrigins = [
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
+  "https://marketmix-realestates.vercel.app", // <-- added
   "https://localhost",
 ];
 
@@ -115,6 +115,9 @@ const intasend = new IntaSend(
 );
 
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
+const REAL_ESTATE_RECEIPT_URL =
+  process.env.REAL_ESTATE_RECEIPT_URL ||
+  "https://marketmix-realestates.vercel.app/receipt";
 
 // ============================
 // Brevo Email Service
@@ -821,6 +824,310 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
 };
 
 // ============================
+// Real Estate Payment Confirmation Email
+// ============================
+const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
+  try {
+    console.log('🏠 Sending real estate payment confirmation to:', userEmail);
+
+    if (!BREVO_API_KEY) {
+      console.log('❌ BREVO_API_KEY not configured - skipping real estate email');
+      return false;
+    }
+
+    const paidAt = new Date().toLocaleString('en-KE', {
+      timeZone: 'Africa/Nairobi',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+
+    const propertyTitle = data.propertyTitle || data.propertyName || 'Property';
+    const propertyLocation = data.propertyLocation || data.location || 'N/A';
+    const propertyType = data.propertyType || data.listingType || 'N/A';
+    const amount = Number(data.totalAmount || data.amount || 0);
+    const mpesaRef = data.mpesaReference || data.mpesaCode || 'N/A';
+    const landlordName = data.landlordName || data.sellerName || 'N/A';
+    const landlordPhone = data.landlordPhone || data.sellerPhone || 'N/A';
+    const buyerName = data.buyerName || data.shippingDetails?.fullName || userEmail;
+
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6;
+      color: #1f2937;
+      margin: 0;
+      padding: 0;
+      background: #f3f4f6;
+    }
+    .container {
+      max-width: 560px;
+      margin: 24px auto;
+      background: #ffffff;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid #e5e7eb;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.06);
+    }
+    .header {
+      background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%);
+      color: #ffffff;
+      padding: 32px 24px;
+      text-align: center;
+    }
+    .header h1 {
+      margin: 0 0 6px 0;
+      font-size: 22px;
+      font-weight: 700;
+    }
+    .header p {
+      margin: 0;
+      font-size: 14px;
+      opacity: 0.9;
+    }
+    .badge {
+      display: inline-block;
+      margin-top: 14px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.35);
+      color: #ffffff;
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+    }
+    .content {
+      padding: 28px 24px 8px 24px;
+    }
+    .greeting {
+      font-size: 16px;
+      color: #111827;
+      margin-bottom: 6px;
+    }
+    .intro {
+      color: #4b5563;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
+    .amount-box {
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      border-radius: 12px;
+      padding: 18px;
+      text-align: center;
+      margin-bottom: 22px;
+    }
+    .amount-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #047857;
+      margin: 0 0 6px 0;
+    }
+    .amount-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: #065f46;
+      margin: 0;
+    }
+    .details {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 18px;
+      margin-bottom: 20px;
+    }
+    .details h3 {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      color: #111827;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      padding: 7px 0;
+      border-bottom: 1px dashed #e5e7eb;
+      font-size: 13px;
+    }
+    .row:last-child {
+      border-bottom: none;
+    }
+    .row .label {
+      color: #6b7280;
+    }
+    .row .value {
+      color: #111827;
+      font-weight: 600;
+      text-align: right;
+      max-width: 60%;
+      word-break: break-word;
+    }
+    .note {
+      background: #eff6ff;
+      border-left: 4px solid #3b82f6;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+      color: #1e3a8a;
+      margin-bottom: 20px;
+    }
+    .cta {
+      text-align: center;
+      margin: 24px 0 8px 0;
+    }
+    .cta a {
+      display: inline-block;
+      background: #0f766e;
+      color: #ffffff;
+      text-decoration: none;
+      padding: 12px 22px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0 6px 10px 6px;
+    }
+    .cta a.secondary {
+      background: #111827;
+    }
+    .footer {
+      background: #f9fafb;
+      border-top: 1px solid #e5e7eb;
+      padding: 18px 24px;
+      text-align: center;
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .footer a {
+      color: #0f766e;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>MarketMix Real Estates</h1>
+      <p>Payment Confirmation Receipt</p>
+      <div class="badge">✅ PAYMENT CONFIRMED</div>
+    </div>
+
+    <div class="content">
+      <p class="greeting">Hello ${buyerName},</p>
+      <p class="intro">
+        Your payment for the property below has been received and confirmed.
+        Please keep this email as your official receipt.
+      </p>
+
+      <div class="amount-box">
+        <p class="amount-label">Amount Paid</p>
+        <p class="amount-value">KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+      </div>
+
+      <div class="details">
+        <h3>Property Details</h3>
+        <div class="row">
+          <span class="label">Property</span>
+          <span class="value">${propertyTitle}</span>
+        </div>
+        <div class="row">
+          <span class="label">Location</span>
+          <span class="value">${propertyLocation}</span>
+        </div>
+        <div class="row">
+          <span class="label">Type</span>
+          <span class="value">${propertyType}</span>
+        </div>
+        <div class="row">
+          <span class="label">Reference</span>
+          <span class="value">${orderId}</span>
+        </div>
+        <div class="row">
+          <span class="label">M-Pesa Code</span>
+          <span class="value">${mpesaRef}</span>
+        </div>
+        <div class="row">
+          <span class="label">Paid On</span>
+          <span class="value">${paidAt}</span>
+        </div>
+      </div>
+
+      <div class="details">
+        <h3>Landlord / Agent Contact</h3>
+        <div class="row">
+          <span class="label">Name</span>
+          <span class="value">${landlordName}</span>
+        </div>
+        <div class="row">
+          <span class="label">Phone</span>
+          <span class="value">${landlordPhone}</span>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>Next steps:</strong> The landlord or agent will contact you shortly to
+        arrange viewing, keys handover, or any outstanding paperwork. If you have
+        questions, reply to this email or contact support.
+      </div>
+
+      <div class="cta">
+        <a href="${REAL_ESTATE_RECEIPT_URL}/${orderId}">View Receipt Online</a>
+        <a href="https://marketmix-realestates.vercel.app" class="secondary">Browse More Properties</a>
+      </div>
+    </div>
+
+    <div class="footer">
+      <p style="margin: 0 0 6px 0;"><strong>MarketMix Real Estates</strong></p>
+      <p style="margin: 0 0 6px 0;">MarketMix Kenya © ${new Date().getFullYear()}</p>
+      <p style="margin: 0;">Need help? <a href="mailto:sales@marketmix.site">sales@marketmix.site</a></p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+    const emailSent = await sendEmail(
+      userEmail,
+      `Payment Confirmed - ${propertyTitle} (${orderId.substring(0, 8)})`,
+      emailHtml,
+      'sales'
+    );
+
+    if (emailSent) {
+      try {
+        await db.collection('realEstateEmails').add({
+          orderId,
+          userEmail,
+          propertyTitle,
+          amount,
+          mpesaReference: mpesaRef,
+          type: 'real_estate_confirmation',
+          sender: 'MarketMixKenya <sales@marketmix.site>',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          authenticated: true,
+          dmarc: 'configured',
+          dkim: 'signed'
+        });
+      } catch (logErr) {
+        console.error('Failed to log real estate email:', logErr);
+      }
+    }
+
+    return emailSent;
+  } catch (error) {
+    console.error('❌ Real estate payment email failed:', error.message);
+    return false;
+  }
+};
+
+// ============================
 // Fee Constants & Helpers
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
@@ -852,6 +1159,16 @@ function parsePositiveNumber(value) {
 function sendServerError(res, err, msg = "Internal server error") {
   console.error(msg, err);
   return res.status(500).json({ success: false, message: msg });
+}
+
+// Detect real estate orders by their api_ref prefix or explicit flag
+function isRealEstateRef(apiRef, orderData) {
+  if (!apiRef) return false;
+  if (apiRef.startsWith("PROP_")) return true;
+  if (apiRef.startsWith("REALESTATE_")) return true;
+  if (orderData && orderData.orderType === "real_estate") return true;
+  if (orderData && orderData.isRealEstate === true) return true;
+  return false;
 }
 
 // ============================
@@ -1224,7 +1541,7 @@ app.post("/api/confirm-subscription", async (req, res) => {
 });
 
 // ============================================================
-// ✅ CRITICAL FIX: IntaSend callback - FIXED amount handling
+// IntaSend callback
 // ============================================================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
@@ -1283,7 +1600,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     const orderRef = db.collection("orders").doc(api_ref);
     let orderSnap = await orderRef.get();
     
-    // ✅ FIX: Get the actual amount from the callback
+    // ✅ Get the actual amount from the callback
     const callbackAmount = parseFloat(req.body.value);
     
     // Auto-create order for wallet deposits if not exists
@@ -1293,7 +1610,6 @@ app.post("/api/intasend-callback", async (req, res) => {
       const parts = api_ref.split('_');
       const sellerId = parts[1];
       
-      // ✅ FIX: Use the actual amount from callback, not hardcoded 10
       let amount = 1; // Default minimum
       
       if (callbackAmount && callbackAmount > 0 && callbackAmount <= 500000) {
@@ -1337,7 +1653,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
 
     // ============================================================
-    // 🔥 FIXED: Handle wallet deposit with correct amount
+    // Handle wallet deposit with correct amount
     // ============================================================
     if (isWalletDeposit && state === "COMPLETE") {
       console.log(`💰 Processing wallet deposit: ${api_ref}`);
@@ -1345,7 +1661,6 @@ app.post("/api/intasend-callback", async (req, res) => {
       const parts = api_ref.split('_');
       const sellerId = parts[1];
       
-      // ✅ FIX: Get amount from callback first, then orderData
       let amount = callbackAmount;
       
       // If callback amount is invalid, try orderData
@@ -1416,9 +1731,11 @@ app.post("/api/intasend-callback", async (req, res) => {
       console.log(`✅ Successfully processed deposit: ${api_ref} for KSH ${amount}`);
     }
 
-    // Send confirmation email for regular orders
-    if (!isWalletDeposit && state === "COMPLETE") {
-      let userEmail = orderData.userEmail || orderData.shippingDetails?.email;
+    // ============================================================
+    // Send confirmation emails on COMPLETE (real estate + regular orders)
+    // ============================================================
+    if (state === "COMPLETE" && !isWalletDeposit) {
+      let userEmail = orderData.userEmail || orderData.shippingDetails?.email || orderData.buyerEmail;
       
       if (!userEmail && orderData.userId) {
         try {
@@ -1428,14 +1745,37 @@ app.post("/api/intasend-callback", async (req, res) => {
           console.error('Failed to fetch user email:', err);
         }
       }
-      
+
       if (userEmail) {
-        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
-          .then(success => {
-            if (success) console.log(`✅ Confirmation email sent for ${api_ref}`);
-            else console.log(`❌ Failed to send email for ${api_ref}`);
-          })
-          .catch(err => console.error('Email error:', err));
+        const realEstate = isRealEstateRef(api_ref, orderData);
+
+        if (realEstate) {
+          const realEstatePayload = {
+            ...orderData,
+            totalAmount: orderData.totalAmount || callbackAmount || 0,
+            mpesaReference: mpesa_reference || orderData.mpesaReference || 'N/A',
+            propertyTitle: orderData.propertyTitle || orderData.propertyName,
+            propertyLocation: orderData.propertyLocation || orderData.location,
+            propertyType: orderData.propertyType || orderData.listingType,
+            buyerName: orderData.buyerName || orderData.shippingDetails?.fullName,
+            landlordName: orderData.landlordName || orderData.sellerName,
+            landlordPhone: orderData.landlordPhone || orderData.sellerPhone,
+          };
+
+          sendRealEstatePaymentEmail(realEstatePayload, userEmail, api_ref)
+            .then(success => {
+              if (success) console.log(`🏠 Real estate receipt sent for ${api_ref}`);
+              else console.log(`❌ Failed to send real estate receipt for ${api_ref}`);
+            })
+            .catch(err => console.error('Real estate email error:', err));
+        } else {
+          sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+            .then(success => {
+              if (success) console.log(`✅ Confirmation email sent for ${api_ref}`);
+              else console.log(`❌ Failed to send email for ${api_ref}`);
+            })
+            .catch(err => console.error('Email error:', err));
+        }
       }
     }
 
@@ -2154,6 +2494,36 @@ app.post("/api/test-proposal-email", async (req, res) => {
   }
 });
 
+// Real estate email test endpoint
+app.post("/api/test-real-estate-email", async (req, res) => {
+  try {
+    const testEmail = req.body.email || 'test@example.com';
+    const testRef = 'PROP_TEST_' + Date.now();
+
+    const testData = {
+      propertyTitle: 'Spacious Bedsitter - Kilimani',
+      propertyLocation: 'Kilimani, Nairobi',
+      propertyType: 'For Rent',
+      totalAmount: 4000,
+      mpesaReference: 'TEST' + Math.floor(Math.random() * 1000000),
+      buyerName: 'Test Buyer',
+      landlordName: 'Test Landlord',
+      landlordPhone: '254712345678'
+    };
+
+    const sent = await sendRealEstatePaymentEmail(testData, testEmail, testRef);
+
+    if (sent) {
+      res.json({ success: true, message: 'Test real estate email sent', to: testEmail });
+    } else {
+      res.status(500).json({ success: false, message: 'Failed to send test real estate email' });
+    }
+  } catch (error) {
+    console.error('❌ Test real estate email error:', error);
+    res.status(500).json({ success: false, message: 'Test failed', error: error.message });
+  }
+});
+
 // Health check
 app.get("/_health", (req, res) => {
   const health = {
@@ -2166,7 +2536,8 @@ app.get("/_health", (req, res) => {
       email_auth: {
         security: 'MarketMixKenya <security@marketmix.site>',
         sales: 'MarketMixKenya <sales@marketmix.site>',
-        proposal_status: '✅ Ready'
+        proposal_status: '✅ Ready',
+        real_estate: '✅ Ready'
       }
     },
     endpoints: {
@@ -2176,6 +2547,7 @@ app.get("/_health", (req, res) => {
       seller_withdrawal: '/api/seller/withdraw',
       pin_recovery: '/api/seller/recover-pin',
       order_confirmation: 'Automatic on payment',
+      real_estate_confirmation: 'Automatic on payment',
       ad_transaction: '/api/ad-transaction/:paymentRef'
     },
     uptime: process.uptime()
@@ -2210,25 +2582,20 @@ process.on("unhandledRejection", (reason) => {
     return;
   }
 
-  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000; // 4 minutes
-  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000; // 30 seconds
+  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
+  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
   const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
-  
-  // Overnight pause: 11 PM to 5 AM East African Time (UTC+3)
-  const PAUSE_START_HOUR = 23; // 11 PM
-  const PAUSE_END_HOUR = 5;    // 5 AM
+
+  const PAUSE_START_HOUR = 23;
+  const PAUSE_END_HOUR = 5;
 
   let keepAliveTimeout = null;
   let isPaused = false;
 
-  // Check if current time is within overnight pause period (EAT)
   const isOvernightPause = () => {
     const now = new Date();
-    // Convert to East African Time (UTC+3)
     const eatHour = (now.getUTCHours() + 3) % 24;
-    
     if (PAUSE_START_HOUR <= PAUSE_END_HOUR) {
-      // Example: 23 to 5 (wraps around midnight)
       return eatHour >= PAUSE_START_HOUR || eatHour < PAUSE_END_HOUR;
     } else {
       return eatHour >= PAUSE_START_HOUR && eatHour < PAUSE_END_HOUR;
@@ -2236,7 +2603,6 @@ process.on("unhandledRejection", (reason) => {
   };
 
   const scheduleNext = () => {
-    // Clear any existing timeout
     if (keepAliveTimeout) {
       clearTimeout(keepAliveTimeout);
       keepAliveTimeout = null;
@@ -2251,7 +2617,6 @@ process.on("unhandledRejection", (reason) => {
         const eatHour = (now.getUTCHours() + 3) % 24;
         console.log(`🌙 Entering overnight pause mode (${eatHour}:00 EAT) - No pings until 5 AM`);
       }
-      // Check again in 5 minutes during pause
       keepAliveTimeout = setTimeout(scheduleNext, 5 * 60 * 1000);
       if (keepAliveTimeout.unref) keepAliveTimeout.unref();
       return;
@@ -2262,12 +2627,10 @@ process.on("unhandledRejection", (reason) => {
       console.log(`☀️ Exiting overnight pause mode - Resuming keep-alive pings`);
     }
 
-    // Calculate next ping time with jitter
     const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS;
     const delay = Math.max(1000, BASE_INTERVAL_MS + jitter);
 
     keepAliveTimeout = setTimeout(() => {
-      // Double-check we're not in pause period before pinging
       if (!isOvernightPause()) {
         try {
           const options = {
@@ -2298,15 +2661,12 @@ process.on("unhandledRejection", (reason) => {
     if (keepAliveTimeout.unref) keepAliveTimeout.unref();
   };
 
-  // Start the keep-alive schedule
   scheduleNext();
 
-  // Log schedule on startup
   console.log(`🌀 Smart keep-alive initialized with overnight pause (${PAUSE_START_HOUR}:00 - ${PAUSE_END_HOUR}:00 EAT)`);
   console.log(`   Ping interval: ~${BASE_INTERVAL_MS / 1000}s ±${JITTER_MS / 1000}s`);
   console.log(`   Overnight pause: 11 PM - 5 AM (East African Time)`);
 
-  // Cleanup on shutdown
   const cleanup = () => {
     if (keepAliveTimeout) {
       clearTimeout(keepAliveTimeout);
@@ -2324,6 +2684,7 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
   console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
   console.log(`📧 Proposal Status Emails: ✅ Enabled`);
+  console.log(`🏠 Real Estate Receipts: ✅ Enabled`);
   console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
   console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`🖼️ Logo Image: https://i.ibb.co/JjSrxbPz/icon-png-1.png`);
