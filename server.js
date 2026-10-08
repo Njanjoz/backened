@@ -1,7 +1,8 @@
 // server.js — MarketMix backend
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
-// WhatsApp (WAHA) notifications fire for store, real estate, and moving after payment.
-// WAHA sends are queued so the callback never blocks.
+// WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
+// WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
+// Uses only existing env vars.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -100,7 +101,8 @@ const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}
 const REAL_ESTATE_RECEIPT_URL =
   process.env.REAL_ESTATE_RECEIPT_URL ||
   "https://marketmix-realestates.vercel.app/receipt";
-const MARKETPLACE_URL = process.env.MARKETPLACE_URL || "https://marketmix.site";
+const MARKETPLACE_URL = "https://marketmix.site";
+const MOVING_URL = "https://marketmix.site/transport";
 
 // ============================
 // Brevo senders
@@ -174,16 +176,18 @@ const sendEmail = async (to, subject, html, type = "security") => {
 })();
 
 // ============================
-// WhatsApp (WAHA) — queued sender, 30s timeout
+// WhatsApp (WAHA) — queued sender, fast cold abort + warm retry
 // ============================
 const WAHA_URL = process.env.WAHA_URL;
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
-const WAHA_TIMEOUT_MS = 30 * 1000;
+const WAHA_TIMEOUT_MS = 8000;        // cold attempt — abort fast
+const WAHA_COLD_GRACE_MS = 30000;    // warm retry — WAHA is awake now
 
 async function wahaFetch(path, opts = {}) {
   if (!WAHA_URL) throw new Error("WAHA_URL not configured");
+  const timeoutMs = opts.timeoutMs ?? WAHA_TIMEOUT_MS;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), WAHA_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(`${WAHA_URL}${path}`, {
       ...opts,
@@ -212,12 +216,17 @@ function normalizePhoneForWa(phoneNumber) {
 }
 
 // ---- WhatsApp send queue ----
-// Simple in-memory queue with retry. Runs independently of request/response
-// so the IntaSend callback returns immediately.
 const waQueue = [];
 let waRunning = false;
-const WA_MAX_ATTEMPTS = 3;
-const WA_BASE_DELAY_MS = 2000;
+const WA_MAX_ATTEMPTS = 4;
+
+function timeoutForAttempt(attempts) {
+  return attempts === 0 ? WAHA_TIMEOUT_MS : WAHA_COLD_GRACE_MS;
+}
+
+function backoffForAttempt(attempts) {
+  return [1000, 3000, 8000][attempts - 1] || 8000;
+}
 
 function enqueueWhatsApp(phoneNumber, message, meta = {}) {
   const normalized = normalizePhoneForWa(phoneNumber);
@@ -243,9 +252,10 @@ async function drainWaQueue() {
   while (waQueue.length > 0) {
     const job = waQueue.shift();
     const ok = await attemptWaSend(job);
+
     if (!ok && job.attempts < WA_MAX_ATTEMPTS) {
       job.attempts += 1;
-      const delay = WA_BASE_DELAY_MS * job.attempts;
+      const delay = backoffForAttempt(job.attempts);
       console.log(`🔁 WA retry ${job.attempts}/${WA_MAX_ATTEMPTS} in ${delay}ms → ${job.phone}`);
       setTimeout(() => {
         waQueue.push(job);
@@ -254,7 +264,7 @@ async function drainWaQueue() {
     } else if (!ok) {
       console.error(`❌ WA giving up after ${WA_MAX_ATTEMPTS} attempts → ${job.phone}`, job.meta);
     }
-    // tiny spacing between sends to avoid hammering WAHA
+
     await new Promise((r) => setTimeout(r, 250));
   }
   waRunning = false;
@@ -263,28 +273,34 @@ async function drainWaQueue() {
 async function attemptWaSend(job) {
   if (!WAHA_URL || !WAHA_API_KEY) {
     console.log("⚠️ WAHA not configured, dropping queued message");
-    return true; // don't retry
+    return true;
   }
+  const timeoutMs = timeoutForAttempt(job.attempts);
   try {
     const chatId = `${job.phone}@c.us`;
     const res = await wahaFetch("/api/sendText", {
       method: "POST",
+      timeoutMs,
       body: JSON.stringify({ session: "default", chatId, text: job.message }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      console.error(`❌ WAHA send failed (${res.status}) → ${job.phone}`, data);
+      console.error(`❌ WAHA send failed (${res.status}, attempt ${job.attempts + 1}, ${timeoutMs}ms) → ${job.phone}`, data);
       return false;
     }
-    console.log(`📱 WhatsApp sent → ${job.phone}`);
+    console.log(`📱 WhatsApp sent → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms)`);
     return true;
   } catch (e) {
-    console.error(`❌ WAHA error → ${job.phone}:`, e.message);
+    const isAbort = e.name === "AbortError";
+    console.error(
+      `❌ WAHA ${isAbort ? "aborted" : "error"} → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms):`,
+      e.message
+    );
     return false;
   }
 }
 
-// Legacy sync-style helper kept for compatibility, but now just enqueues.
+// Kept for compatibility — always queues now
 const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
 
 // Keep WAHA awake on Render free tier
@@ -295,7 +311,7 @@ const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber
   }
   const INTERVAL = 4 * 60 * 1000;
   const ping = () => {
-    wahaFetch("/health").catch(() => {});
+    wahaFetch("/health", { timeoutMs: 5000 }).catch(() => {});
     setTimeout(ping, INTERVAL).unref?.();
   };
   setTimeout(ping, 30 * 1000).unref?.();
@@ -590,7 +606,7 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
       subtitle: "A local transport provider will confirm vehicle fit and quote shortly.",
       bodyHtml,
       ctaLabel: "Open tracking page",
-      ctaUrl: `${MARKETPLACE_URL}/transport`,
+      ctaUrl: MOVING_URL,
       footerNote: "Live driver updates appear on your tracking page when sharing is enabled.",
     });
 
@@ -907,7 +923,7 @@ app.post("/api/real-estate/seed", async (req, res) => {
 });
 
 // ============================
-// WhatsApp endpoints (control panel)
+// WhatsApp control endpoints
 // ============================
 
 app.post("/api/real-estate/notify", async (req, res) => {
@@ -930,12 +946,12 @@ app.post("/api/real-estate/notify", async (req, res) => {
 
 app.get("/api/real-estate/whatsapp/status", async (req, res) => {
   try {
-    const r = await wahaFetch("/api/sessions/default");
-    if (r.status === 404) return res.json({ success: true, status: "NOT_STARTED" });
+    const r = await wahaFetch("/api/sessions/default", { timeoutMs: 8000 });
+    if (r.status === 404) return res.json({ success: true, status: "NOT_STARTED", queue: waQueue.length });
     const data = await r.json();
     return res.json({ success: true, status: data.status || "UNKNOWN", queue: waQueue.length });
   } catch (e) {
-    return res.status(500).json({ success: false, message: e.message });
+    return res.status(500).json({ success: false, message: e.message, queue: waQueue.length });
   }
 });
 
@@ -943,6 +959,7 @@ app.post("/api/real-estate/whatsapp/start", async (req, res) => {
   try {
     const r = await wahaFetch("/api/sessions/start", {
       method: "POST",
+      timeoutMs: 30000,
       body: JSON.stringify({ name: "default" }),
     });
     const data = await r.json().catch(() => ({}));
@@ -954,7 +971,7 @@ app.post("/api/real-estate/whatsapp/start", async (req, res) => {
 
 app.post("/api/real-estate/whatsapp/stop", async (req, res) => {
   try {
-    const r = await wahaFetch("/api/sessions/default/stop", { method: "POST" });
+    const r = await wahaFetch("/api/sessions/default/stop", { method: "POST", timeoutMs: 30000 });
     return res.json({ success: r.ok });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
@@ -963,10 +980,11 @@ app.post("/api/real-estate/whatsapp/stop", async (req, res) => {
 
 app.post("/api/real-estate/whatsapp/restart", async (req, res) => {
   try {
-    await wahaFetch("/api/sessions/default/logout", { method: "POST" }).catch(() => {});
+    await wahaFetch("/api/sessions/default/logout", { method: "POST", timeoutMs: 30000 }).catch(() => {});
     await new Promise((r) => setTimeout(r, 1500));
     const r = await wahaFetch("/api/sessions/start", {
       method: "POST",
+      timeoutMs: 30000,
       body: JSON.stringify({ name: "default" }),
     });
     return res.json({ success: r.ok });
@@ -979,6 +997,7 @@ app.get("/api/real-estate/whatsapp/qr", async (req, res) => {
   try {
     const r = await wahaFetch("/api/default/auth/qr", {
       headers: { Accept: "image/png" },
+      timeoutMs: 15000,
     });
     if (!r.ok) return res.status(404).json({ success: false, message: "QR not ready" });
     const buf = Buffer.from(await r.arrayBuffer());
@@ -1286,7 +1305,6 @@ app.post("/api/intasend-callback", async (req, res) => {
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
 
-      // EMAIL
       if (!userEmail) {
         console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
       } else if (realEstate) {
@@ -1319,7 +1337,6 @@ app.post("/api/intasend-callback", async (req, res) => {
           .catch((e) => console.error("Email error:", e));
       }
 
-      // WHATSAPP (queued, non-blocking)
       const shortRef = String(mpesa_reference || api_ref).slice(0, 16);
       const amountNum = Number(orderData.totalAmount || callbackAmount || 0);
 
@@ -1339,7 +1356,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       } else if (moving) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MARKETPLACE_URL}/transport`,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}`,
             { kind: "moving-paid", api_ref }
           );
         }
@@ -1852,7 +1869,7 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
-  console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"} — queued, ${WAHA_TIMEOUT_MS / 1000}s timeout`);
+  console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"} — queued (cold ${WAHA_TIMEOUT_MS}ms / warm ${WAHA_COLD_GRACE_MS}ms)`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
   console.log(`📦 Store: ✅ email + WhatsApp`);
   console.log(`🏠 Real estate: ✅ email + WhatsApp (buyer + landlord)`);
