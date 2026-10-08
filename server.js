@@ -176,12 +176,12 @@ const sendEmail = async (to, subject, html, type = "security") => {
 })();
 
 // ============================
-// WhatsApp (WAHA) — queued sender, fast cold abort + warm retry
+// WhatsApp (WAHA) — queued sender
 // ============================
 const WAHA_URL = process.env.WAHA_URL;
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
-const WAHA_TIMEOUT_MS = 8000;        // cold attempt — abort fast
-const WAHA_COLD_GRACE_MS = 30000;    // warm retry — WAHA is awake now
+const WAHA_TIMEOUT_MS = 8000;
+const WAHA_COLD_GRACE_MS = 30000;
 
 async function wahaFetch(path, opts = {}) {
   if (!WAHA_URL) throw new Error("WAHA_URL not configured");
@@ -215,7 +215,6 @@ function normalizePhoneForWa(phoneNumber) {
   return digits;
 }
 
-// ---- WhatsApp send queue ----
 const waQueue = [];
 let waRunning = false;
 const WA_MAX_ATTEMPTS = 4;
@@ -300,7 +299,6 @@ async function attemptWaSend(job) {
   }
 }
 
-// Kept for compatibility — always queues now
 const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
 
 // Keep WAHA awake on Render free tier
@@ -346,7 +344,6 @@ function sendServerError(res, err, msg = "Internal server error") {
   return res.status(500).json({ success: false, message: msg });
 }
 
-// Ref-prefix routing
 const isWalletRef       = (r) => typeof r === "string" && r.startsWith("WALLET_");
 const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
 const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
@@ -419,7 +416,7 @@ const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
 // ============================
-// Order confirmation email (store)
+// Order confirmation email
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -1027,31 +1024,76 @@ app.post("/api/real-estate/whatsapp/send-test", async (req, res) => {
 // ============================
 // MOVING endpoints
 // ============================
+
+// Fires email + WhatsApp to the customer when admin updates a move request.
+// Only needs { requestId } — reads everything else from Firestore.
 app.post("/api/moving/notify", async (req, res) => {
   try {
-    const { requestId, email } = req.body || {};
-    if (!requestId || !email) {
-      return res.status(400).json({ success: false, message: "requestId and email required" });
+    const { requestId } = req.body || {};
+    if (!requestId) {
+      return res.status(400).json({ success: false, message: "requestId required" });
     }
     const snap = await db.collection("transportRequests").doc(requestId).get();
     if (!snap.exists) {
       return res.status(404).json({ success: false, message: "Request not found" });
     }
     const data = snap.data();
-    const ok = await sendMovingConfirmationEmail({
-      userName: data.userName,
-      pickupLabel: data.pickupLabel,
-      pickupCoordinates: data.pickupCoordinates,
-      destinationLabel: data.destinationLabel,
-      destinationTitle: data.destinationTitle,
-      destinationCoordinates: data.destinationCoordinates,
-      vehicleLabel: data.vehicleLabel,
-      itemCount: data.itemCount,
-      items: data.items,
-      quotedPrice: data.quotedPrice,
-      status: data.status,
-    }, email, requestId);
-    return res.json({ success: ok });
+
+    const email =
+      req.body.email ||
+      data.userEmail ||
+      data.email ||
+      null;
+
+    const phone =
+      req.body.phone ||
+      data.phoneNumber ||
+      data.shippingDetails?.phoneNumber ||
+      null;
+
+    const status = data.status || "REQUESTED";
+    const statusLabel = String(status).replace(/_/g, " ").toLowerCase();
+    const quote = Number(data.quotedPrice || 0);
+
+    // Email (non-blocking)
+    if (email) {
+      sendMovingConfirmationEmail({
+        userName: data.userName,
+        pickupLabel: data.pickupLabel,
+        pickupCoordinates: data.pickupCoordinates,
+        destinationLabel: data.destinationLabel,
+        destinationTitle: data.destinationTitle,
+        destinationCoordinates: data.destinationCoordinates,
+        vehicleLabel: data.vehicleLabel,
+        itemCount: data.itemCount,
+        items: data.items,
+        quotedPrice: data.quotedPrice,
+        status,
+      }, email, requestId)
+        .then((ok) => console.log(ok ? `🚚 Moving notify email sent for ${requestId}` : `❌ Moving notify email failed for ${requestId}`))
+        .catch((e) => console.error("Moving notify email error:", e));
+    }
+
+    // WhatsApp (queued)
+    if (phone) {
+      const lines = [
+        "🚚 MarketMix Moving",
+        "Update on your move:",
+        `${data.pickupLabel} → ${data.destinationTitle || data.destinationLabel}`,
+        `Status: ${statusLabel.toUpperCase()}`,
+      ];
+      if (quote > 0) lines.push(`Quote: KES ${quote.toLocaleString("en-KE")}`);
+      if (data.driverName) {
+        const driverLine = `Driver: ${data.driverName}${data.driverPhone ? ` (${data.driverPhone})` : ""}`;
+        lines.push(driverLine);
+      }
+      if (data.etaMinutes) lines.push(`ETA: ${data.etaMinutes} min`);
+      lines.push(`Track: ${MOVING_URL}`);
+
+      enqueueWhatsApp(phone, lines.join("\n"), { kind: "moving-status", requestId });
+    }
+
+    return res.json({ success: true });
   } catch (e) {
     return sendServerError(res, e, "Moving notify failed");
   }
