@@ -689,6 +689,96 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
 };
 
 // ============================
+// Real Estates — welcome email (signup + role switch)
+// Copy is supplied by the frontend (label, desc, perks) — no roles defined here.
+// ============================
+const sendRealEstateWelcomeEmail = async ({
+  userEmail,
+  userName,
+  roleLabel,
+  roleDesc = "",
+  rolePerks = [],
+  isSwitch = false,
+  previousRoleLabel = null,
+  ctaLabel = "Open MarketMix Real Estates",
+  ctaUrl = REAL_ESTATE_APP_URL,
+  emailType = "bookings",
+}) => {
+  try {
+    if (!BREVO_API_KEY) return false;
+    const name = userName || (userEmail ? userEmail.split("@")[0] : "there");
+
+    const title = isSwitch
+      ? `You switched to ${roleLabel}`
+      : `Welcome to MarketMix Real Estates, ${name}!`;
+
+    const subtitle = isSwitch
+      ? `You're now a ${roleLabel}${previousRoleLabel ? ` (was ${previousRoleLabel})` : ""} on MarketMix Real Estates.`
+      : (roleDesc || "Find houses, match with roommates, and book transport to your new place — all in one app.");
+
+    const bodyHtml = `
+      ${emailBodyText(
+        isSwitch
+          ? `Hello <strong>${name}</strong>, your MarketMix Real Estates account type has been updated.`
+          : `Hello <strong>${name}</strong>, we're thrilled to have you on MarketMix Real Estates.`
+      )}
+
+      ${rolePerks.length ? emailSectionLabel(isSwitch ? `As a ${roleLabel}, you can now:` : "What you can do") : ""}
+      ${rolePerks.length ? `
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+          <tr><td style="padding:18px;font-size:13px;line-height:1.9;color:#334155;">
+            ${rolePerks.map((line) => `• ${line}`).join("<br/>")}
+          </td></tr>
+        </table>` : ""}
+
+      ${emailSectionLabel(isSwitch ? "What happens next" : "Getting started")}
+      ${emailInfoCard([
+        ["Account type", roleLabel, true],
+        ["Status", isSwitch ? "Updated" : "Active", true],
+      ])}
+
+      ${emailBodyText(
+        isSwitch
+          ? "If you switched by mistake, you can change back anytime from your Profile page."
+          : "You can switch your account type anytime from your Profile page."
+      )}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: isSwitch
+        ? `You're now a ${roleLabel} on MarketMix Real Estates`
+        : `Welcome to MarketMix Real Estates — here's what you can do as a ${roleLabel}`,
+      eyebrow: `MarketMix Real Estates · ${roleLabel}`,
+      title,
+      subtitle,
+      bodyHtml,
+      ctaLabel,
+      ctaUrl,
+      footerNote: "Questions? Reply to this email and our team will help.",
+    });
+
+    const subject = isSwitch
+      ? `You're now a ${roleLabel} · MarketMix Real Estates`
+      : `Welcome to MarketMix Real Estates, ${name}!`;
+
+    const ok = await sendEmail(userEmail, subject, html, emailType);
+    if (ok) {
+      await reDb.collection("welcomeEmails").add({
+        userEmail,
+        roleLabel,
+        isSwitch,
+        previousRoleLabel: previousRoleLabel || null,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ RE welcome email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
 // PIN recovery helpers
 // ============================
 const generateReplacementCode = () =>
@@ -976,6 +1066,83 @@ app.post("/api/real-estate/seed", async (req, res) => {
     return res.json({ success: true, message: "Real estate order seeded", ref });
   } catch (e) {
     return sendServerError(res, e, "Real estate seed failed");
+  }
+});
+
+// ============================
+// Real Estates — welcome (signup + role switch)
+// Frontend sends roleLabel / roleDesc / rolePerks from its own constants.
+// ============================
+app.post("/api/re/welcome", async (req, res) => {
+  try {
+    const {
+      email,
+      name,
+      phone,
+      roleLabel,
+      roleDesc,
+      rolePerks,
+      isSwitch = false,
+      previousRoleLabel = null,
+      ctaLabel,
+      ctaUrl,
+    } = req.body || {};
+
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ success: false, message: "Valid email required" });
+    }
+    if (!roleLabel) {
+      return res.status(400).json({ success: false, message: "roleLabel required" });
+    }
+
+    const emailSent = await sendRealEstateWelcomeEmail({
+      userEmail: email,
+      userName: name,
+      roleLabel,
+      roleDesc,
+      rolePerks: Array.isArray(rolePerks) ? rolePerks : [],
+      isSwitch: !!isSwitch,
+      previousRoleLabel,
+      ctaLabel,
+      ctaUrl,
+    });
+
+    let whatsappQueued = false;
+    if (phone) {
+      const lines = [
+        `🏠 *MarketMix Real Estates*`,
+        ``,
+        isSwitch
+          ? `Hi ${name || "there"} — you're now a *${roleLabel}*${previousRoleLabel ? ` (was ${previousRoleLabel})` : ""}.`
+          : `*Welcome, ${name || "friend"}!*`,
+        ``,
+        roleDesc ? roleDesc : "",
+        rolePerks && rolePerks.length ? `\n*What you can do:*` : "",
+        ...(Array.isArray(rolePerks) ? rolePerks.map((l) => `• ${l}`) : []),
+        ``,
+        isSwitch
+          ? `Changed by mistake? You can switch back anytime from your Profile page.`
+          : `You can switch your account type anytime from your Profile page.`,
+        ``,
+        `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
+      ].filter(Boolean);
+
+      whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
+        kind: isSwitch ? "re-welcome-role-switch" : "re-welcome-signup",
+        roleLabel,
+      });
+    }
+
+    return res.json({
+      success: true,
+      emailSent,
+      whatsappQueued,
+      isSwitch: !!isSwitch,
+      roleLabel,
+    });
+  } catch (e) {
+    console.error("❌ /api/re/welcome failed:", e);
+    return sendServerError(res, e, "Welcome failed");
   }
 });
 
@@ -2011,6 +2178,7 @@ app.get("/_health", (req, res) => {
       "/api/whatsapp/notify",
       "/api/service-request/notify",
       "/api/moving/notify",
+      "/api/re/welcome",
       "/api/stk-push",
       "/api/store/seed",
       "/api/real-estate/seed",
@@ -2086,6 +2254,7 @@ const server = app.listen(PORT, () => {
   console.log(`🧑‍✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
   console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
   console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/service-request/notify, /api/moving/notify)`);
+  console.log(`👋 Real Estates welcome: ✅ (/api/re/welcome)`);
 });
 
 const shutdown = () => {
