@@ -1,15 +1,5 @@
-// server.js
-// Full Express backend for Campus Store + MarketMix Real Estates
-// Features:
-// - Brevo transactional email (PIN recovery, order confirmations, proposal status, real estate receipts)
-// - Real-time fee listener from Firestore
-// - IntaSend B2C withdrawals
-// - Hugging Face image generation
-// - Subscription payment handling (M-Pesa STK Push)
-// - Subscription status polling and confirmation
-// - Smart keep-alive with overnight pause (11pm - 5am)
-// - Universal cross-site transaction lookup
-// - Orders-first ad-transaction lookup with wallet-deposit auto-heal
+// server.js — single-file backend for MarketMix (store + wallet + subscriptions + real estate)
+// Real-estate flow is isolated by the "PROP_" ref prefix; it does NOT touch store/wallet/subscription logic.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -27,7 +17,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
 // ============================
-// CORS CONFIGURATION
+// CORS
 // ============================
 const allowedOrigins = [
   "http://localhost:5173",
@@ -41,37 +31,27 @@ const allowedOrigins = [
   "https://localhost",
 ];
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      if (
-        origin.startsWith("http://localhost") ||
-        origin.startsWith("http://127.0.0.1")
-      ) {
-        return callback(null, true);
-      }
-      const msg = `CORS blocked: ${origin}`;
-      console.error(msg);
-      return callback(new Error(msg), false);
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
+      return callback(null, true);
+    }
+    console.error(`CORS blocked: ${origin}`);
+    return callback(new Error(`CORS blocked: ${origin}`), false);
+  },
+  credentials: true,
+}));
 
 // ============================
 // Middleware
 // ============================
 app.use(bodyParser.json());
 
-// Request logging middleware
 app.use((req, res, next) => {
   try {
-    console.log(
-      `${new Date().toISOString()} → ${req.method} ${req.originalUrl}`,
-      req.body || {}
-    );
+    console.log(`${new Date().toISOString()} → ${req.method} ${req.originalUrl}`, req.body || {});
   } catch (e) {
     console.error("Logging error:", e);
   }
@@ -93,7 +73,7 @@ if (missing.length) {
 }
 
 // ============================
-// Firebase Admin init
+// Firebase
 // ============================
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
@@ -107,7 +87,7 @@ try {
 const db = admin.firestore();
 
 // ============================
-// IntaSend init
+// IntaSend
 // ============================
 const intasend = new IntaSend(
   process.env.INTASEND_PUBLISHABLE_KEY,
@@ -121,554 +101,76 @@ const REAL_ESTATE_RECEIPT_URL =
   "https://marketmix-realestates.vercel.app/receipt";
 
 // ============================
-// Brevo Email Service
+// Brevo
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
-const sendEmail = async (to, subject, html, type = 'security') => {
+const sendEmail = async (to, subject, html, type = "security") => {
   try {
-    console.log('📧 Attempting to send email to:', to);
-    console.log('📧 Subject:', subject);
-    console.log('📧 Type:', type);
-    
+    console.log("📧 Sending email:", { to, subject, type });
+
     if (!BREVO_API_KEY) {
-      console.log('❌ BREVO_API_KEY not configured in environment');
-      console.log('📧 Email would have been sent to:', to);
-      console.log('📧 Sender:', type === 'sales' ? 'MarketMixKenya <sales@marketmix.site>' : 'MarketMixKenya <security@marketmix.site>');
-      console.log('📧 Subject:', subject);
+      console.log("❌ BREVO_API_KEY not configured");
       return false;
     }
-    
-    const sender = type === 'sales' 
-      ? { name: 'MarketMixKenya', email: 'sales@marketmix.site' }
-      : { name: 'MarketMixKenya', email: 'security@marketmix.site' };
-    
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
+
+    const sender = type === "sales"
+      ? { name: "MarketMixKenya", email: "sales@marketmix.site" }
+      : { name: "MarketMixKenya", email: "security@marketmix.site" };
+
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
       headers: {
-        'accept': 'application/json',
-        'api-key': BREVO_API_KEY,
-        'content-type': 'application/json'
+        accept: "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
       },
       body: JSON.stringify({
-        sender: sender,
-        to: [{
-          email: to,
-          name: to.split('@')[0] || 'User'
-        }],
-        subject: subject,
+        sender,
+        to: [{ email: to, name: to.split("@")[0] || "User" }],
+        subject,
         htmlContent: html,
-        tags: [type === 'sales' ? 'order-confirmation' : 'pin-recovery']
-      })
+        tags: [type === "sales" ? "order-confirmation" : "pin-recovery"],
+      }),
     });
 
     const data = await response.json();
-    
     if (!response.ok) {
-      console.error('❌ Brevo API error:', JSON.stringify(data, null, 2));
+      console.error("❌ Brevo API error:", JSON.stringify(data, null, 2));
       throw new Error(data.message || `Brevo API error: ${response.status}`);
     }
 
-    console.log(`✅ Email sent successfully!`);
-    console.log(`📧 Message ID: ${data.messageId}`);
-    console.log(`📧 To: ${to}`);
-    console.log(`📧 From: ${sender.name} <${sender.email}>`);
-    console.log(`📧 Type: ${type}`);
+    console.log(`✅ Email sent (id=${data.messageId})`);
     return true;
-    
   } catch (error) {
-    console.error('❌ Email sending failed:', error.message);
+    console.error("❌ Email sending failed:", error.message);
     return false;
   }
 };
 
-// Test Brevo setup on startup
+// Brevo startup check
 (async () => {
-  if (BREVO_API_KEY) {
-    try {
-      const response = await fetch('https://api.brevo.com/v3/account', {
-        headers: {
-          'accept': 'application/json',
-          'api-key': BREVO_API_KEY
-        }
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        console.log(`✅ Brevo API connected successfully`);
-        console.log(`📧 Account: ${data.email}`);
-        console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
-        console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
-        console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
-      } else {
-        console.warn('⚠️ Brevo API key may be invalid');
-      }
-    } catch (error) {
-      console.warn('⚠️ Could not verify Brevo API key on startup:', error.message);
+  if (!BREVO_API_KEY) {
+    console.warn("⚠️ BREVO_API_KEY not set — emails will not be sent");
+    return;
+  }
+  try {
+    const r = await fetch("https://api.brevo.com/v3/account", {
+      headers: { accept: "application/json", "api-key": BREVO_API_KEY },
+    });
+    if (r.ok) {
+      const d = await r.json();
+      console.log(`✅ Brevo connected as ${d.email}`);
+    } else {
+      console.warn("⚠️ Brevo key may be invalid");
     }
-  } else {
-    console.warn('⚠️ BREVO_API_KEY not set in environment - emails will not be sent');
+  } catch (e) {
+    console.warn("⚠️ Brevo startup check failed:", e.message);
   }
 })();
 
 // ============================
-// Proposal Status Email Function
-// ============================
-const sendProposalStatusEmail = async (emailData) => {
-  try {
-    console.log(`📧 Sending proposal status email to: ${emailData.to}`);
-    console.log(`📧 Proposal ID: ${emailData.proposalId}`);
-    console.log(`📧 Status: ${emailData.status}`);
-    
-    if (!BREVO_API_KEY) {
-      console.log('❌ BREVO_API_KEY not configured - skipping email');
-      return false;
-    }
-    
-    const emailHtml = emailData.html || `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: #f9fafb; }
-    .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border: 1px solid #e5e7eb; }
-    .header { background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%); padding: 32px 24px; text-align: center; color: white; }
-    .content { padding: 32px 24px; }
-    .footer { background: #f8f9fa; padding: 24px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div style="font-size: 24px; font-weight: bold; margin-bottom: 8px;">MarketMix Kenya</div>
-      <h2 style="margin: 8px 0 0 0; font-weight: 300; font-size: 16px; opacity: 0.9;">Lipa Mdogo Mdogo Installment Update</h2>
-    </div>
-    <div class="content">
-      <h3 style="color: #1f2937; margin-bottom: 8px; font-size: 18px;">Hello ${emailData.studentName || 'Student'},</h3>
-      <p style="color: #4b5563; margin-bottom: 20px;">Your installment proposal has been reviewed.</p>
-      <div style="background: ${emailData.status === 'approved' ? '#f0fdf4' : '#fef2f2'}; border-left: 4px solid ${emailData.status === 'approved' ? '#10b981' : '#ef4444'}; padding: 16px; border-radius: 8px; margin: 20px 0;">
-        <h4 style="margin-top: 0; color: ${emailData.status === 'approved' ? '#065f46' : '#7c2d12'}; margin-bottom: 8px; font-size: 14px;">
-          Status: ${emailData.status === 'approved' ? 'APPROVED ✅' : 'REJECTED ❌'}
-        </h4>
-        ${emailData.notes ? `<p style="color: #374151; margin: 0; font-size: 14px; line-height: 1.5;">${emailData.notes.replace(/\n/g, '<br>')}</p>` : ''}
-      </div>
-      <div style="background: #f8fafc; border-radius: 10px; padding: 20px; margin: 20px 0; border: 1px solid #e2e8f0;">
-        <p style="margin: 0 0 10px 0; font-size: 14px;"><strong>Proposal Details:</strong></p>
-        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>ID:</strong> ${emailData.proposalId?.substring(0, 8) || 'N/A'}</p>
-        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>Amount:</strong> KSH ${parseFloat(emailData.amount || 0).toLocaleString()}</p>
-        <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>Institution:</strong> ${emailData.institution || 'N/A'}</p>
-      </div>
-    </div>
-    <div class="footer">
-      <p style="margin: 0 0 8px 0; font-weight: 500;">MarketMix Kenya © ${new Date().getFullYear()}</p>
-      <p style="margin: 0; font-size: 12px;">This email was sent from <strong>MarketMixKenya &lt;sales@marketmix.site&gt;</strong></p>
-    </div>
-  </div>
-</body>
-</html>`;
-
-    const emailSent = await sendEmail(
-      emailData.to,
-      emailData.subject || `Your Installment Proposal Update - MarketMix Kenya`,
-      emailHtml,
-      'sales'
-    );
-
-    if (emailSent) {
-      try {
-        await db.collection('proposalStatusEmails').add({
-          proposalId: emailData.proposalId,
-          studentEmail: emailData.to,
-          studentName: emailData.studentName,
-          status: emailData.status,
-          notes: emailData.notes || '',
-          amount: emailData.amount || 0,
-          institution: emailData.institution || '',
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          sender: 'MarketMixKenya <sales@marketmix.site>',
-          authenticated: true,
-          dmarc: 'configured',
-          dkim: 'signed'
-        });
-        console.log(`✅ Proposal status email logged for ${emailData.proposalId}`);
-      } catch (logErr) {
-        console.error('Failed to log proposal status email:', logErr);
-      }
-    }
-    
-    return emailSent;
-    
-  } catch (error) {
-    console.error('❌ Proposal status email failed:', error.message);
-    return false;
-  }
-};
-
-// ============================
-// PIN Recovery System (Replacement Codes)
-// ============================
-
-const generateReplacementCode = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-};
-
-const storeReplacementCode = async (userId, email, code) => {
-  try {
-    const expiryTime = new Date();
-    expiryTime.setMinutes(expiryTime.getMinutes() + 15);
-    
-    await db.collection('pinRecoveryCodes').doc(userId).set({
-      code, email, userId,
-      expiresAt: expiryTime,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      attempts: 0, maxAttempts: 3, used: false, status: 'pending'
-    });
-    
-    return true;
-  } catch (error) {
-    console.error('Failed to store replacement code:', error);
-    return false;
-  }
-};
-
-const verifyReplacementCode = async (userId, code) => {
-  try {
-    const recoveryDoc = await db.collection('pinRecoveryCodes').doc(userId).get();
-    
-    if (!recoveryDoc.exists) {
-      return { valid: false, message: 'No recovery request found' };
-    }
-    
-    const recoveryData = recoveryDoc.data();
-    
-    if (recoveryData.expiresAt.toDate() < new Date()) {
-      await db.collection('pinRecoveryCodes').doc(userId).delete();
-      return { valid: false, message: 'Recovery code has expired' };
-    }
-    if (recoveryData.used) {
-      return { valid: false, message: 'Recovery code has already been used' };
-    }
-    if (recoveryData.attempts >= recoveryData.maxAttempts) {
-      return { valid: false, message: 'Too many failed attempts' };
-    }
-    if (recoveryData.code !== code) {
-      await db.collection('pinRecoveryCodes').doc(userId).update({
-        attempts: admin.firestore.FieldValue.increment(1)
-      });
-      const remainingAttempts = recoveryData.maxAttempts - (recoveryData.attempts + 1);
-      return { valid: false, message: `Invalid code. ${remainingAttempts} attempts remaining` };
-    }
-    
-    await db.collection('pinRecoveryCodes').doc(userId).update({
-      status: 'verified',
-      verifiedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-    
-    return { valid: true, data: recoveryData };
-  } catch (error) {
-    console.error('Failed to verify replacement code:', error);
-    return { valid: false, message: 'Verification failed' };
-  }
-};
-
-const markCodeAsUsed = async (userId) => {
-  try {
-    await db.collection('pinRecoveryCodes').doc(userId).update({
-      used: true,
-      usedAt: admin.firestore.FieldValue.serverTimestamp(),
-      status: 'completed'
-    });
-    return true;
-  } catch (error) {
-    console.error('Failed to mark code as used:', error);
-    return false;
-  }
-};
-
-// ============================
-// Order Confirmation Email System
-// ============================
-
-const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
-  try {
-    console.log('📧 Sending order confirmation to:', userEmail);
-    
-    if (!BREVO_API_KEY) {
-      console.log('❌ BREVO_API_KEY not configured - skipping email');
-      return false;
-    }
-    
-    const orderDate = orderData.orderDate?.toDate() || new Date();
-    const formattedDate = orderDate.toLocaleString('en-KE', {
-      timeZone: 'Africa/Nairobi',
-      month: 'short', day: 'numeric', year: 'numeric',
-      hour: '2-digit', minute: '2-digit'
-    });
-    
-    const itemsTotal = orderData.items?.reduce((sum, item) => 
-      sum + ((item.price || 0) * (item.quantity || 1)), 0) || 0;
-    
-    const deliveryTotal = orderData.sellerGroups?.reduce((sum, group) => 
-      sum + (group.deliveryCost || 0), 0) || 0;
-    
-    const emailHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: 'Georgia', 'Times New Roman', serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: linear-gradient(to bottom right, #f9fafb, #f3f4f6); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-    .container { max-width: 480px; width: 100%; margin: 20px auto; background: white; border-radius: 20px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.08); position: relative; border: 1px solid #e5e7eb; padding-bottom: 64px; }
-    .watermark { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; z-index: 0; opacity: 0.05; }
-    .watermark img { width: 100%; height: 100%; object-fit: cover; }
-    .logo-container { display: flex; justify-content: center; margin-bottom: 24px; margin-top: 24px; position: relative; z-index: 10; }
-    .logo { height: 64px; }
-    .header { text-align: center; position: relative; z-index: 10; padding: 0 24px; }
-    .title { font-weight: bold; font-size: 18px; margin-bottom: 4px; color: #1f2937; }
-    .subtitle { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
-    .content-box { background: #f9fafb; border-radius: 12px; padding: 20px; margin: 0 24px 24px; border: 1px solid #e5e7eb; position: relative; z-index: 10; }
-    .order-info { margin-bottom: 16px; }
-    .info-row { margin-bottom: 8px; font-size: 14px; }
-    .info-label { font-weight: 600; color: #374151; }
-    .items-section { margin-top: 16px; }
-    .items-title { font-weight: 600; margin-bottom: 8px; color: #374151; }
-    .items-list { padding-left: 20px; list-style-type: disc; margin: 0; }
-    .item { margin-bottom: 6px; color: #4b5563; font-size: 14px; }
-    .item span { color: #1f2937; font-weight: 500; }
-    .total-row { text-align: right; font-weight: 600; margin-top: 16px; padding-top: 12px; border-top: 1px dashed #d1d5db; font-size: 15px; color: #1f2937; }
-    .divider { height: 1px; background: #e5e7eb; margin: 24px; position: relative; z-index: 10; }
-    .section-title { font-weight: 600; margin-bottom: 12px; margin-left: 24px; color: #374151; position: relative; z-index: 10; font-size: 15px; }
-    .shipping-box { background: #f9fafb; border-radius: 8px; padding: 16px; margin: 0 24px; border: 1px solid #e5e7eb; position: relative; z-index: 10; }
-    .shipping-row { margin-bottom: 6px; font-size: 14px; }
-    .footer { text-align: center; font-size: 11px; color: #9ca3af; margin-top: 24px; position: relative; z-index: 10; padding: 0 24px; }
-    .receipt-id { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 8px 16px; border-radius: 8px; font-weight: bold; margin-bottom: 16px; font-size: 14px; letter-spacing: 0.5px; }
-    .status-badge { display: inline-block; background: #10b981; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; margin-top: 8px; }
-    .print-section { text-align: center; margin-top: 24px; position: relative; z-index: 10; }
-    .action-link { color: #4f46e5; text-decoration: none; font-weight: 500; font-size: 14px; }
-    .action-button { display: inline-block; background: #4f46e5; color: white; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 500; margin: 0 8px; font-size: 14px; border: none; cursor: pointer; }
-    .coupon-row { color: #10b981; font-size: 14px; }
-    .delivery-row { font-size: 14px; color: #4b5563; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="watermark">
-      <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="Watermark">
-    </div>
-    <div class="logo-container">
-      <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="MarketMix Logo" class="logo">
-    </div>
-    <div class="header">
-      <div class="receipt-id">Order #${orderId.substring(0, 8)}</div>
-      <div class="title">Thank you for shopping with us</div>
-      <div class="subtitle">We appreciate your trust and hope you enjoyed your order.</div>
-      <div class="status-badge">Payment Confirmed</div>
-    </div>
-    <div class="content-box">
-      <div class="order-info">
-        <div class="info-row"><span class="info-label">Order ID:</span> ${orderId || "N/A"}</div>
-        <div class="info-row"><span class="info-label">Date:</span> ${formattedDate}</div>
-        <div class="info-row"><span class="info-label">Buyer:</span> ${orderData.shippingDetails?.fullName || userEmail || "N/A"}</div>
-      </div>
-      <div class="items-section">
-        <div class="items-title">Items:</div>
-        <ul class="items-list">
-          ${orderData.items?.map(item => `<li class="item">${item.name} × ${item.quantity} – Ksh <span>${((item.price || 0) * (item.quantity || 1)).toFixed(2)}</span></li>`).join('') || '<li class="item">No items</li>'}
-        </ul>
-      </div>
-      <div class="total-row">Items Total: Ksh ${itemsTotal.toFixed(2)}</div>
-      ${orderData.couponDiscount > 0 ? `<div class="total-row coupon-row">Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}: -Ksh ${orderData.couponDiscount.toFixed(2)}</div>` : ''}
-      <div class="total-row delivery-row">Delivery Total: Ksh ${deliveryTotal.toFixed(2)}</div>
-      <div class="total-row" style="font-size: 16px; color: #1f2937; margin-top: 20px;">Total Amount Paid: Ksh ${orderData.totalAmount?.toFixed(2) || '0.00'}</div>
-    </div>
-    <div class="divider"></div>
-    <div class="section-title">Shipping Details</div>
-    <div class="shipping-box">
-      <div class="shipping-row"><span class="info-label">Full Name:</span> ${orderData.shippingDetails?.fullName || "N/A"}</div>
-      <div class="shipping-row"><span class="info-label">Phone:</span> ${orderData.shippingDetails?.phoneNumber || "N/A"}</div>
-      <div class="shipping-row"><span class="info-label">Delivery Place:</span> ${orderData.shippingDetails?.deliveryPlace || "N/A"}</div>
-    </div>
-    <div class="print-section">
-      <p style="margin-bottom: 16px; color: #6b7280; font-size: 14px;">View your full receipt: <a href="https://marketmix.site/order-receipt/${orderId}" class="action-link">Order Receipt</a></p>
-      <div style="margin-top: 20px;">
-        <a href="https://marketmix.site" class="action-button" style="background: #1f2937;">Continue Shopping</a>
-        <a href="https://marketmix.site/orders" class="action-button">View All Orders</a>
-      </div>
-    </div>
-    <div class="footer">
-      <p style="margin: 0;">MarketMix Kenya © ${new Date().getFullYear()} | Receipt generated online</p>
-      <p style="margin: 8px 0 0 0; font-size: 10px;">Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #6b7280;">sales@marketmix.site</a></p>
-    </div>
-  </div>
-</body>
-</html>`;
-
-    const emailSent = await sendEmail(
-      userEmail,
-      `Order Confirmation #${orderId.substring(0, 8)} - MarketMix Kenya`,
-      emailHtml,
-      'sales'
-    );
-
-    if (emailSent) {
-      try {
-        await db.collection('orderEmails').add({
-          orderId, userEmail, type: 'confirmation',
-          sender: 'MarketMixKenya <sales@marketmix.site>',
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          authenticated: true, dmarc: 'configured', dkim: 'signed'
-        });
-      } catch (logErr) {
-        console.error('Failed to log email:', logErr);
-      }
-    }
-    
-    return emailSent;
-    
-  } catch (error) {
-    console.error('❌ Order confirmation email failed:', error.message);
-    return false;
-  }
-};
-
-// ============================
-// Real Estate Payment Confirmation Email
-// ============================
-const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
-  try {
-    console.log('🏠 Sending real estate payment confirmation to:', userEmail);
-
-    if (!BREVO_API_KEY) {
-      console.log('❌ BREVO_API_KEY not configured - skipping real estate email');
-      return false;
-    }
-
-    const paidAt = new Date().toLocaleString('en-KE', {
-      timeZone: 'Africa/Nairobi',
-      month: 'short', day: 'numeric', year: 'numeric',
-      hour: '2-digit', minute: '2-digit'
-    });
-
-    const propertyTitle = data.propertyTitle || data.propertyName || 'Property';
-    const propertyLocation = data.propertyLocation || data.location || 'N/A';
-    const propertyType = data.propertyType || data.listingType || 'N/A';
-    const amount = Number(data.totalAmount || data.amount || 0);
-    const mpesaRef = data.mpesaReference || data.mpesaCode || 'N/A';
-    const landlordName = data.landlordName || data.sellerName || 'N/A';
-    const landlordPhone = data.landlordPhone || data.sellerPhone || 'N/A';
-    const buyerName = data.buyerName || data.shippingDetails?.fullName || userEmail;
-
-    const emailHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: #f3f4f6; }
-    .container { max-width: 560px; margin: 24px auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #e5e7eb; box-shadow: 0 8px 30px rgba(0,0,0,0.06); }
-    .header { background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%); color: #ffffff; padding: 32px 24px; text-align: center; }
-    .header h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; }
-    .header p { margin: 0; font-size: 14px; opacity: 0.9; }
-    .badge { display: inline-block; margin-top: 14px; background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.35); color: #ffffff; padding: 6px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: 0.4px; }
-    .content { padding: 28px 24px 8px 24px; }
-    .greeting { font-size: 16px; color: #111827; margin-bottom: 6px; }
-    .intro { color: #4b5563; font-size: 14px; margin-bottom: 20px; }
-    .amount-box { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 22px; }
-    .amount-label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #047857; margin: 0 0 6px 0; }
-    .amount-value { font-size: 28px; font-weight: 700; color: #065f46; margin: 0; }
-    .details { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; margin-bottom: 20px; }
-    .details h3 { margin: 0 0 12px 0; font-size: 14px; color: #111827; }
-    .row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px dashed #e5e7eb; font-size: 13px; }
-    .row:last-child { border-bottom: none; }
-    .row .label { color: #6b7280; }
-    .row .value { color: #111827; font-weight: 600; text-align: right; max-width: 60%; word-break: break-word; }
-    .note { background: #eff6ff; border-left: 4px solid #3b82f6; border-radius: 8px; padding: 14px 16px; font-size: 13px; color: #1e3a8a; margin-bottom: 20px; }
-    .cta { text-align: center; margin: 24px 0 8px 0; }
-    .cta a { display: inline-block; background: #0f766e; color: #ffffff; text-decoration: none; padding: 12px 22px; border-radius: 10px; font-size: 14px; font-weight: 600; margin: 0 6px 10px 6px; }
-    .cta a.secondary { background: #111827; }
-    .footer { background: #f9fafb; border-top: 1px solid #e5e7eb; padding: 18px 24px; text-align: center; font-size: 12px; color: #6b7280; }
-    .footer a { color: #0f766e; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>MarketMix Real Estates</h1>
-      <p>Payment Confirmation Receipt</p>
-      <div class="badge">✅ PAYMENT CONFIRMED</div>
-    </div>
-    <div class="content">
-      <p class="greeting">Hello ${buyerName},</p>
-      <p class="intro">Your payment for the property below has been received and confirmed. Please keep this email as your official receipt.</p>
-      <div class="amount-box">
-        <p class="amount-label">Amount Paid</p>
-        <p class="amount-value">KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-      </div>
-      <div class="details">
-        <h3>Property Details</h3>
-        <div class="row"><span class="label">Property</span><span class="value">${propertyTitle}</span></div>
-        <div class="row"><span class="label">Location</span><span class="value">${propertyLocation}</span></div>
-        <div class="row"><span class="label">Type</span><span class="value">${propertyType}</span></div>
-        <div class="row"><span class="label">Reference</span><span class="value">${orderId}</span></div>
-        <div class="row"><span class="label">M-Pesa Code</span><span class="value">${mpesaRef}</span></div>
-        <div class="row"><span class="label">Paid On</span><span class="value">${paidAt}</span></div>
-      </div>
-      <div class="details">
-        <h3>Landlord / Agent Contact</h3>
-        <div class="row"><span class="label">Name</span><span class="value">${landlordName}</span></div>
-        <div class="row"><span class="label">Phone</span><span class="value">${landlordPhone}</span></div>
-      </div>
-      <div class="note">
-        <strong>Next steps:</strong> The landlord or agent will contact you shortly to arrange viewing, keys handover, or any outstanding paperwork. If you have questions, reply to this email or contact support.
-      </div>
-      <div class="cta">
-        <a href="${REAL_ESTATE_RECEIPT_URL}/${orderId}">View Receipt Online</a>
-        <a href="https://marketmix-realestates.vercel.app" class="secondary">Browse More Properties</a>
-      </div>
-    </div>
-    <div class="footer">
-      <p style="margin: 0 0 6px 0;"><strong>MarketMix Real Estates</strong></p>
-      <p style="margin: 0 0 6px 0;">MarketMix Kenya © ${new Date().getFullYear()}</p>
-      <p style="margin: 0;">Need help? <a href="mailto:sales@marketmix.site">sales@marketmix.site</a></p>
-    </div>
-  </div>
-</body>
-</html>`;
-
-    const emailSent = await sendEmail(
-      userEmail,
-      `Payment Confirmed - ${propertyTitle} (${orderId.substring(0, 8)})`,
-      emailHtml,
-      'sales'
-    );
-
-    if (emailSent) {
-      try {
-        await db.collection('realEstateEmails').add({
-          orderId, userEmail, propertyTitle, amount,
-          mpesaReference: mpesaRef, type: 'real_estate_confirmation',
-          sender: 'MarketMixKenya <sales@marketmix.site>',
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          authenticated: true, dmarc: 'configured', dkim: 'signed'
-        });
-      } catch (logErr) {
-        console.error('Failed to log real estate email:', logErr);
-      }
-    }
-
-    return emailSent;
-  } catch (error) {
-    console.error('❌ Real estate payment email failed:', error.message);
-    return false;
-  }
-};
-
-// ============================
-// Fee Constants & Helpers
+// Helpers
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
 const FIXED_FEE_BELOW_THRESHOLD = 10.0;
@@ -699,166 +201,318 @@ function sendServerError(res, err, msg = "Internal server error") {
   return res.status(500).json({ success: false, message: msg });
 }
 
-function isRealEstateRef(apiRef, orderData) {
-  if (!apiRef) return false;
-  if (apiRef.startsWith("PROP_")) return true;
-  if (apiRef.startsWith("REALESTATE_")) return true;
-  if (orderData && orderData.orderType === "real_estate") return true;
-  if (orderData && orderData.isRealEstate === true) return true;
-  return false;
+// Ref-prefix routing (this is the isolation mechanism)
+const isWalletRef       = (r) => typeof r === "string" && r.startsWith("WALLET_");
+const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
+const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
+const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY_");
+
+function isRealEstateOrder(apiRef, orderData) {
+  return isRealEstateRef(apiRef)
+      || orderData?.orderType === "real_estate"
+      || orderData?.isRealEstate === true;
 }
 
 // ============================
-// Subscription Helper Functions
+// Email templates
 // ============================
+const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
+  try {
+    console.log("📧 Order confirmation →", userEmail);
+    if (!BREVO_API_KEY) return false;
 
+    const itemsTotal = orderData.items?.reduce(
+      (s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0) || 0;
+    const deliveryTotal = orderData.sellerGroups?.reduce(
+      (s, g) => s + (g.deliveryCost || 0), 0) || 0;
+
+    const html = `
+<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f9fafb;padding:20px">
+  <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb">
+    <h2 style="margin:0 0 6px 0;color:#111827">Thank you for shopping with us</h2>
+    <p style="color:#6b7280;margin:0 0 16px 0">Order #${String(orderId).substring(0, 8)}</p>
+    <p><strong>Date:</strong> ${new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })}</p>
+    <p><strong>Buyer:</strong> ${orderData.shippingDetails?.fullName || userEmail}</p>
+    <ul>
+      ${(orderData.items || []).map(i =>
+        `<li>${i.name} × ${i.quantity} — Ksh ${((i.price || 0) * (i.quantity || 1)).toFixed(2)}</li>`
+      ).join("") || "<li>No items</li>"}
+    </ul>
+    <p><strong>Items Total:</strong> Ksh ${itemsTotal.toFixed(2)}</p>
+    <p><strong>Delivery:</strong> Ksh ${deliveryTotal.toFixed(2)}</p>
+    <p style="font-size:18px"><strong>Total Paid:</strong> Ksh ${(orderData.totalAmount || 0).toFixed(2)}</p>
+    <p style="color:#6b7280;font-size:12px;margin-top:24px">MarketMix Kenya © ${new Date().getFullYear()}</p>
+  </div>
+</body></html>`;
+
+    const ok = await sendEmail(
+      userEmail,
+      `Order Confirmation #${String(orderId).substring(0, 8)} - MarketMix Kenya`,
+      html,
+      "sales"
+    );
+    if (ok) {
+      await db.collection("orderEmails").add({
+        orderId, userEmail, type: "confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Order email failed:", e.message);
+    return false;
+  }
+};
+
+const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
+  try {
+    console.log("🏠 Real estate receipt →", userEmail);
+    if (!BREVO_API_KEY) return false;
+
+    const paidAt = new Date().toLocaleString("en-KE", {
+      timeZone: "Africa/Nairobi", dateStyle: "medium", timeStyle: "short",
+    });
+
+    const amount = Number(data.totalAmount || data.amount || 0);
+    const mpesaRef = data.mpesaReference || data.mpesaCode || "N/A";
+
+    const html = `
+<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f3f4f6;padding:20px">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb">
+    <div style="background:linear-gradient(135deg,#0f766e,#14b8a6);padding:28px 24px;color:#fff;text-align:center">
+      <h1 style="margin:0;font-size:22px">MarketMix Real Estates</h1>
+      <p style="margin:6px 0 0 0;font-size:14px;opacity:.9">Payment Confirmation Receipt</p>
+      <p style="display:inline-block;margin-top:12px;padding:6px 14px;border-radius:999px;background:rgba(255,255,255,.2);font-size:12px;font-weight:600">✅ PAYMENT CONFIRMED</p>
+    </div>
+    <div style="padding:24px">
+      <p>Hello ${data.buyerName || userEmail},</p>
+      <p>Your payment has been received and confirmed.</p>
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;padding:16px;text-align:center;margin:16px 0">
+        <p style="margin:0;font-size:12px;color:#047857;letter-spacing:1px">AMOUNT PAID</p>
+        <p style="margin:6px 0 0 0;font-size:26px;font-weight:700;color:#065f46">KES ${amount.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</p>
+      </div>
+      <table style="width:100%;font-size:13px;border-collapse:collapse">
+        <tr><td style="padding:6px 0;color:#6b7280">Property</td><td style="text-align:right;font-weight:600">${data.propertyTitle || "—"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">Location</td><td style="text-align:right;font-weight:600">${data.propertyLocation || "—"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">Type</td><td style="text-align:right;font-weight:600">${data.propertyType || "—"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">Reference</td><td style="text-align:right;font-weight:600">${orderId}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">M-Pesa Code</td><td style="text-align:right;font-weight:600">${mpesaRef}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">Paid On</td><td style="text-align:right;font-weight:600">${paidAt}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280">Landlord</td><td style="text-align:right;font-weight:600">${data.landlordName || "—"} (${data.landlordPhone || "—"})</td></tr>
+      </table>
+      <p style="margin-top:18px;text-align:center">
+        <a href="${REAL_ESTATE_RECEIPT_URL}/${orderId}" style="display:inline-block;background:#0f766e;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600">View Receipt Online</a>
+      </p>
+    </div>
+    <div style="background:#f9fafb;padding:16px;text-align:center;font-size:12px;color:#6b7280">
+      MarketMix Real Estates · MarketMix Kenya © ${new Date().getFullYear()}<br>
+      <a href="mailto:sales@marketmix.site" style="color:#0f766e">sales@marketmix.site</a>
+    </div>
+  </div>
+</body></html>`;
+
+    const ok = await sendEmail(
+      userEmail,
+      `Payment Confirmed - ${data.propertyTitle || "Property"} (${String(orderId).substring(0, 8)})`,
+      html,
+      "sales"
+    );
+    if (ok) {
+      await db.collection("realEstateEmails").add({
+        orderId, userEmail,
+        propertyTitle: data.propertyTitle || null,
+        amount, mpesaReference: mpesaRef,
+        type: "real_estate_confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Real estate email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
+// PIN recovery (seller withdrawals)
+// ============================
+const generateReplacementCode = () =>
+  Math.floor(100000 + Math.random() * 900000).toString();
+
+const storeReplacementCode = async (userId, email, code) => {
+  try {
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    await db.collection("pinRecoveryCodes").doc(userId).set({
+      code, email, userId, expiresAt,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      attempts: 0, maxAttempts: 3, used: false, status: "pending",
+    });
+    return true;
+  } catch (e) {
+    console.error("Failed to store code:", e);
+    return false;
+  }
+};
+
+const verifyReplacementCode = async (userId, code) => {
+  try {
+    const doc = await db.collection("pinRecoveryCodes").doc(userId).get();
+    if (!doc.exists) return { valid: false, message: "No recovery request found" };
+    const d = doc.data();
+    if (d.expiresAt.toDate() < new Date()) {
+      await db.collection("pinRecoveryCodes").doc(userId).delete();
+      return { valid: false, message: "Recovery code has expired" };
+    }
+    if (d.used) return { valid: false, message: "Code already used" };
+    if (d.attempts >= d.maxAttempts) return { valid: false, message: "Too many attempts" };
+    if (d.code !== code) {
+      await db.collection("pinRecoveryCodes").doc(userId).update({
+        attempts: admin.firestore.FieldValue.increment(1),
+      });
+      return { valid: false, message: `Invalid code. ${d.maxAttempts - (d.attempts + 1)} left` };
+    }
+    await db.collection("pinRecoveryCodes").doc(userId).update({
+      status: "verified",
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return { valid: true, data: d };
+  } catch (e) {
+    console.error("Verify code failed:", e);
+    return { valid: false, message: "Verification failed" };
+  }
+};
+
+const markCodeAsUsed = async (userId) => {
+  try {
+    await db.collection("pinRecoveryCodes").doc(userId).update({
+      used: true,
+      usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "completed",
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+// ============================
+// Subscription helpers
+// ============================
 const validateSubscriptionPayment = (data) => {
-  const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data;
+  const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data || {};
   if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
     return { valid: false, message: "Missing required fields" };
   }
   const amt = parsePositiveNumber(amount);
   if (!amt) return { valid: false, message: "Invalid amount" };
-  if (!isValidPhone(phoneNumber)) {
-    return { valid: false, message: "Invalid phone number format. Use 2547XXXXXXXX or 2541XXXXXXXX" };
-  }
+  if (!isValidPhone(phoneNumber)) return { valid: false, message: "Invalid phone" };
   if (!email.includes("@")) return { valid: false, message: "Invalid email" };
   return { valid: true, data: { ...data, amount: amt } };
 };
 
-const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
-  try {
-    const subscriptionRef = db.collection('subscriptions').doc(subscriptionData.orderId);
-    const subscriptionRecord = {
-      sellerId: subscriptionData.sellerId,
-      planId: subscriptionData.planId,
-      planName: subscriptionData.planName,
-      amount: subscriptionData.amount,
-      invoiceId: invoiceId,
-      status: 'pending',
-      paymentMethod: 'mpesa',
-      phoneNumber: subscriptionData.phoneNumber,
-      email: subscriptionData.email,
-      fullName: subscriptionData.fullName,
-      orderId: subscriptionData.orderId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: null,
-      paymentStatus: 'pending',
-      mpesaReference: null
-    };
-    await subscriptionRef.set(subscriptionRecord);
-    return subscriptionRef.id;
-  } catch (error) {
-    console.error('Failed to create subscription record:', error);
-    throw error;
-  }
+const createSubscriptionRecord = async (s, invoiceId) => {
+  const ref = db.collection("subscriptions").doc(s.orderId);
+  await ref.set({
+    sellerId: s.sellerId, planId: s.planId, planName: s.planName,
+    amount: s.amount, invoiceId, status: "pending",
+    paymentMethod: "mpesa", phoneNumber: s.phoneNumber,
+    email: s.email, fullName: s.fullName, orderId: s.orderId,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: null, paymentStatus: "pending", mpesaReference: null,
+  });
+  return ref.id;
 };
 
 const getSubscriptionPaymentStatus = async (invoiceId) => {
-  try {
-    const subscriptionSnapshot = await db.collection('subscriptions')
-      .where('invoiceId', '==', invoiceId).limit(1).get();
-    if (subscriptionSnapshot.empty) {
-      return { success: false, message: 'Subscription not found' };
-    }
-    const subscription = subscriptionSnapshot.docs[0].data();
-    return { 
-      success: true, 
-      data: {
-        paymentStatus: subscription.paymentStatus || 'pending',
-        mpesaReference: subscription.mpesaReference,
-        status: subscription.status
-      }
-    };
-  } catch (error) {
-    console.error('Failed to get subscription status:', error);
-    return { success: false, message: 'Failed to check payment status' };
-  }
+  const snap = await db.collection("subscriptions")
+    .where("invoiceId", "==", invoiceId).limit(1).get();
+  if (snap.empty) return { success: false, message: "Subscription not found" };
+  const s = snap.docs[0].data();
+  return { success: true, data: {
+    paymentStatus: s.paymentStatus || "pending",
+    mpesaReference: s.mpesaReference,
+    status: s.status,
+  }};
 };
 
-const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
-  try {
-    const { orderId, planId, sellerId, sellerEmail } = subscriptionData;
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 30);
-    
-    const subscriptionRef = db.collection('subscriptions').doc(orderId);
-    await subscriptionRef.update({
-      status: 'active', paymentStatus: 'paid',
-      mpesaReference: mpesaReference,
-      activatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: expiresAt,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-    
-    const sellerRef = db.collection('users').doc(sellerId);
-    await sellerRef.update({
-      subscriptionPlan: planId, subscriptionStatus: 'active',
-      subscriptionActive: true, subscriptionExpiresAt: expiresAt,
-      subscriptionStartedAt: admin.firestore.FieldValue.serverTimestamp(),
-      lastSubscriptionPayment: {
-        amount: subscriptionData.amount,
-        date: admin.firestore.FieldValue.serverTimestamp(),
-        reference: mpesaReference, orderId: orderId
-      },
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-    
-    await db.collection('subscriptionPayments').add({
-      sellerId, planId, amount: subscriptionData.amount,
-      mpesaReference, orderId, status: 'completed', sellerEmail,
-      paymentDate: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: expiresAt
-    });
-    
-    await db.collection('subscriptionLogs').add({
-      sellerId, action: 'subscription_activated', planId,
-      amount: subscriptionData.amount, orderId,
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-    
-    return true;
-  } catch (error) {
-    console.error('Failed to activate subscription:', error);
-    throw error;
-  }
+const activateSellerSubscription = async (s, mpesaReference) => {
+  const { orderId, planId, sellerId, sellerEmail } = s;
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 30);
+
+  await db.collection("subscriptions").doc(orderId).update({
+    status: "active", paymentStatus: "paid",
+    mpesaReference,
+    activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("users").doc(sellerId).update({
+    subscriptionPlan: planId,
+    subscriptionStatus: "active",
+    subscriptionActive: true,
+    subscriptionExpiresAt: expiresAt,
+    subscriptionStartedAt: admin.firestore.FieldValue.serverTimestamp(),
+    lastSubscriptionPayment: {
+      amount: s.amount,
+      date: admin.firestore.FieldValue.serverTimestamp(),
+      reference: mpesaReference,
+      orderId,
+    },
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("subscriptionPayments").add({
+    sellerId, planId, amount: s.amount, mpesaReference, orderId,
+    status: "completed", sellerEmail,
+    paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt,
+  });
+
+  await db.collection("subscriptionLogs").add({
+    sellerId, action: "subscription_activated", planId,
+    amount: s.amount, orderId,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return true;
 };
 
 // ============================
-// Routes
+// ROUTES
 // ============================
 
+// --- Proposal status email ---
 app.post("/api/send-proposal-status", async (req, res) => {
   try {
-    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body;
+    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body || {};
     if (!to || !proposalId || !status) {
-      return res.status(400).json({ success: false, message: 'Missing required fields: to, proposalId, status' });
+      return res.status(400).json({ success: false, message: "Missing required fields" });
     }
-    const emailData = {
-      to,
-      subject: subject || `Your Installment Proposal Has Been ${status === 'approved' ? 'Approved' : 'Rejected'} - MarketMix Kenya`,
-      html, proposalId, studentName, status, notes, amount, institution
-    };
-    const emailSent = await sendProposalStatusEmail(emailData);
-    if (emailSent) {
-      res.json({ success: true, message: 'Proposal status email sent successfully',
-        data: { to, proposalId, status, sentAt: new Date().toISOString(), sender: 'MarketMixKenya <sales@marketmix.site>' }
-      });
-    } else {
-      res.status(500).json({ success: false, message: 'Failed to send proposal status email' });
-    }
-  } catch (error) {
-    console.error('❌ Send proposal status email error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error while sending email' });
+    const emailHtml = html || `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+        <h2>Installment Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}</h2>
+        <p>Hello ${studentName || "Student"},</p>
+        <p>Proposal <strong>${proposalId}</strong> has been <strong>${status}</strong>.</p>
+        ${notes ? `<p><em>${notes}</em></p>` : ""}
+        <p>Amount: KSH ${Number(amount || 0).toLocaleString()}</p>
+        <p>Institution: ${institution || "N/A"}</p>
+      </div>`;
+    const ok = await sendEmail(to, subject || `Proposal ${status}`, emailHtml, "sales");
+    return res.json({ success: ok, message: ok ? "Sent" : "Failed" });
+  } catch (e) {
+    return sendServerError(res, e, "Proposal email failed");
   }
 });
 
+// --- STK push (store, wallet, real estate seed orders — all use this) ---
 app.post("/api/stk-push", async (req, res) => {
   try {
-    const { amount, phoneNumber, fullName, email, orderId } = req.body;
+    const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
     const amt = parsePositiveNumber(amount);
     if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone number format" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
     if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
     if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
     if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
@@ -869,349 +523,347 @@ app.post("/api/stk-push", async (req, res) => {
     let response;
     try {
       response = await intasend.collection().mpesaStkPush({
-        first_name: firstName, last_name: lastName, email,
-        phone_number: phoneNumber, amount: amt,
-        host: BACKEND_HOST, api_ref: orderId,
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        phone_number: phoneNumber,
+        amount: amt,
+        host: BACKEND_HOST,
+        api_ref: orderId,
       });
     } catch (intasendErr) {
-      console.error("❌ IntaSend STK Push failed:", intasendErr?.response || intasendErr);
+      console.error("❌ IntaSend STK failed:", intasendErr?.response || intasendErr);
       return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
-    await db.collection("orders").doc(orderId).set(
-      {
-        invoiceId: response?.invoice?.invoice_id || null,
-        status: "STK_PUSH_SENT",
-        totalAmount: amt,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    await db.collection("orders").doc(orderId).set({
+      invoiceId: response?.invoice?.invoice_id || null,
+      status: "STK_PUSH_SENT",
+      totalAmount: amt,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
     return res.json({ success: true, data: response });
-  } catch (error) {
-    return sendServerError(res, error, "STK Push failed");
+  } catch (e) {
+    return sendServerError(res, e, "STK push failed");
   }
 });
 
+// --- Store order seed (items + shipping so store receipt renders) ---
+app.post("/api/store/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, cart } = req.body || {};
+    if (!ref || !email) return res.status(400).json({ success: false, message: "ref and email required" });
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "store",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      shippingDetails: { fullName, phoneNumber, email, deliveryPlace: "TBD" },
+      items: Array.isArray(cart?.items) ? cart.items : [],
+      sellerGroups: Array.isArray(cart?.sellerGroups) ? cart.sellerGroups : [],
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, ref });
+  } catch (e) {
+    return sendServerError(res, e, "Store seed failed");
+  }
+});
+
+// --- REAL ESTATE SECTION (isolated) -------------------------------------
+
+// Seed a real-estate order before STK push. Ref must start with PROP_.
+app.post("/api/real-estate/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, paymentKind, property, landlord } = req.body || {};
+    if (!ref || !ref.startsWith("PROP_")) {
+      return res.status(400).json({ success: false, message: "ref must start with PROP_" });
+    }
+    if (!property?.id || !landlord?.phone || !email) {
+      return res.status(400).json({ success: false, message: "Missing property/landlord/email" });
+    }
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "real_estate",
+      isRealEstate: true,
+      paymentKind: paymentKind || "rent",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      buyerName: fullName || "Buyer",
+      shippingDetails: { fullName, phoneNumber, email },
+      propertyId: property.id,
+      propertyTitle: property.title,
+      propertyLocation: property.location,
+      propertyType: property.type,
+      landlordName: landlord.name,
+      landlordPhone: landlord.phone,
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, message: "Real estate order seeded", ref });
+  } catch (e) {
+    return sendServerError(res, e, "Real estate seed failed");
+  }
+});
+
+// --- Subscriptions ---
 app.post("/api/subscription-payment", async (req, res) => {
   try {
-    console.log("📦 Subscription payment request:", req.body);
-    const validation = validateSubscriptionPayment(req.body);
-    if (!validation.valid) {
-      return res.status(400).json({ success: false, message: validation.message });
-    }
-    const subscriptionData = validation.data;
-    const { amount, phoneNumber, fullName, email, orderId } = subscriptionData;
-    const [firstName, ...rest] = fullName.trim().split(" ");
+    const v = validateSubscriptionPayment(req.body);
+    if (!v.valid) return res.status(400).json({ success: false, message: v.message });
+    const s = v.data;
+    const [firstName, ...rest] = s.fullName.trim().split(" ");
     const lastName = rest.join(" ") || "N/A";
 
     let intasendResponse;
     try {
       intasendResponse = await intasend.collection().mpesaStkPush({
-        first_name: firstName, last_name: lastName, email,
-        phone_number: phoneNumber, amount: amount,
-        host: BACKEND_HOST, api_ref: orderId,
+        first_name: firstName, last_name: lastName,
+        email: s.email, phone_number: s.phoneNumber,
+        amount: s.amount, host: BACKEND_HOST, api_ref: s.orderId,
       });
-    } catch (intasendErr) {
-      console.error("❌ IntaSend Subscription STK Push failed:", intasendErr?.response || intasendErr);
+    } catch (e) {
       return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
-    const invoiceId = intasendResponse?.invoice?.invoice_id;
-    await createSubscriptionRecord(subscriptionData, invoiceId);
-
-    return res.json({ success: true, data: intasendResponse, message: "Subscription payment initiated successfully" });
-  } catch (error) {
-    console.error("❌ Subscription payment error:", error);
-    return sendServerError(res, error, "Subscription payment failed");
+    await createSubscriptionRecord(s, intasendResponse?.invoice?.invoice_id);
+    return res.json({ success: true, data: intasendResponse });
+  } catch (e) {
+    return sendServerError(res, e, "Subscription payment failed");
   }
 });
 
 app.get("/api/subscription-status/:invoiceId", async (req, res) => {
   try {
-    const { invoiceId } = req.params;
-    if (!invoiceId) {
-      return res.status(400).json({ success: false, message: "Missing invoice ID" });
-    }
-    const status = await getSubscriptionPaymentStatus(invoiceId);
-    if (!status.success) {
-      return res.status(404).json(status);
-    }
-    return res.json(status);
-  } catch (error) {
-    console.error("❌ Subscription status check error:", error);
-    return sendServerError(res, error, "Failed to check subscription status");
+    const r = await getSubscriptionPaymentStatus(req.params.invoiceId);
+    if (!r.success) return res.status(404).json(r);
+    return res.json(r);
+  } catch (e) {
+    return sendServerError(res, e, "Status check failed");
   }
 });
 
 app.post("/api/confirm-subscription", async (req, res) => {
   try {
-    const { orderId, mpesaReference, planId, sellerId, sellerEmail } = req.body;
-    console.log("✅ Confirming subscription:", { orderId, mpesaReference });
+    const { orderId, mpesaReference, planId, sellerId, sellerEmail } = req.body || {};
     if (!orderId || !mpesaReference || !planId || !sellerId || !sellerEmail) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
-    await activateSellerSubscription({
-      orderId, planId, sellerId, sellerEmail, amount: req.body.amount
-    }, mpesaReference);
-    return res.json({ success: true, message: "Subscription activated successfully",
-      data: { orderId, activated: true, timestamp: new Date().toISOString() }
-    });
-  } catch (error) {
-    console.error("❌ Confirm subscription error:", error);
-    return sendServerError(res, error, "Failed to confirm subscription");
+    await activateSellerSubscription({ orderId, planId, sellerId, sellerEmail, amount: req.body.amount }, mpesaReference);
+    return res.json({ success: true });
+  } catch (e) {
+    return sendServerError(res, e, "Confirm subscription failed");
   }
 });
 
-// ============================================================
-// IntaSend callback
-// ============================================================
+// --- IntaSend callback (shared by ALL flows, routes by ref prefix) ---
 app.post("/api/intasend-callback", async (req, res) => {
   try {
-    const { api_ref, state, mpesa_reference, invoice_id } = req.body;
+    const { api_ref, state, mpesa_reference } = req.body || {};
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
 
-    console.log(`📞 Callback received:`, {
-      api_ref, state, mpesa_reference, invoice_id,
-      value: req.body.value, timestamp: new Date().toISOString()
-    });
+    console.log("📞 Callback:", { api_ref, state, mpesa_reference, value: req.body.value });
 
     let paymentStatus = "pending";
     if (state === "COMPLETE") paymentStatus = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
 
-    const isSubscription = api_ref?.startsWith('SUB_');
-    const isWalletDeposit = api_ref?.startsWith('WALLET_');
-    
-    if (isSubscription) {
-      const subscriptionRef = db.collection('subscriptions').doc(api_ref);
-      const subscriptionSnap = await subscriptionRef.get();
-      if (subscriptionSnap.exists) {
-        await subscriptionRef.update({
-          paymentStatus: paymentStatus,
+    // -- Subscription branch --
+    if (isSubscriptionRef(api_ref)) {
+      const ref = db.collection("subscriptions").doc(api_ref);
+      const snap = await ref.get();
+      if (snap.exists) {
+        await ref.update({
+          paymentStatus,
           mpesaReference: mpesa_reference || null,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        console.log(`✅ Subscription ${api_ref} updated to: ${paymentStatus}`);
         if (state === "COMPLETE") {
-          const subscriptionData = subscriptionSnap.data();
+          const s = snap.data();
           try {
             await activateSellerSubscription({
-              orderId: api_ref, planId: subscriptionData.planId,
-              sellerId: subscriptionData.sellerId,
-              sellerEmail: subscriptionData.email,
-              amount: subscriptionData.amount
+              orderId: api_ref, planId: s.planId, sellerId: s.sellerId,
+              sellerEmail: s.email, amount: s.amount,
             }, mpesa_reference);
-            console.log(`✅ Subscription ${api_ref} activated`);
-          } catch (activationError) {
-            console.error('Failed to activate subscription:', activationError);
+          } catch (err) {
+            console.error("Activation error:", err);
           }
         }
       }
       return res.send("OK");
     }
-    
+
+    // -- Wallet / Store / Real estate: all live in `orders` keyed by api_ref --
     const orderRef = db.collection("orders").doc(api_ref);
     let orderSnap = await orderRef.get();
     const callbackAmount = parseFloat(req.body.value);
-    
-    if (!orderSnap.exists && isWalletDeposit) {
-      console.log(`📝 Auto-creating wallet order: ${api_ref}`);
-      const parts = api_ref.split('_');
-      const sellerId = parts[1];
-      let amount = 1;
-      if (callbackAmount && callbackAmount > 0 && callbackAmount <= 500000) {
-        amount = callbackAmount;
-        console.log(`✅ Using amount from callback: KSH ${amount}`);
-      } else {
-        console.log(`⚠️ Invalid callback amount: ${callbackAmount}, using default: ${amount}`);
-      }
+
+    // Wallet auto-create
+    if (!orderSnap.exists && isWalletRef(api_ref)) {
+      const sellerId = api_ref.split("_")[1];
+      const amount = (callbackAmount > 0 && callbackAmount <= 500000) ? callbackAmount : 1;
       await orderRef.set({
-        orderId: api_ref, paymentStatus: paymentStatus,
+        orderId: api_ref,
+        paymentStatus,
         mpesaReference: mpesa_reference || null,
-        totalAmount: amount, state: state,
+        totalAmount: amount,
+        state,
+        isWalletDeposit: true,
+        sellerId,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        isWalletDeposit: true, sellerId: sellerId
       });
       orderSnap = await orderRef.get();
-      console.log(`✅ Auto-created wallet order: ${api_ref} with amount ${amount}`);
     }
-    
+
     if (!orderSnap.exists) {
       console.error(`❌ Order not found: ${api_ref}`);
       return res.status(404).send("Order not found");
     }
 
     const orderData = orderSnap.data();
-    await orderRef.update({
-      paymentStatus: paymentStatus,
-      mpesaReference: mpesa_reference || null,
-      state: state,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-    console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
 
-    if (isWalletDeposit && state === "COMPLETE") {
-      console.log(`💰 Processing wallet deposit: ${api_ref}`);
-      const parts = api_ref.split('_');
-      const sellerId = parts[1];
+    await orderRef.update({
+      paymentStatus,
+      mpesaReference: mpesa_reference || null,
+      state,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`✅ Order ${api_ref} → ${paymentStatus}`);
+
+    // Wallet deposit: update wallet balance + ad transaction
+    if (isWalletRef(api_ref) && state === "COMPLETE") {
+      const sellerId = api_ref.split("_")[1];
       let amount = callbackAmount;
+      if (!amount || amount <= 0 || amount > 500000) amount = orderData.totalAmount;
       if (!amount || amount <= 0 || amount > 500000) {
-        amount = orderData.totalAmount;
-        console.log(`⚠️ Using amount from orderData: ${amount}`);
-      }
-      if (!amount || amount <= 0 || amount > 500000) {
-        console.error(`❌ Invalid amount: ${amount} - marking transaction as failed`);
-        await orderRef.update({ paymentStatus: 'failed', errorMessage: 'Invalid amount detected' });
+        await orderRef.update({ paymentStatus: "failed", errorMessage: "Invalid amount" });
         return res.send("OK");
       }
-      console.log(`✅ Processing deposit amount: KSH ${amount}`);
-      
-      const adTxRef = db.collection('adTransactions').doc(api_ref);
-      await adTxRef.set({
-        paymentRef: api_ref, sellerId: sellerId,
-        sellerEmail: orderData.sellerEmail || null,
-        sellerName: orderData.sellerName || null,
-        sellerPhone: orderData.sellerPhone || null,
-        type: 'deposit', amount: amount, status: 'completed',
-        paymentMethod: 'mpesa',
+
+      await db.collection("adTransactions").doc(api_ref).set({
+        paymentRef: api_ref, sellerId,
+        type: "deposit", amount, status: "completed",
+        paymentMethod: "mpesa",
         mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
         description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
-      console.log(`✅ AdTransaction created with amount: ${amount}`);
-      
-      const walletRef = db.collection('sellerAdCredits').doc(sellerId);
+
+      const walletRef = db.collection("sellerAdCredits").doc(sellerId);
       const walletSnap = await walletRef.get();
       if (walletSnap.exists) {
         await walletRef.update({
           balance: admin.firestore.FieldValue.increment(amount),
           totalDeposited: admin.firestore.FieldValue.increment(amount),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        console.log(`💰 Wallet updated for ${sellerId}: +KSH ${amount}`);
       } else {
         await walletRef.set({
-          sellerId: sellerId, balance: amount, totalDeposited: amount,
+          sellerId, balance: amount, totalDeposited: amount,
           totalSpent: 0, reservedBalance: 0,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        console.log(`💰 Wallet created for ${sellerId} with KSH ${amount}`);
       }
-      console.log(`✅ Successfully processed deposit: ${api_ref} for KSH ${amount}`);
+      console.log(`💰 Wallet ${sellerId} +KSH ${amount}`);
     }
 
-    if (state === "COMPLETE" && !isWalletDeposit) {
-      let userEmail = orderData.userEmail || orderData.shippingDetails?.email || orderData.buyerEmail;
+    // Email branch on COMPLETE for non-wallet orders
+    if (state === "COMPLETE" && !isWalletRef(api_ref)) {
+      let userEmail =
+        orderData.userEmail ||
+        orderData.shippingDetails?.email ||
+        orderData.buyerEmail ||
+        orderData.email;
+
       if (!userEmail && orderData.userId) {
         try {
-          const userDoc = await db.collection('users').doc(orderData.userId).get();
-          if (userDoc.exists) userEmail = userDoc.data().email;
-        } catch (err) {
-          console.error('Failed to fetch user email:', err);
-        }
+          const u = await db.collection("users").doc(orderData.userId).get();
+          if (u.exists) userEmail = u.data().email;
+        } catch (_) {}
       }
-      if (userEmail) {
-        const realEstate = isRealEstateRef(api_ref, orderData);
+      if (!userEmail && isTestRef(api_ref)) {
+        userEmail = orderData.testEmail || process.env.TEST_RECEIPT_EMAIL || null;
+      }
+
+      if (!userEmail) {
+        console.log(`⚠️ No email on order ${api_ref}, skipping receipt`);
+      } else {
+        const realEstate = isRealEstateOrder(api_ref, orderData);
+
         if (realEstate) {
-          const realEstatePayload = {
+          const payload = {
             ...orderData,
             totalAmount: orderData.totalAmount || callbackAmount || 0,
-            mpesaReference: mpesa_reference || orderData.mpesaReference || 'N/A',
-            propertyTitle: orderData.propertyTitle || orderData.propertyName,
-            propertyLocation: orderData.propertyLocation || orderData.location,
-            propertyType: orderData.propertyType || orderData.listingType,
+            mpesaReference: mpesa_reference || orderData.mpesaReference || "N/A",
+            propertyTitle: orderData.propertyTitle,
+            propertyLocation: orderData.propertyLocation,
+            propertyType: orderData.propertyType,
             buyerName: orderData.buyerName || orderData.shippingDetails?.fullName,
-            landlordName: orderData.landlordName || orderData.sellerName,
-            landlordPhone: orderData.landlordPhone || orderData.sellerPhone,
+            landlordName: orderData.landlordName,
+            landlordPhone: orderData.landlordPhone,
           };
-          sendRealEstatePaymentEmail(realEstatePayload, userEmail, api_ref)
-            .then(success => {
-              if (success) console.log(`🏠 Real estate receipt sent for ${api_ref}`);
-              else console.log(`❌ Failed to send real estate receipt for ${api_ref}`);
-            })
-            .catch(err => console.error('Real estate email error:', err));
+          sendRealEstatePaymentEmail(payload, userEmail, api_ref)
+            .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
+            .catch((e) => console.error("RE email error:", e));
         } else {
           sendOrderConfirmationEmail(orderData, userEmail, api_ref)
-            .then(success => {
-              if (success) console.log(`✅ Confirmation email sent for ${api_ref}`);
-              else console.log(`❌ Failed to send email for ${api_ref}`);
-            })
-            .catch(err => console.error('Email error:', err));
+            .then((ok) => console.log(ok ? `✅ Confirmation sent for ${api_ref}` : `❌ Confirmation failed for ${api_ref}`))
+            .catch((e) => console.error("Email error:", e));
         }
       }
     }
 
     return res.send("OK");
-    
-  } catch (error) {
-    console.error('❌ IntaSend callback error:', error);
+  } catch (e) {
+    console.error("❌ Callback error:", e);
     return res.status(500).send("Callback processing failed");
   }
 });
 
-// ✅ Transaction lookup (for orders by invoiceId)
-app.get("/api/transaction/:invoiceId", async (req, res) => {
-  try {
-    const invoiceId = req.params.invoiceId;
-    if (!invoiceId) {
-      return res.status(400).json({ success: false, message: "Missing invoiceId" });
-    }
-    const docs = await db.collection("orders").where("invoiceId", "==", invoiceId).get();
-    if (docs.empty) {
-      return res.status(404).json({ success: false, message: "Transaction not found" });
-    }
-    return res.json({ success: true, data: docs.docs[0].data() });
-  } catch (error) {
-    return sendServerError(res, error, "Transaction lookup failed");
-  }
-});
-
-// ✅ Ad Transaction lookup by paymentRef — orders-first, with auto-heal
+// --- Universal transaction lookup (used by all frontends for polling) ---
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
+  const paymentRef = req.params.paymentRef;
   try {
-    const paymentRef = req.params.paymentRef;
-    if (!paymentRef) {
-      return res.status(400).json({ success: false, message: "Missing paymentRef" });
-    }
+    if (!paymentRef) return res.status(400).json({ success: false, message: "Missing paymentRef" });
+    console.log(`🔍 Lookup: ${paymentRef}`);
 
-    console.log(`🔍 Looking up transaction: ${paymentRef}`);
-
-    // 1. Check orders collection directly by doc ID
-    const orderDoc = await db.collection('orders').doc(paymentRef).get();
+    // 1. Orders by doc ID (store, wallet, real estate, test)
+    const orderDoc = await db.collection("orders").doc(paymentRef).get();
     if (orderDoc.exists) {
       const orderData = orderDoc.data();
+      console.log(`✅ Order found: paymentStatus=${orderData.paymentStatus}, isWalletDeposit=${!!orderData.isWalletDeposit}, isRealEstate=${!!orderData.isRealEstate}`);
 
-      // Auto-heal: create missing adTransaction for paid wallet deposits
-      if (
-        orderData.paymentStatus === 'paid' &&
-        orderData.isWalletDeposit &&
-        orderData.sellerId
-      ) {
-        const adTxRef = db.collection('adTransactions').doc(paymentRef);
-        const adTxSnap = await adTxRef.get();
-        if (!adTxSnap.exists) {
+      // Auto-heal wallet adTransaction
+      if (orderData.paymentStatus === "paid" && orderData.isWalletDeposit && orderData.sellerId) {
+        const adRef = db.collection("adTransactions").doc(paymentRef);
+        const adSnap = await adRef.get();
+        if (!adSnap.exists) {
           const amount = orderData.totalAmount || 1;
-          await adTxRef.set({
-            paymentRef,
-            sellerId: orderData.sellerId,
+          await adRef.set({
+            paymentRef, sellerId: orderData.sellerId,
             sellerEmail: orderData.sellerEmail || null,
-            type: 'deposit',
-            amount,
-            status: 'completed',
-            paymentMethod: 'mpesa',
-            mpesaCode: orderData.mpesaReference || 'SYNCED',
+            type: "deposit", amount, status: "completed",
+            paymentMethod: "mpesa",
+            mpesaCode: orderData.mpesaReference || "SYNCED",
             description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
-            completedAt: admin.firestore.FieldValue.serverTimestamp()
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`🔄 Auto-healed missing adTransaction for ${paymentRef}`);
+          console.log(`🔄 Auto-healed adTransaction ${paymentRef}`);
         }
       }
 
@@ -1219,46 +871,53 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
         success: true,
         data: {
           ...orderData,
-          status: orderData.paymentStatus === 'paid' ? 'completed' : orderData.paymentStatus,
-          paymentStatus: orderData.paymentStatus
-        }
+          status: orderData.paymentStatus === "paid" ? "completed" : orderData.paymentStatus,
+          paymentStatus: orderData.paymentStatus,
+        },
       });
     }
 
-    // 2. Check adTransactions collection
-    const adTxDoc = await db.collection('adTransactions').doc(paymentRef).get();
+    // 2. adTransactions by doc ID
+    const adTxDoc = await db.collection("adTransactions").doc(paymentRef).get();
     if (adTxDoc.exists) {
-      const txData = adTxDoc.data();
-      console.log(`✅ Found adTransaction: status=${txData.status}, amount=${txData.amount}`);
-      return res.json({ success: true, data: txData });
+      const tx = adTxDoc.data();
+      console.log(`✅ adTransaction found: status=${tx.status}`);
+      return res.json({ success: true, data: tx });
     }
 
-    console.log(`❌ No transaction found for ${paymentRef}`);
+    console.log(`❌ Not found: ${paymentRef}`);
     return res.status(404).json({ success: false, message: "Transaction not found" });
-
   } catch (error) {
-    console.error("Transaction lookup failed:", error);
-    return res.status(500).json({ success: false, message: "Lookup failed" });
+    console.error(`❌ Lookup failed for ${paymentRef}:`, error?.message || error);
+    return res.status(500).json({ success: false, message: "Lookup failed", error: error?.message });
   }
 });
 
-// ✅ Seller Withdrawal
+// Alias for storefront (by invoiceId)
+app.get("/api/transaction/:invoiceId", async (req, res) => {
+  try {
+    const invoiceId = req.params.invoiceId;
+    if (!invoiceId) return res.status(400).json({ success: false, message: "Missing invoiceId" });
+    const docs = await db.collection("orders").where("invoiceId", "==", invoiceId).get();
+    if (docs.empty) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true, data: docs.docs[0].data() });
+  } catch (e) {
+    return sendServerError(res, e, "Transaction lookup failed");
+  }
+});
+
+// --- Seller withdrawal ---
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
-    const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
-    console.log("📤 Withdrawal Request:", req.body);
-
+    const { sellerId, amount: requestedAmount, phoneNumber } = req.body || {};
     if (!sellerId) return res.status(400).json({ success: false, message: "Missing sellerId" });
     const amount = parsePositiveNumber(requestedAmount);
     if (!amount) return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone number" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
 
     const minFeeCheck = calculateTotalFee(amount);
     if (amount <= minFeeCheck) {
-      return res.status(400).json({
-        success: false,
-        message: `Requested amount must be greater than the total fee of KSH ${minFeeCheck.toFixed(2)}.`,
-      });
+      return res.status(400).json({ success: false, message: `Amount must exceed fee KSH ${minFeeCheck.toFixed(2)}` });
     }
 
     const ordersSnap = await db.collection("orders")
@@ -1268,616 +927,352 @@ app.post("/api/seller/withdraw", async (req, res) => {
 
     let totalRevenue = 0;
     ordersSnap.forEach((doc) => {
-      const data = doc.data();
-      const items = data.items;
+      const items = doc.data().items;
       if (!items) return;
-      if (Array.isArray(items)) {
-        items.forEach((item) => {
-          if (item?.sellerId === sellerId) {
-            const price = Number(item.price) || 0;
-            const qty = Number(item.quantity) || 0;
-            totalRevenue += price * qty;
-          }
-        });
-      } else if (typeof items === "object") {
-        Object.values(items).forEach((item) => {
-          if (item?.sellerId === sellerId) {
-            const price = Number(item.price) || 0;
-            const qty = Number(item.quantity) || 0;
-            totalRevenue += price * qty;
-          }
-        });
-      }
+      const list = Array.isArray(items) ? items : Object.values(items);
+      list.forEach((item) => {
+        if (item?.sellerId === sellerId) {
+          totalRevenue += (Number(item.price) || 0) * (Number(item.quantity) || 0);
+        }
+      });
     });
 
-    let totalPreviouslyWithdrawn = 0;
-    const sellerLedgerRef = db.collection("sellerLedgers").doc(sellerId);
-    const ledgerSnap = await sellerLedgerRef.get();
-    if (ledgerSnap.exists) {
-      totalPreviouslyWithdrawn = ledgerSnap.data().totalWithdrawn || 0;
-    }
+    const ledgerRef = db.collection("sellerLedgers").doc(sellerId);
+    const ledgerSnap = await ledgerRef.get();
+    const withdrawn = ledgerSnap.exists ? (ledgerSnap.data().totalWithdrawn || 0) : 0;
+    const available = totalRevenue - withdrawn;
 
-    const netAvailableRevenue = totalRevenue - totalPreviouslyWithdrawn;
-    console.log(`💰 Seller ${sellerId} live total revenue: ${totalRevenue.toFixed(2)}`);
-    console.log(`💸 Total previously withdrawn: ${totalPreviouslyWithdrawn.toFixed(2)}`);
-    console.log(`✅ Net available balance: ${netAvailableRevenue.toFixed(2)}`);
-
-    if (netAvailableRevenue < amount) {
-      return res.status(400).json({ success: false, message: "Insufficient balance" });
-    }
+    if (available < amount) return res.status(400).json({ success: false, message: "Insufficient balance" });
 
     const feeAmount = calculateTotalFee(amount);
-    const netPayoutAmount = +(amount - feeAmount).toFixed(2);
-    if (netPayoutAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Net payout is KSH 0.00 or less after the KSH ${feeAmount.toFixed(2)} fee.`,
-      });
-    }
+    const netPayout = +(amount - feeAmount).toFixed(2);
+    if (netPayout <= 0) return res.status(400).json({ success: false, message: "Net payout is zero" });
 
-    const withdrawalDocRef = db.collection("withdrawals").doc();
-    await withdrawalDocRef.set({
-      sellerId, amount, feeAmount, netPayout: netPayoutAmount,
-      phoneNumber, status: "PENDING_PAYOUT",
+    const wRef = db.collection("withdrawals").doc();
+    await wRef.set({
+      sellerId, amount, feeAmount, netPayout, phoneNumber,
+      status: "PENDING_PAYOUT",
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    let payoutResponse;
+    let payout;
     try {
-      payoutResponse = await intasend.payouts().mpesa({
+      payout = await intasend.payouts().mpesa({
         currency: "KES", requires_approval: "NO",
         transactions: [{
           name: "Seller Withdrawal", account: phoneNumber,
-          amount: netPayoutAmount, narrative: "Seller Payout",
+          amount: netPayout, narrative: "Seller Payout",
         }],
       });
-    } catch (intasendErr) {
-      console.error("❌ IntaSend payout failed:", intasendErr?.response || intasendErr);
-      await withdrawalDocRef.update({
+    } catch (e) {
+      await wRef.update({
         status: "PAYOUT_FAILED",
-        intasendError: intasendErr?.response || intasendErr?.message || String(intasendErr),
+        intasendError: e?.response || e?.message || String(e),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.status(502).json({ success: false, message: "Payout provider error" });
     }
 
-    await withdrawalDocRef.update({
-      trackingId: payoutResponse?.tracking_id || null,
+    await wRef.update({
+      trackingId: payout?.tracking_id || null,
       status: "PAYOUT_INITIATED",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      intasendResponse: payoutResponse,
+      intasendResponse: payout,
     });
 
-    await db.collection("sellerLedgers").doc(sellerId).set(
-      {
-        totalWithdrawn: admin.firestore.FieldValue.increment(amount),
-        lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    await ledgerRef.set({
+      totalWithdrawn: admin.firestore.FieldValue.increment(amount),
+      lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
     return res.json({
       success: true, message: "Withdrawal initiated",
-      data: {
-        requestedAmount: amount, fee: feeAmount, netPayout: netPayoutAmount,
-        trackingId: payoutResponse?.tracking_id || null,
-        withdrawalId: withdrawalDocRef.id,
-      },
+      data: { requestedAmount: amount, fee: feeAmount, netPayout,
+              trackingId: payout?.tracking_id || null, withdrawalId: wRef.id },
     });
-  } catch (error) {
-    console.error("❌ Withdrawal Error:", error);
-    return sendServerError(res, error, "Withdrawal failed");
+  } catch (e) {
+    console.error("Withdrawal error:", e);
+    return sendServerError(res, e, "Withdrawal failed");
   }
 });
 
-// PIN Recovery Endpoints
+// --- PIN recovery ---
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
-    const { email, userId } = req.body;
-    if (!email || !userId) {
-      return res.status(400).json({ success: false, message: 'Email and user ID are required' });
-    }
-    const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    const userData = userDoc.data();
-    if (userData.email && userData.email !== email) {
-      return res.status(403).json({ success: false, message: 'Email does not match user account' });
-    }
-    if (!userData.withdrawalPin) {
-      return res.status(400).json({ success: false, message: 'No PIN is set for this account' });
+    const { email, userId } = req.body || {};
+    if (!email || !userId) return res.status(400).json({ success: false, message: "Email and userId required" });
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) return res.status(404).json({ success: false, message: "User not found" });
+
+    const u = userDoc.data();
+    if (u.email && u.email !== email) return res.status(403).json({ success: false, message: "Email mismatch" });
+    if (!u.withdrawalPin) return res.status(400).json({ success: false, message: "No PIN set" });
+
+    const code = generateReplacementCode();
+    if (!(await storeReplacementCode(userId, email, code))) {
+      return res.status(500).json({ success: false, message: "Failed to generate code" });
     }
 
-    const replacementCode = generateReplacementCode();
-    const codeStored = await storeReplacementCode(userId, email, replacementCode);
-    if (!codeStored) {
-      return res.status(500).json({ success: false, message: 'Failed to generate recovery code' });
-    }
-
-    await db.collection('securityLogs').add({
-      userId: userId, email: email,
-      action: 'PIN_RECOVERY_REQUESTED', codeGenerated: true,
+    await db.collection("securityLogs").add({
+      userId, email, action: "PIN_RECOVERY_REQUESTED",
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      ipAddress: req.ip, userAgent: req.get('User-Agent')
+      ipAddress: req.ip, userAgent: req.get("User-Agent"),
     });
 
-    const emailHtml = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background: #f8f9fa; }
-          .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-          .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center; color: white; }
-          .logo { font-size: 32px; font-weight: bold; margin-bottom: 10px; }
-          .content { padding: 40px 30px; }
-          .code-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; font-size: 32px; font-weight: bold; padding: 25px; border-radius: 12px; text-align: center; letter-spacing: 8px; margin: 30px 0; box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
-          .security-note { background: #fff3e0; border-left: 5px solid #ff9800; padding: 20px; border-radius: 8px; margin: 25px 0; }
-          .footer { background: #f8f9fa; padding: 25px 30px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 14px; }
-          .info-box { background: #e8f4fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 5px solid #2196f3; }
-          .timer { background: #f8f9fa; padding: 10px 15px; border-radius: 6px; text-align: center; margin: 20px 0; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <div class="logo">MarketMix Kenya</div>
-            <h2 style="margin: 10px 0 0 0; font-weight: 300;">Withdrawal PIN Recovery</h2>
-          </div>
-          <div class="content">
-            <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Hello Seller,</h3>
-            <p style="color: #666; text-align: center; margin-bottom: 20px;">You requested to reset your withdrawal PIN. Use the code below to verify your identity.</p>
-            <div class="code-box">${replacementCode}</div>
-            <div class="timer">
-              <p style="margin: 0; color: #666;"><strong>This code expires in 15 minutes</strong></p>
-            </div>
-            <div class="security-note">
-              <h4 style="margin-top: 0; color: #856404;">SECURITY ALERT</h4>
-              <ul style="margin-bottom: 0; color: #856404;">
-                <li>This code is for PIN reset verification only</li>
-                <li>Never share it with anyone</li>
-                <li>MarketMix staff will never ask for this code</li>
-                <li>If you didn't request this, contact support immediately</li>
-              </ul>
-            </div>
-            <div class="info-box">
-              <h4 style="margin-top: 0; color: #0c5460;">Request Details</h4>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Time:</strong> ${new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Email:</strong> ${email}</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Account ID:</strong> ${userId.slice(0, 8)}...</p>
-              <p style="margin: 5px 0; color: #0c5460;"><strong>Valid Attempts:</strong> 3 attempts remaining</p>
-            </div>
-            <p style="text-align: center; color: #666; margin-top: 30px;">Enter this code in the PIN recovery page to reset your withdrawal PIN.</p>
-          </div>
-          <div class="footer">
-            <p style="margin: 0 0 10px 0;"><strong>MarketMix Kenya</strong></p>
-            <p style="margin: 0 0 10px 0; font-size: 12px;">This email was sent from <strong>security@marketmix.site</strong></p>
-            <p style="margin: 0; font-size: 12px;">If you didn't request this, please secure your account immediately.</p>
-            <p style="margin: 15px 0 0 0; font-size: 12px;">
-              <a href="https://marketmix.site" style="color: #667eea; text-decoration: none;">Visit Marketplace</a> | 
-              <a href="https://marketmix.site/seller/dashboard" style="color: #667eea; text-decoration: none;">Seller Dashboard</a> | 
-              <a href="mailto:sales@marketmix.site" style="color: #667eea; text-decoration: none;">Contact Support</a>
-            </p>
-          </div>
-        </div>
-      </body>
-      </html>
-    `;
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+        <h2>Withdrawal PIN Recovery</h2>
+        <p>You requested a PIN reset. Use this code:</p>
+        <div style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;padding:20px;background:#667eea;color:#fff;border-radius:12px">${code}</div>
+        <p><strong>This code expires in 15 minutes.</strong></p>
+        <p style="color:#856404">If you didn't request this, ignore this email.</p>
+      </div>`;
 
-    const emailSent = await sendEmail(email, 'Your PIN Reset Code - MarketMix Kenya', emailHtml, 'security');
-    if (!emailSent) {
-      return res.json({
-        success: false,
-        message: 'Failed to send PIN recovery code. Please try again or contact support.',
-        emailSent: false
-      });
-    }
-    res.json({
-      success: true, message: 'PIN recovery code sent to your email',
-      emailSent: true,
-      note: 'Check your inbox and spam folder. The code expires in 15 minutes.'
-    });
-  } catch (error) {
-    console.error('❌ PIN recovery error:', error);
-    res.status(500).json({ success: false, message: 'Failed to process PIN recovery request' });
+    const ok = await sendEmail(email, "Your PIN Reset Code - MarketMix Kenya", html, "security");
+    if (!ok) return res.json({ success: false, message: "Failed to send recovery code", emailSent: false });
+
+    return res.json({ success: true, message: "Code sent", emailSent: true });
+  } catch (e) {
+    console.error("PIN recovery error:", e);
+    return res.status(500).json({ success: false, message: "PIN recovery failed" });
   }
 });
 
 app.post("/api/seller/verify-recovery-code", async (req, res) => {
   try {
-    const { userId, code } = req.body;
-    if (!userId || !code) {
-      return res.status(400).json({ success: false, message: 'User ID and code are required' });
-    }
-    const verification = await verifyReplacementCode(userId, code);
-    if (!verification.valid) {
-      return res.status(400).json({ success: false, message: verification.message });
-    }
-    await db.collection('securityLogs').add({
-      userId: userId, email: verification.data.email,
-      action: 'PIN_RECOVERY_VERIFIED',
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      ipAddress: req.ip
+    const { userId, code } = req.body || {};
+    if (!userId || !code) return res.status(400).json({ success: false, message: "userId and code required" });
+
+    const v = await verifyReplacementCode(userId, code);
+    if (!v.valid) return res.status(400).json({ success: false, message: v.message });
+
+    await db.collection("securityLogs").add({
+      userId, email: v.data.email, action: "PIN_RECOVERY_VERIFIED",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), ipAddress: req.ip,
     });
-    res.json({ success: true, message: 'Code verified successfully', verified: true });
-  } catch (error) {
-    console.error('❌ Code verification error:', error);
-    res.status(500).json({ success: false, message: 'Failed to verify recovery code' });
+    return res.json({ success: true, verified: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "Verification failed" });
   }
 });
 
 app.post("/api/seller/reset-pin", async (req, res) => {
   try {
-    const { userId, code, newPin, confirmPin } = req.body;
-    if (!userId || !code || !newPin || !confirmPin) {
-      return res.status(400).json({ success: false, message: 'All fields are required' });
-    }
-    if (newPin !== confirmPin) {
-      return res.status(400).json({ success: false, message: 'PINs do not match' });
-    }
-    if (newPin.length < 4 || !/^\d+$/.test(newPin)) {
-      return res.status(400).json({ success: false, message: 'PIN must be at least 4 digits and contain only numbers' });
-    }
-    const verification = await verifyReplacementCode(userId, code);
-    if (!verification.valid) {
-      return res.status(400).json({ success: false, message: verification.message });
-    }
-    const userRef = db.collection('users').doc(userId);
-    await userRef.update({
+    const { userId, code, newPin, confirmPin } = req.body || {};
+    if (!userId || !code || !newPin || !confirmPin) return res.status(400).json({ success: false, message: "All fields required" });
+    if (newPin !== confirmPin) return res.status(400).json({ success: false, message: "PINs do not match" });
+    if (newPin.length < 4 || !/^\d+$/.test(newPin)) return res.status(400).json({ success: false, message: "PIN must be 4+ digits" });
+
+    const v = await verifyReplacementCode(userId, code);
+    if (!v.valid) return res.status(400).json({ success: false, message: v.message });
+
+    await db.collection("users").doc(userId).update({
       withdrawalPin: newPin,
       pinSetAt: admin.firestore.FieldValue.serverTimestamp(),
-      pinSetMethod: 'recovery',
-      pinLastChanged: admin.firestore.FieldValue.serverTimestamp()
+      pinSetMethod: "recovery",
+      pinLastChanged: admin.firestore.FieldValue.serverTimestamp(),
     });
+
     await markCodeAsUsed(userId);
-    await db.collection('securityLogs').add({
-      userId: userId, email: verification.data.email,
-      action: 'PIN_RESET_SUCCESS', method: 'recovery',
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      ipAddress: req.ip
+    await db.collection("securityLogs").add({
+      userId, email: v.data.email, action: "PIN_RESET_SUCCESS",
+      method: "recovery",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), ipAddress: req.ip,
     });
-    res.json({ success: true, message: 'PIN reset successfully', reset: true });
-  } catch (error) {
-    console.error('❌ PIN reset error:', error);
-    res.status(500).json({ success: false, message: 'Failed to reset PIN' });
+    return res.json({ success: true, reset: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "Reset failed" });
   }
 });
 
-// Stock update
+// --- Stock update ---
 app.post("/api/update-stock", async (req, res) => {
   try {
-    const { productId, quantity } = req.body;
+    const { productId, quantity } = req.body || {};
     if (!productId || typeof quantity !== "number" || quantity <= 0) {
       return res.status(400).json({ success: false, message: "Invalid product or quantity" });
     }
-    const productRef = db.collection("products").doc(productId);
+    const pRef = db.collection("products").doc(productId);
     await db.runTransaction(async (t) => {
-      const doc = await t.get(productRef);
+      const doc = await t.get(pRef);
       if (!doc.exists) throw new Error("Product not found");
-      const currentQuantity = doc.data().quantity || 0;
-      if (currentQuantity < quantity) throw new Error("Not enough stock");
-      t.update(productRef, { quantity: currentQuantity - quantity });
+      const q = doc.data().quantity || 0;
+      if (q < quantity) throw new Error("Not enough stock");
+      t.update(pRef, { quantity: q - quantity });
     });
-    return res.json({ success: true, message: "Stock updated successfully" });
-  } catch (error) {
-    console.error("❌ Stock update failed:", error);
-    return sendServerError(res, error, "Stock update failed");
+    return res.json({ success: true, message: "Stock updated" });
+  } catch (e) {
+    return sendServerError(res, e, "Stock update failed");
   }
 });
 
-// Hugging Face image generation
+// --- Hugging Face image gen ---
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
-    if (!prompt || typeof prompt !== "string" || prompt.trim().length < 3) {
+    if (!prompt || prompt.trim().length < 3) {
       return res.status(400).json({ success: false, message: "Invalid prompt" });
     }
     if (!process.env.HF_API_KEY) {
-      console.error("Missing HF_API_KEY in environment");
-      return res.status(500).json({ success: false, message: "Server misconfiguration: HF_API_KEY is missing." });
+      return res.status(500).json({ success: false, message: "HF_API_KEY missing" });
     }
-    const hfResponse = await fetch(
+    const r = await fetch(
       "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
       {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${process.env.HF_API_KEY}`,
+          Authorization: `Bearer ${process.env.HF_API_KEY}`,
           "Content-Type": "application/json",
-          "Accept": "image/png"
+          Accept: "image/png",
         },
-        body: JSON.stringify({ inputs: prompt, options: { wait_for_model: true } })
+        body: JSON.stringify({ inputs: prompt, options: { wait_for_model: true } }),
       }
     );
-    if (!hfResponse.ok) {
-      const status = hfResponse.status;
-      let bodyText = "Hugging Face call failed.";
-      try { bodyText = await hfResponse.text(); } catch (e) { }
-      console.error(`Hugging Face error ${status}:`, bodyText.slice(0, 300));
-      return res.status(502).json({
-        success: false,
-        message: "Image generation provider error. Check key/limits.",
-        providerStatus: status,
-        providerBody: bodyText.slice(0, 200)
-      });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return res.status(502).json({ success: false, message: "HF provider error", providerStatus: r.status, providerBody: t.slice(0, 200) });
     }
-    const contentType = hfResponse.headers.get("content-type") || "image/png";
-    const arrBuf = await hfResponse.arrayBuffer();
-    const imageBuffer = Buffer.from(arrBuf);
-    const base64Image = imageBuffer.toString('base64');
-    const imageUrl = `data:${contentType};base64,${base64Image}`;
-    return res.json({ imageUrl: imageUrl, success: true });
-  } catch (err) {
-    console.error("❌ AI generation error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "AI generation failed due to a server-side error.",
-      detail: err.message
-    });
+    const ct = r.headers.get("content-type") || "image/png";
+    const buf = Buffer.from(await r.arrayBuffer());
+    return res.json({ success: true, imageUrl: `data:${ct};base64,${buf.toString("base64")}` });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "AI generation failed", detail: e.message });
   }
 });
 
-// Debug & Test Endpoints
+// --- Test endpoints ---
 app.get("/api/test-email-auth", async (req, res) => {
-  try {
-    if (!BREVO_API_KEY) {
-      return res.json({
-        success: false,
-        message: "BREVO_API_KEY not configured",
-        help: "Add BREVO_API_KEY to environment variables",
-        authentication: {
-          security: "MarketMixKenya <security@marketmix.site>",
-          sales: "MarketMixKenya <sales@marketmix.site>",
-          dkim: "Configured via Brevo",
-          dmarc: "marketmix.site (configured)",
-          spf: "Brevo servers included"
-        }
-      });
-    }
-    res.json({
-      success: true, message: "✅ Email authentication configured",
-      senders: {
-        security: { name: "MarketMixKenya", email: "security@marketmix.site", purpose: "PIN recovery, security notifications", status: "Verified" },
-        sales: { name: "MarketMixKenya", email: "sales@marketmix.site", purpose: "Order confirmations, customer support, proposal status", status: "Verified" }
-      },
-      authentication: {
-        dkim: "Signature configured",
-        dmarc: "policy=quarantine; rua=mailto:dmarc-reports@marketmix.site",
-        spf: "v=spf1 include:spf.brevo.com ~all",
-        shared_ip: "Brevo shared IP pool"
-      }
-    });
-  } catch (error) {
-    console.error('❌ Email auth test error:', error);
-    res.status(500).json({ success: false, message: 'Email authentication test failed', error: error.message });
-  }
+  res.json({
+    success: !!BREVO_API_KEY,
+    message: BREVO_API_KEY ? "Email authentication configured" : "BREVO_API_KEY not configured",
+    senders: {
+      security: "MarketMixKenya <security@marketmix.site>",
+      sales: "MarketMixKenya <sales@marketmix.site>",
+    },
+  });
 });
 
 app.post("/api/test-proposal-email", async (req, res) => {
-  try {
-    const testEmail = req.body.email || 'test@example.com';
-    const testData = {
-      to: testEmail, proposalId: 'TEST_' + Date.now(),
-      studentName: 'Test Student', status: 'approved',
-      notes: 'This is a test email from the MarketMix proposal status system.',
-      amount: 15000, institution: 'University of Nairobi'
-    };
-    console.log(`📧 Sending test proposal email to: ${testEmail}`);
-    const emailSent = await sendProposalStatusEmail(testData);
-    if (emailSent) {
-      res.json({ success: true, message: 'Test proposal status email sent successfully',
-        data: { to: testEmail, sentAt: new Date().toISOString(), sender: 'MarketMixKenya <sales@marketmix.site>' }
-      });
-    } else {
-      res.status(500).json({ success: false, message: 'Failed to send test email' });
-    }
-  } catch (error) {
-    console.error('❌ Test proposal email error:', error);
-    res.status(500).json({ success: false, message: 'Test email failed', error: error.message });
-  }
+  const testEmail = req.body?.email || "test@example.com";
+  const html = `<p>Test proposal email</p>`;
+  const ok = await sendEmail(testEmail, "Test Proposal Email", html, "sales");
+  res.json({ success: ok, to: testEmail });
 });
 
 app.post("/api/test-real-estate-email", async (req, res) => {
-  try {
-    const testEmail = req.body.email || 'test@example.com';
-    const testRef = 'PROP_TEST_' + Date.now();
-    const testData = {
-      propertyTitle: 'Spacious Bedsitter - Kilimani',
-      propertyLocation: 'Kilimani, Nairobi',
-      propertyType: 'For Rent',
-      totalAmount: 4000,
-      mpesaReference: 'TEST' + Math.floor(Math.random() * 1000000),
-      buyerName: 'Test Buyer',
-      landlordName: 'Test Landlord',
-      landlordPhone: '254712345678'
-    };
-    const sent = await sendRealEstatePaymentEmail(testData, testEmail, testRef);
-    if (sent) {
-      res.json({ success: true, message: 'Test real estate email sent', to: testEmail });
-    } else {
-      res.status(500).json({ success: false, message: 'Failed to send test real estate email' });
-    }
-  } catch (error) {
-    console.error('❌ Test real estate email error:', error);
-    res.status(500).json({ success: false, message: 'Test failed', error: error.message });
-  }
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "PROP_TEST_" + Date.now();
+  const ok = await sendRealEstatePaymentEmail({
+    propertyTitle: "Spacious Bedsitter - Kilimani",
+    propertyLocation: "Kilimani, Nairobi",
+    propertyType: "For Rent",
+    totalAmount: 4000,
+    mpesaReference: "TESTREF" + Math.floor(Math.random() * 1e6),
+    buyerName: "Test Buyer",
+    landlordName: "Test Landlord",
+    landlordPhone: "254712345678",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
 });
 
-// Health check
+// --- Health ---
 app.get("/_health", (req, res) => {
-  const health = {
+  res.json({
     ok: true,
     timestamp: Date.now(),
     services: {
       firebase: true,
       brevo: !!BREVO_API_KEY,
       intasend: true,
-      email_auth: {
-        security: 'MarketMixKenya <security@marketmix.site>',
-        sales: 'MarketMixKenya <sales@marketmix.site>',
-        proposal_status: '✅ Ready',
-        real_estate: '✅ Ready'
-      }
+      realEstate: "ready",
     },
-    endpoints: {
-      proposal_status: '/api/send-proposal-status',
-      stk_push: '/api/stk-push',
-      subscription_payment: '/api/subscription-payment',
-      seller_withdrawal: '/api/seller/withdraw',
-      pin_recovery: '/api/seller/recover-pin',
-      order_confirmation: 'Automatic on payment',
-      real_estate_confirmation: 'Automatic on payment',
-      ad_transaction: '/api/ad-transaction/:paymentRef'
-    },
-    uptime: process.uptime()
-  };
-  res.json(health);
+    endpoints: [
+      "/api/stk-push",
+      "/api/store/seed",
+      "/api/real-estate/seed",
+      "/api/subscription-payment",
+      "/api/seller/withdraw",
+      "/api/seller/recover-pin",
+      "/api/ad-transaction/:paymentRef",
+      "/_health",
+    ],
+    uptime: process.uptime(),
+  });
 });
 
-// 404 fallback
+// 404
 app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
 
-// Global error handlers
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
-});
+// Errors
+process.on("uncaughtException", (err) => console.error("Uncaught:", err));
+process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 
-// ============================================================
-// SMART KEEP-ALIVE with overnight pause (11pm - 5am EAT)
-// ============================================================
-(function setupSmartKeepAlive() {
-  const explicitDisable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
-  const explicitEnable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
+// ============================
+// Keep-alive (11pm–5am EAT pause)
+// ============================
+(function keepAlive() {
+  const disable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
+  const enable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
   const isProd = process.env.NODE_ENV === "production";
-  const enabled = explicitEnable || (isProd && !explicitDisable);
-
-  if (!enabled) {
-    console.log("🛑 Keep-alive disabled by environment");
+  if (!(enable || (isProd && !disable))) {
+    console.log("🛑 Keep-alive disabled");
     return;
   }
 
-  const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
-  const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
-  const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
-  const PAUSE_START_HOUR = 23;
-  const PAUSE_END_HOUR = 5;
+  const INTERVAL = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
+  const JITTER = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
+  const TIMEOUT = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
+  let timer = null;
+  let paused = false;
 
-  let keepAliveTimeout = null;
-  let isPaused = false;
-
-  const isOvernightPause = () => {
-    const now = new Date();
-    const eatHour = (now.getUTCHours() + 3) % 24;
-    if (PAUSE_START_HOUR <= PAUSE_END_HOUR) {
-      return eatHour >= PAUSE_START_HOUR || eatHour < PAUSE_END_HOUR;
-    } else {
-      return eatHour >= PAUSE_START_HOUR && eatHour < PAUSE_END_HOUR;
-    }
+  const inPause = () => {
+    const h = (new Date().getUTCHours() + 3) % 24;
+    return h >= 23 || h < 5;
   };
 
-  const scheduleNext = () => {
-    if (keepAliveTimeout) {
-      clearTimeout(keepAliveTimeout);
-      keepAliveTimeout = null;
-    }
-    const isPauseTime = isOvernightPause();
-    if (isPauseTime) {
-      if (!isPaused) {
-        isPaused = true;
-        const now = new Date();
-        const eatHour = (now.getUTCHours() + 3) % 24;
-        console.log(`🌙 Entering overnight pause mode (${eatHour}:00 EAT) - No pings until 5 AM`);
-      }
-      keepAliveTimeout = setTimeout(scheduleNext, 5 * 60 * 1000);
-      if (keepAliveTimeout.unref) keepAliveTimeout.unref();
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    if (inPause()) {
+      if (!paused) { paused = true; console.log("🌙 Keep-alive paused until 5am EAT"); }
+      timer = setTimeout(schedule, 5 * 60 * 1000);
+      timer.unref?.();
       return;
     }
-    if (isPaused) {
-      isPaused = false;
-      console.log(`☀️ Exiting overnight pause mode - Resuming keep-alive pings`);
-    }
-    const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS;
-    const delay = Math.max(1000, BASE_INTERVAL_MS + jitter);
-    keepAliveTimeout = setTimeout(() => {
-      if (!isOvernightPause()) {
-        try {
-          const options = {
-            host: "127.0.0.1", port: PORT, path: "/_health",
-            method: "GET", timeout: REQUEST_TIMEOUT_MS,
-          };
-          const req = http.request(options, (res) => {
-            res.on("data", () => {});
-            res.on("end", () => {});
-          });
-          req.on("timeout", () => { try { req.destroy(); } catch (e) {} });
-          req.on("error", () => {});
-          req.end();
-        } catch (err) {
-          // Silent fail
-        }
+    if (paused) { paused = false; console.log("☀️ Keep-alive resumed"); }
+    const j = Math.floor(Math.random() * (JITTER * 2 + 1)) - JITTER;
+    timer = setTimeout(() => {
+      if (!inPause()) {
+        const req = http.request({ host: "127.0.0.1", port: PORT, path: "/_health", method: "GET", timeout: TIMEOUT });
+        req.on("timeout", () => req.destroy());
+        req.on("error", () => {});
+        req.end();
       }
-      scheduleNext();
-    }, delay);
-    if (keepAliveTimeout.unref) keepAliveTimeout.unref();
+      schedule();
+    }, Math.max(1000, INTERVAL + j));
+    timer.unref?.();
   };
 
-  scheduleNext();
-  console.log(`🌀 Smart keep-alive initialized with overnight pause (${PAUSE_START_HOUR}:00 - ${PAUSE_END_HOUR}:00 EAT)`);
-  console.log(`   Ping interval: ~${BASE_INTERVAL_MS / 1000}s ±${JITTER_MS / 1000}s`);
-  console.log(`   Overnight pause: 11 PM - 5 AM (East African Time)`);
-
-  const cleanup = () => {
-    if (keepAliveTimeout) {
-      clearTimeout(keepAliveTimeout);
-      keepAliveTimeout = null;
-    }
-  };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  schedule();
+  console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
-// Start server
+// ============================
+// Start
+// ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not configured'}`);
-  console.log(`📧 Security Sender: MarketMixKenya <security@marketmix.site>`);
-  console.log(`📧 Sales Sender: MarketMixKenya <sales@marketmix.site>`);
-  console.log(`📧 Proposal Status Emails: ✅ Enabled`);
-  console.log(`🏠 Real Estate Receipts: ✅ Enabled`);
-  console.log(`📧 Authentication: DKIM, DMARC, SPF configured`);
-  console.log(`🌐 CORS enabled for: ${allowedOrigins.join(', ')}`);
-  console.log(`🖼️ Logo Image: https://i.ibb.co/JjSrxbPz/icon-png-1.png`);
-  console.log(`💰 Subscription System: ✅ Ready`);
-  console.log(`📋 Proposal Management: ✅ Email notifications enabled`);
-  console.log(`📊 Available Endpoints:`);
-  console.log(`   POST /api/send-proposal-status - Send proposal approval/rejection emails`);
-  console.log(`   POST /api/stk-push - M-Pesa STK Push`);
-  console.log(`   POST /api/subscription-payment - Subscription payments`);
-  console.log(`   POST /api/seller/withdraw - Seller withdrawals`);
-  console.log(`   POST /api/seller/recover-pin - PIN recovery`);
-  console.log(`   GET /api/ad-transaction/:paymentRef - Check wallet deposit status`);
-  console.log(`   GET /_health - Health check`);
-  console.log(`🌀 Smart keep-alive: Active (pauses 11 PM - 5 AM EAT)`);
+  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
+  console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
+  console.log(`🏠 Real estate: enabled (PROP_ prefix)`);
+  console.log(`💰 Subscriptions: enabled (SUB_ prefix)`);
+  console.log(`🪙 Wallet: enabled (WALLET_ prefix)`);
 });
 
-// Graceful shutdown
-const shutdown = async () => {
-  console.log("Shutting down server...");
-  try {
-    server.close(() => {
-      console.log("Server closed");
-      process.exit(0);
-    });
-    setTimeout(() => process.exit(1), 5000).unref();
-  } catch (e) {
-    console.error("Error during shutdown:", e);
-    process.exit(1);
-  }
+const shutdown = () => {
+  console.log("Shutting down…");
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
