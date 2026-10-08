@@ -4,6 +4,7 @@
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
 // Uses only existing env vars.
 // Emails can optionally mirror to WhatsApp by passing a phone number.
+// Dual Firebase Admin: shop (default) owns all data; realestate (named) only verifies tokens.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -69,6 +70,7 @@ const requiredEnv = [
   "INTASEND_PUBLISHABLE_KEY",
   "INTASEND_SECRET_KEY",
   "FIREBASE_SERVICE_ACCOUNT_KEY",
+  "FIREBASE_REALESTATE_KEY",
 ];
 const missing = requiredEnv.filter((k) => !process.env[k]);
 if (missing.length) {
@@ -77,17 +79,42 @@ if (missing.length) {
 }
 
 // ============================
-// Firebase
+// Firebase — two Admin apps
+// - shop app (default)     → all Firestore reads/writes still go here
+// - realestate app (named) → only used to verify tokens from the real-estate frontend
 // ============================
+let shopApp;
+let reApp;
+let db;
+
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-  console.log("✅ Firebase Admin initialized");
+  const shopSA = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+  shopApp = admin.initializeApp({ credential: admin.credential.cert(shopSA) });
+  console.log("✅ Firebase Admin (shop) initialized");
+
+  const reSA = JSON.parse(process.env.FIREBASE_REALESTATE_KEY);
+  reApp = admin.initializeApp(
+    { credential: admin.credential.cert(reSA) },
+    "realestate"
+  );
+  console.log("✅ Firebase Admin (realestate) initialized");
 } catch (e) {
   console.error("❌ Firebase Admin init failed:", e);
   process.exit(1);
 }
-const db = admin.firestore();
+
+db = shopApp.firestore(); // every existing route keeps using this
+
+// Try both projects' verifiers so a token from either frontend works.
+async function verifyAnyToken(idToken) {
+  try {
+    return await shopApp.auth().verifyIdToken(idToken);
+  } catch (_) {}
+  try {
+    return await reApp.auth().verifyIdToken(idToken);
+  } catch (_) {}
+  throw new Error("Invalid auth token");
+}
 
 // ============================
 // IntaSend
@@ -1253,7 +1280,7 @@ app.post("/api/driver/decision", async (req, res) => {
 
     let decoded;
     try {
-      decoded = await admin.auth().verifyIdToken(idToken);
+      decoded = await verifyAnyToken(idToken);
     } catch (e) {
       return res.status(401).json({ success: false, message: "Invalid auth token" });
     }
