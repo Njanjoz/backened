@@ -1238,6 +1238,123 @@ app.post("/api/confirm-subscription", async (req, res) => {
 });
 
 // ============================
+// DRIVER APPROVAL — admin approves or rejects a driver application
+// ============================
+app.post("/api/driver/decision", async (req, res) => {
+  try {
+    const { userId, decision, reason = "" } = req.body || {};
+    if (!userId || !["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ success: false, message: "userId and decision (approve|reject) required" });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (e) {
+      return res.status(401).json({ success: false, message: "Invalid auth token" });
+    }
+
+    const callerDoc = await db.collection("users").doc(decoded.uid).get();
+    const caller = callerDoc.data() || {};
+    if (caller.role !== "admin" && caller.userType !== "admin") {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+
+    const userRef = db.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return res.status(404).json({ success: false, message: "Driver not found" });
+    const driver = userSnap.data() || {};
+    const profile = driver.driverProfile || {};
+    const approved = decision === "approve";
+
+    await userRef.update({
+      driverApproved: approved,
+      driverStatus: approved ? "approved" : "rejected",
+      driverRejectionReason: approved ? "" : (reason || "Not specified"),
+      driverReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+      driverReviewedBy: decoded.uid,
+      roles: approved
+        ? Array.from(new Set([...(driver.roles || []), "driver"]))
+        : (driver.roles || []).filter(r => r !== "driver"),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const driverEmail = driver.email || "";
+    const driverPhone = profile.phone || driver.phone || driver.phoneNumber || "";
+    const driverName = driver.name || (driverEmail ? driverEmail.split("@")[0] : "Driver");
+
+    if (approved) {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Your driver account is approved",
+          eyebrow: "MarketMix Moving",
+          title: "You're approved to drive",
+          subtitle: `Welcome aboard, ${driverName}. Your driver account is active.`,
+          bodyHtml: `
+            ${emailBodyText("You can now accept move requests on MarketMix and start earning.")}
+            ${emailSectionLabel("Your driver details")}
+            ${emailInfoCard([
+              ["Vehicle", profile.vehicleId || "—"],
+              ["Plate", profile.plate || "—"],
+              ["License", profile.licenseNumber || "—"],
+              ["Phone", driverPhone || "—"],
+            ])}
+            ${emailBodyText("Open the driver dashboard to see live offers and manage trips.")}
+          `,
+          ctaLabel: "Open driver dashboard",
+          ctaUrl: "https://marketmix.site/transport/driver",
+          footerNote: "Questions? Reply to this email and we'll help.",
+        });
+        sendEmail(driverEmail, "You're approved · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver approve email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: https://marketmix.site/transport/driver`,
+          { kind: "driver-approved", userId }
+        );
+      }
+    } else {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Driver application update",
+          eyebrow: "MarketMix Moving",
+          title: "Driver application not approved",
+          subtitle: `Hello ${driverName}, we couldn't approve your driver account at this time.`,
+          bodyHtml: `
+            ${emailBodyText("You can update your details and resubmit at any time.")}
+            ${emailSectionLabel("Reason")}
+            ${emailInfoCard([["Reason", reason || "Not specified"]])}
+            ${emailBodyText("If you believe this is a mistake, reply to this email and we'll review again.")}
+          `,
+          ctaLabel: "Update my details",
+          ctaUrl: "https://marketmix.site/transport/driver/onboard",
+          footerNote: "MarketMix Kenya · support@marketmix.site",
+        });
+        sendEmail(driverEmail, "Update on your driver application · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver reject email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at /transport/driver/onboard`,
+          { kind: "driver-rejected", userId }
+        );
+      }
+    }
+
+    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"}`);
+    return res.json({ success: true, decision, userId });
+  } catch (e) {
+    console.error("❌ Driver decision failed:", e);
+    return sendServerError(res, e, "Driver decision failed");
+  }
+});
+
+// ============================
 // IntaSend callback
 // ============================
 app.post("/api/intasend-callback", async (req, res) => {
@@ -1873,6 +1990,7 @@ app.get("/_health", (req, res) => {
       "/api/moving/notify",
       "/api/moving/request",
       "/api/moving/request/:id",
+      "/api/driver/decision",
       "/api/subscription-payment",
       "/api/seller/withdraw",
       "/api/seller/recover-pin",
@@ -1942,6 +2060,7 @@ const server = app.listen(PORT, () => {
   console.log(`📦 Store: ✅ email + WhatsApp`);
   console.log(`🏠 Real estate: ✅ email + WhatsApp (buyer + landlord)`);
   console.log(`🚚 Moving: ✅ email + WhatsApp`);
+  console.log(`🧑‍✈️ Driver approvals: ✅ (admin only)`);
   console.log(`💰 Subscriptions: ✅`);
   console.log(`🪙 Wallet: ✅`);
 });
