@@ -9,6 +9,7 @@
 // - Subscription status polling and confirmation
 // - Smart keep-alive with overnight pause (11pm - 5am)
 // - Universal cross-site transaction lookup
+// - Orders-first ad-transaction lookup with wallet-deposit auto-heal
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -36,7 +37,7 @@ const allowedOrigins = [
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
-  "https://marketmix-realestates.vercel.app", // <-- added
+  "https://marketmix-realestates.vercel.app",
   "https://localhost",
 ];
 
@@ -138,16 +139,9 @@ const sendEmail = async (to, subject, html, type = 'security') => {
       return false;
     }
     
-    // Determine sender based on email type
     const sender = type === 'sales' 
-      ? {
-          name: 'MarketMixKenya',
-          email: 'sales@marketmix.site'
-        }
-      : {
-          name: 'MarketMixKenya',
-          email: 'security@marketmix.site'
-        };
+      ? { name: 'MarketMixKenya', email: 'sales@marketmix.site' }
+      : { name: 'MarketMixKenya', email: 'security@marketmix.site' };
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -238,40 +232,11 @@ const sendProposalStatusEmail = async (emailData) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    body { 
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      line-height: 1.6; 
-      color: #1f2937; 
-      margin: 0; 
-      padding: 0; 
-      background: #f9fafb;
-    }
-    .container { 
-      max-width: 600px; 
-      margin: 0 auto; 
-      background: white; 
-      border-radius: 16px; 
-      overflow: hidden; 
-      box-shadow: 0 4px 20px rgba(0,0,0,0.08); 
-      border: 1px solid #e5e7eb;
-    }
-    .header {
-      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-      padding: 32px 24px;
-      text-align: center;
-      color: white;
-    }
-    .content {
-      padding: 32px 24px;
-    }
-    .footer {
-      background: #f8f9fa;
-      padding: 24px;
-      text-align: center;
-      border-top: 1px solid #e9ecef;
-      color: #6c757d;
-      font-size: 13px;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: #f9fafb; }
+    .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border: 1px solid #e5e7eb; }
+    .header { background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%); padding: 32px 24px; text-align: center; color: white; }
+    .content { padding: 32px 24px; }
+    .footer { background: #f8f9fa; padding: 24px; text-align: center; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -280,23 +245,15 @@ const sendProposalStatusEmail = async (emailData) => {
       <div style="font-size: 24px; font-weight: bold; margin-bottom: 8px;">MarketMix Kenya</div>
       <h2 style="margin: 8px 0 0 0; font-weight: 300; font-size: 16px; opacity: 0.9;">Lipa Mdogo Mdogo Installment Update</h2>
     </div>
-    
     <div class="content">
       <h3 style="color: #1f2937; margin-bottom: 8px; font-size: 18px;">Hello ${emailData.studentName || 'Student'},</h3>
       <p style="color: #4b5563; margin-bottom: 20px;">Your installment proposal has been reviewed.</p>
-      
-      <div style="background: ${emailData.status === 'approved' ? '#f0fdf4' : '#fef2f2'}; 
-                  border-left: 4px solid ${emailData.status === 'approved' ? '#10b981' : '#ef4444'}; 
-                  padding: 16px; 
-                  border-radius: 8px; 
-                  margin: 20px 0;">
-        <h4 style="margin-top: 0; color: ${emailData.status === 'approved' ? '#065f46' : '#7c2d12'}; 
-                   margin-bottom: 8px; font-size: 14px;">
+      <div style="background: ${emailData.status === 'approved' ? '#f0fdf4' : '#fef2f2'}; border-left: 4px solid ${emailData.status === 'approved' ? '#10b981' : '#ef4444'}; padding: 16px; border-radius: 8px; margin: 20px 0;">
+        <h4 style="margin-top: 0; color: ${emailData.status === 'approved' ? '#065f46' : '#7c2d12'}; margin-bottom: 8px; font-size: 14px;">
           Status: ${emailData.status === 'approved' ? 'APPROVED ✅' : 'REJECTED ❌'}
         </h4>
         ${emailData.notes ? `<p style="color: #374151; margin: 0; font-size: 14px; line-height: 1.5;">${emailData.notes.replace(/\n/g, '<br>')}</p>` : ''}
       </div>
-      
       <div style="background: #f8fafc; border-radius: 10px; padding: 20px; margin: 20px 0; border: 1px solid #e2e8f0;">
         <p style="margin: 0 0 10px 0; font-size: 14px;"><strong>Proposal Details:</strong></p>
         <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>ID:</strong> ${emailData.proposalId?.substring(0, 8) || 'N/A'}</p>
@@ -304,7 +261,6 @@ const sendProposalStatusEmail = async (emailData) => {
         <p style="margin: 5px 0; font-size: 13px; color: #4b5563;"><strong>Institution:</strong> ${emailData.institution || 'N/A'}</p>
       </div>
     </div>
-    
     <div class="footer">
       <p style="margin: 0 0 8px 0; font-weight: 500;">MarketMix Kenya © ${new Date().getFullYear()}</p>
       <p style="margin: 0; font-size: 12px;">This email was sent from <strong>MarketMixKenya &lt;sales@marketmix.site&gt;</strong></p>
@@ -336,7 +292,6 @@ const sendProposalStatusEmail = async (emailData) => {
           dmarc: 'configured',
           dkim: 'signed'
         });
-        
         console.log(`✅ Proposal status email logged for ${emailData.proposalId}`);
       } catch (logErr) {
         console.error('Failed to log proposal status email:', logErr);
@@ -365,15 +320,10 @@ const storeReplacementCode = async (userId, email, code) => {
     expiryTime.setMinutes(expiryTime.getMinutes() + 15);
     
     await db.collection('pinRecoveryCodes').doc(userId).set({
-      code,
-      email,
-      userId,
+      code, email, userId,
       expiresAt: expiryTime,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      attempts: 0,
-      maxAttempts: 3,
-      used: false,
-      status: 'pending'
+      attempts: 0, maxAttempts: 3, used: false, status: 'pending'
     });
     
     return true;
@@ -397,25 +347,18 @@ const verifyReplacementCode = async (userId, code) => {
       await db.collection('pinRecoveryCodes').doc(userId).delete();
       return { valid: false, message: 'Recovery code has expired' };
     }
-    
     if (recoveryData.used) {
       return { valid: false, message: 'Recovery code has already been used' };
     }
-    
     if (recoveryData.attempts >= recoveryData.maxAttempts) {
       return { valid: false, message: 'Too many failed attempts' };
     }
-    
     if (recoveryData.code !== code) {
       await db.collection('pinRecoveryCodes').doc(userId).update({
         attempts: admin.firestore.FieldValue.increment(1)
       });
-      
       const remainingAttempts = recoveryData.maxAttempts - (recoveryData.attempts + 1);
-      return { 
-        valid: false, 
-        message: `Invalid code. ${remainingAttempts} attempts remaining` 
-      };
+      return { valid: false, message: `Invalid code. ${remainingAttempts} attempts remaining` };
     }
     
     await db.collection('pinRecoveryCodes').doc(userId).update({
@@ -460,11 +403,8 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     const orderDate = orderData.orderDate?.toDate() || new Date();
     const formattedDate = orderDate.toLocaleString('en-KE', {
       timeZone: 'Africa/Nairobi',
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
     });
     
     const itemsTotal = orderData.items?.reduce((sum, item) => 
@@ -480,219 +420,37 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    body { 
-      font-family: 'Georgia', 'Times New Roman', serif;
-      line-height: 1.6; 
-      color: #1f2937; 
-      margin: 0; 
-      padding: 0; 
-      background: linear-gradient(to bottom right, #f9fafb, #f3f4f6);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-    }
-    .container { 
-      max-width: 480px; 
-      width: 100%;
-      margin: 20px auto; 
-      background: white; 
-      border-radius: 20px; 
-      overflow: hidden; 
-      box-shadow: 0 10px 30px rgba(0,0,0,0.08); 
-      position: relative;
-      border: 1px solid #e5e7eb;
-      padding-bottom: 64px;
-    }
-    .watermark {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      pointer-events: none;
-      z-index: 0;
-      opacity: 0.05;
-    }
-    .watermark img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-    .logo-container {
-      display: flex;
-      justify-content: center;
-      margin-bottom: 24px;
-      margin-top: 24px;
-      position: relative;
-      z-index: 10;
-    }
-    .logo {
-      height: 64px;
-    }
-    .header {
-      text-align: center;
-      position: relative;
-      z-index: 10;
-      padding: 0 24px;
-    }
-    .title {
-      font-weight: bold;
-      font-size: 18px;
-      margin-bottom: 4px;
-      color: #1f2937;
-    }
-    .subtitle {
-      color: #6b7280;
-      font-size: 14px;
-      margin-bottom: 24px;
-    }
-    .content-box {
-      background: #f9fafb;
-      border-radius: 12px;
-      padding: 20px;
-      margin: 0 24px 24px;
-      border: 1px solid #e5e7eb;
-      position: relative;
-      z-index: 10;
-    }
-    .order-info {
-      margin-bottom: 16px;
-    }
-    .info-row {
-      margin-bottom: 8px;
-      font-size: 14px;
-    }
-    .info-label {
-      font-weight: 600;
-      color: #374151;
-    }
-    .items-section {
-      margin-top: 16px;
-    }
-    .items-title {
-      font-weight: 600;
-      margin-bottom: 8px;
-      color: #374151;
-    }
-    .items-list {
-      padding-left: 20px;
-      list-style-type: disc;
-      margin: 0;
-    }
-    .item {
-      margin-bottom: 6px;
-      color: #4b5563;
-      font-size: 14px;
-    }
-    .item span {
-      color: #1f2937;
-      font-weight: 500;
-    }
-    .total-row {
-      text-align: right;
-      font-weight: 600;
-      margin-top: 16px;
-      padding-top: 12px;
-      border-top: 1px dashed #d1d5db;
-      font-size: 15px;
-      color: #1f2937;
-    }
-    .divider {
-      height: 1px;
-      background: #e5e7eb;
-      margin: 24px;
-      position: relative;
-      z-index: 10;
-    }
-    .section-title {
-      font-weight: 600;
-      margin-bottom: 12px;
-      margin-left: 24px;
-      color: #374151;
-      position: relative;
-      z-index: 10;
-      font-size: 15px;
-    }
-    .shipping-box {
-      background: #f9fafb;
-      border-radius: 8px;
-      padding: 16px;
-      margin: 0 24px;
-      border: 1px solid #e5e7eb;
-      position: relative;
-      z-index: 10;
-    }
-    .shipping-row {
-      margin-bottom: 6px;
-      font-size: 14px;
-    }
-    .footer {
-      text-align: center;
-      font-size: 11px;
-      color: #9ca3af;
-      margin-top: 24px;
-      position: relative;
-      z-index: 10;
-      padding: 0 24px;
-    }
-    .receipt-id {
-      display: inline-block;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 8px 16px;
-      border-radius: 8px;
-      font-weight: bold;
-      margin-bottom: 16px;
-      font-size: 14px;
-      letter-spacing: 0.5px;
-    }
-    .status-badge {
-      display: inline-block;
-      background: #10b981;
-      color: white;
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 500;
-      margin-top: 8px;
-    }
-    .print-section {
-      text-align: center;
-      margin-top: 24px;
-      position: relative;
-      z-index: 10;
-    }
-    .action-link {
-      color: #4f46e5;
-      text-decoration: none;
-      font-weight: 500;
-      font-size: 14px;
-    }
-    .action-link:hover {
-      text-decoration: underline;
-    }
-    .action-button {
-      display: inline-block;
-      background: #4f46e5;
-      color: white;
-      padding: 10px 20px;
-      border-radius: 8px;
-      text-decoration: none;
-      font-weight: 500;
-      margin: 0 8px;
-      font-size: 14px;
-      border: none;
-      cursor: pointer;
-    }
-    .coupon-row {
-      color: #10b981;
-      font-size: 14px;
-    }
-    .delivery-row {
-      font-size: 14px;
-      color: #4b5563;
-    }
+    body { font-family: 'Georgia', 'Times New Roman', serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: linear-gradient(to bottom right, #f9fafb, #f3f4f6); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .container { max-width: 480px; width: 100%; margin: 20px auto; background: white; border-radius: 20px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.08); position: relative; border: 1px solid #e5e7eb; padding-bottom: 64px; }
+    .watermark { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; z-index: 0; opacity: 0.05; }
+    .watermark img { width: 100%; height: 100%; object-fit: cover; }
+    .logo-container { display: flex; justify-content: center; margin-bottom: 24px; margin-top: 24px; position: relative; z-index: 10; }
+    .logo { height: 64px; }
+    .header { text-align: center; position: relative; z-index: 10; padding: 0 24px; }
+    .title { font-weight: bold; font-size: 18px; margin-bottom: 4px; color: #1f2937; }
+    .subtitle { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
+    .content-box { background: #f9fafb; border-radius: 12px; padding: 20px; margin: 0 24px 24px; border: 1px solid #e5e7eb; position: relative; z-index: 10; }
+    .order-info { margin-bottom: 16px; }
+    .info-row { margin-bottom: 8px; font-size: 14px; }
+    .info-label { font-weight: 600; color: #374151; }
+    .items-section { margin-top: 16px; }
+    .items-title { font-weight: 600; margin-bottom: 8px; color: #374151; }
+    .items-list { padding-left: 20px; list-style-type: disc; margin: 0; }
+    .item { margin-bottom: 6px; color: #4b5563; font-size: 14px; }
+    .item span { color: #1f2937; font-weight: 500; }
+    .total-row { text-align: right; font-weight: 600; margin-top: 16px; padding-top: 12px; border-top: 1px dashed #d1d5db; font-size: 15px; color: #1f2937; }
+    .divider { height: 1px; background: #e5e7eb; margin: 24px; position: relative; z-index: 10; }
+    .section-title { font-weight: 600; margin-bottom: 12px; margin-left: 24px; color: #374151; position: relative; z-index: 10; font-size: 15px; }
+    .shipping-box { background: #f9fafb; border-radius: 8px; padding: 16px; margin: 0 24px; border: 1px solid #e5e7eb; position: relative; z-index: 10; }
+    .shipping-row { margin-bottom: 6px; font-size: 14px; }
+    .footer { text-align: center; font-size: 11px; color: #9ca3af; margin-top: 24px; position: relative; z-index: 10; padding: 0 24px; }
+    .receipt-id { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 8px 16px; border-radius: 8px; font-weight: bold; margin-bottom: 16px; font-size: 14px; letter-spacing: 0.5px; }
+    .status-badge { display: inline-block; background: #10b981; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; margin-top: 8px; }
+    .print-section { text-align: center; margin-top: 24px; position: relative; z-index: 10; }
+    .action-link { color: #4f46e5; text-decoration: none; font-weight: 500; font-size: 14px; }
+    .action-button { display: inline-block; background: #4f46e5; color: white; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: 500; margin: 0 8px; font-size: 14px; border: none; cursor: pointer; }
+    .coupon-row { color: #10b981; font-size: 14px; }
+    .delivery-row { font-size: 14px; color: #4b5563; }
   </style>
 </head>
 <body>
@@ -700,92 +458,49 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     <div class="watermark">
       <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="Watermark">
     </div>
-    
     <div class="logo-container">
       <img src="https://i.ibb.co/JjSrxbPz/icon-png-1.png" alt="MarketMix Logo" class="logo">
     </div>
-    
     <div class="header">
       <div class="receipt-id">Order #${orderId.substring(0, 8)}</div>
       <div class="title">Thank you for shopping with us</div>
       <div class="subtitle">We appreciate your trust and hope you enjoyed your order.</div>
       <div class="status-badge">Payment Confirmed</div>
     </div>
-    
     <div class="content-box">
       <div class="order-info">
-        <div class="info-row">
-          <span class="info-label">Order ID:</span> ${orderId || "N/A"}
-        </div>
-        <div class="info-row">
-          <span class="info-label">Date:</span> ${formattedDate}
-        </div>
-        <div class="info-row">
-          <span class="info-label">Buyer:</span> ${orderData.shippingDetails?.fullName || userEmail || "N/A"}
-        </div>
+        <div class="info-row"><span class="info-label">Order ID:</span> ${orderId || "N/A"}</div>
+        <div class="info-row"><span class="info-label">Date:</span> ${formattedDate}</div>
+        <div class="info-row"><span class="info-label">Buyer:</span> ${orderData.shippingDetails?.fullName || userEmail || "N/A"}</div>
       </div>
-      
       <div class="items-section">
         <div class="items-title">Items:</div>
         <ul class="items-list">
-          ${orderData.items?.map(item => `
-            <li class="item">
-              ${item.name} × ${item.quantity} – Ksh <span>${((item.price || 0) * (item.quantity || 1)).toFixed(2)}</span>
-            </li>
-          `).join('') || '<li class="item">No items</li>'}
+          ${orderData.items?.map(item => `<li class="item">${item.name} × ${item.quantity} – Ksh <span>${((item.price || 0) * (item.quantity || 1)).toFixed(2)}</span></li>`).join('') || '<li class="item">No items</li>'}
         </ul>
       </div>
-      
-      <div class="total-row">
-        Items Total: Ksh ${itemsTotal.toFixed(2)}
-      </div>
-      
-      ${orderData.couponDiscount > 0 ? `
-        <div class="total-row coupon-row">
-          Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}: -Ksh ${orderData.couponDiscount.toFixed(2)}
-        </div>
-      ` : ''}
-      
-      <div class="total-row delivery-row">
-        Delivery Total: Ksh ${deliveryTotal.toFixed(2)}
-      </div>
-      
-      <div class="total-row" style="font-size: 16px; color: #1f2937; margin-top: 20px;">
-        Total Amount Paid: Ksh ${orderData.totalAmount?.toFixed(2) || '0.00'}
-      </div>
+      <div class="total-row">Items Total: Ksh ${itemsTotal.toFixed(2)}</div>
+      ${orderData.couponDiscount > 0 ? `<div class="total-row coupon-row">Coupon Discount ${orderData.couponCode ? `(${orderData.couponCode})` : ''}: -Ksh ${orderData.couponDiscount.toFixed(2)}</div>` : ''}
+      <div class="total-row delivery-row">Delivery Total: Ksh ${deliveryTotal.toFixed(2)}</div>
+      <div class="total-row" style="font-size: 16px; color: #1f2937; margin-top: 20px;">Total Amount Paid: Ksh ${orderData.totalAmount?.toFixed(2) || '0.00'}</div>
     </div>
-    
     <div class="divider"></div>
-    
     <div class="section-title">Shipping Details</div>
     <div class="shipping-box">
-      <div class="shipping-row">
-        <span class="info-label">Full Name:</span> ${orderData.shippingDetails?.fullName || "N/A"}
-      </div>
-      <div class="shipping-row">
-        <span class="info-label">Phone:</span> ${orderData.shippingDetails?.phoneNumber || "N/A"}
-      </div>
-      <div class="shipping-row">
-        <span class="info-label">Delivery Place:</span> ${orderData.shippingDetails?.deliveryPlace || "N/A"}
-      </div>
+      <div class="shipping-row"><span class="info-label">Full Name:</span> ${orderData.shippingDetails?.fullName || "N/A"}</div>
+      <div class="shipping-row"><span class="info-label">Phone:</span> ${orderData.shippingDetails?.phoneNumber || "N/A"}</div>
+      <div class="shipping-row"><span class="info-label">Delivery Place:</span> ${orderData.shippingDetails?.deliveryPlace || "N/A"}</div>
     </div>
-    
     <div class="print-section">
-      <p style="margin-bottom: 16px; color: #6b7280; font-size: 14px;">
-        View your full receipt: 
-        <a href="https://marketmix.site/order-receipt/${orderId}" class="action-link">Order Receipt</a>
-      </p>
+      <p style="margin-bottom: 16px; color: #6b7280; font-size: 14px;">View your full receipt: <a href="https://marketmix.site/order-receipt/${orderId}" class="action-link">Order Receipt</a></p>
       <div style="margin-top: 20px;">
         <a href="https://marketmix.site" class="action-button" style="background: #1f2937;">Continue Shopping</a>
         <a href="https://marketmix.site/orders" class="action-button">View All Orders</a>
       </div>
     </div>
-    
     <div class="footer">
       <p style="margin: 0;">MarketMix Kenya © ${new Date().getFullYear()} | Receipt generated online</p>
-      <p style="margin: 8px 0 0 0; font-size: 10px;">
-        Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #6b7280;">sales@marketmix.site</a>
-      </p>
+      <p style="margin: 8px 0 0 0; font-size: 10px;">Need help? Contact: <a href="mailto:sales@marketmix.site" style="color: #6b7280;">sales@marketmix.site</a></p>
     </div>
   </div>
 </body>
@@ -801,14 +516,10 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     if (emailSent) {
       try {
         await db.collection('orderEmails').add({
-          orderId,
-          userEmail,
-          type: 'confirmation',
+          orderId, userEmail, type: 'confirmation',
           sender: 'MarketMixKenya <sales@marketmix.site>',
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          authenticated: true,
-          dmarc: 'configured',
-          dkim: 'signed'
+          authenticated: true, dmarc: 'configured', dkim: 'signed'
         });
       } catch (logErr) {
         console.error('Failed to log email:', logErr);
@@ -837,11 +548,8 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
 
     const paidAt = new Date().toLocaleString('en-KE', {
       timeZone: 'Africa/Nairobi',
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
     });
 
     const propertyTitle = data.propertyTitle || data.propertyName || 'Property';
@@ -860,156 +568,30 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      line-height: 1.6;
-      color: #1f2937;
-      margin: 0;
-      padding: 0;
-      background: #f3f4f6;
-    }
-    .container {
-      max-width: 560px;
-      margin: 24px auto;
-      background: #ffffff;
-      border-radius: 16px;
-      overflow: hidden;
-      border: 1px solid #e5e7eb;
-      box-shadow: 0 8px 30px rgba(0,0,0,0.06);
-    }
-    .header {
-      background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%);
-      color: #ffffff;
-      padding: 32px 24px;
-      text-align: center;
-    }
-    .header h1 {
-      margin: 0 0 6px 0;
-      font-size: 22px;
-      font-weight: 700;
-    }
-    .header p {
-      margin: 0;
-      font-size: 14px;
-      opacity: 0.9;
-    }
-    .badge {
-      display: inline-block;
-      margin-top: 14px;
-      background: rgba(255,255,255,0.18);
-      border: 1px solid rgba(255,255,255,0.35);
-      color: #ffffff;
-      padding: 6px 14px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0.4px;
-    }
-    .content {
-      padding: 28px 24px 8px 24px;
-    }
-    .greeting {
-      font-size: 16px;
-      color: #111827;
-      margin-bottom: 6px;
-    }
-    .intro {
-      color: #4b5563;
-      font-size: 14px;
-      margin-bottom: 20px;
-    }
-    .amount-box {
-      background: #ecfdf5;
-      border: 1px solid #a7f3d0;
-      border-radius: 12px;
-      padding: 18px;
-      text-align: center;
-      margin-bottom: 22px;
-    }
-    .amount-label {
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #047857;
-      margin: 0 0 6px 0;
-    }
-    .amount-value {
-      font-size: 28px;
-      font-weight: 700;
-      color: #065f46;
-      margin: 0;
-    }
-    .details {
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      border-radius: 12px;
-      padding: 18px;
-      margin-bottom: 20px;
-    }
-    .details h3 {
-      margin: 0 0 12px 0;
-      font-size: 14px;
-      color: #111827;
-    }
-    .row {
-      display: flex;
-      justify-content: space-between;
-      padding: 7px 0;
-      border-bottom: 1px dashed #e5e7eb;
-      font-size: 13px;
-    }
-    .row:last-child {
-      border-bottom: none;
-    }
-    .row .label {
-      color: #6b7280;
-    }
-    .row .value {
-      color: #111827;
-      font-weight: 600;
-      text-align: right;
-      max-width: 60%;
-      word-break: break-word;
-    }
-    .note {
-      background: #eff6ff;
-      border-left: 4px solid #3b82f6;
-      border-radius: 8px;
-      padding: 14px 16px;
-      font-size: 13px;
-      color: #1e3a8a;
-      margin-bottom: 20px;
-    }
-    .cta {
-      text-align: center;
-      margin: 24px 0 8px 0;
-    }
-    .cta a {
-      display: inline-block;
-      background: #0f766e;
-      color: #ffffff;
-      text-decoration: none;
-      padding: 12px 22px;
-      border-radius: 10px;
-      font-size: 14px;
-      font-weight: 600;
-      margin: 0 6px 10px 6px;
-    }
-    .cta a.secondary {
-      background: #111827;
-    }
-    .footer {
-      background: #f9fafb;
-      border-top: 1px solid #e5e7eb;
-      padding: 18px 24px;
-      text-align: center;
-      font-size: 12px;
-      color: #6b7280;
-    }
-    .footer a {
-      color: #0f766e;
-      text-decoration: none;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; margin: 0; padding: 0; background: #f3f4f6; }
+    .container { max-width: 560px; margin: 24px auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #e5e7eb; box-shadow: 0 8px 30px rgba(0,0,0,0.06); }
+    .header { background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%); color: #ffffff; padding: 32px 24px; text-align: center; }
+    .header h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; }
+    .header p { margin: 0; font-size: 14px; opacity: 0.9; }
+    .badge { display: inline-block; margin-top: 14px; background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.35); color: #ffffff; padding: 6px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: 0.4px; }
+    .content { padding: 28px 24px 8px 24px; }
+    .greeting { font-size: 16px; color: #111827; margin-bottom: 6px; }
+    .intro { color: #4b5563; font-size: 14px; margin-bottom: 20px; }
+    .amount-box { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 22px; }
+    .amount-label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #047857; margin: 0 0 6px 0; }
+    .amount-value { font-size: 28px; font-weight: 700; color: #065f46; margin: 0; }
+    .details { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; margin-bottom: 20px; }
+    .details h3 { margin: 0 0 12px 0; font-size: 14px; color: #111827; }
+    .row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px dashed #e5e7eb; font-size: 13px; }
+    .row:last-child { border-bottom: none; }
+    .row .label { color: #6b7280; }
+    .row .value { color: #111827; font-weight: 600; text-align: right; max-width: 60%; word-break: break-word; }
+    .note { background: #eff6ff; border-left: 4px solid #3b82f6; border-radius: 8px; padding: 14px 16px; font-size: 13px; color: #1e3a8a; margin-bottom: 20px; }
+    .cta { text-align: center; margin: 24px 0 8px 0; }
+    .cta a { display: inline-block; background: #0f766e; color: #ffffff; text-decoration: none; padding: 12px 22px; border-radius: 10px; font-size: 14px; font-weight: 600; margin: 0 6px 10px 6px; }
+    .cta a.secondary { background: #111827; }
+    .footer { background: #f9fafb; border-top: 1px solid #e5e7eb; padding: 18px 24px; text-align: center; font-size: 12px; color: #6b7280; }
+    .footer a { color: #0f766e; text-decoration: none; }
   </style>
 </head>
 <body>
@@ -1019,71 +601,35 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
       <p>Payment Confirmation Receipt</p>
       <div class="badge">✅ PAYMENT CONFIRMED</div>
     </div>
-
     <div class="content">
       <p class="greeting">Hello ${buyerName},</p>
-      <p class="intro">
-        Your payment for the property below has been received and confirmed.
-        Please keep this email as your official receipt.
-      </p>
-
+      <p class="intro">Your payment for the property below has been received and confirmed. Please keep this email as your official receipt.</p>
       <div class="amount-box">
         <p class="amount-label">Amount Paid</p>
         <p class="amount-value">KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
       </div>
-
       <div class="details">
         <h3>Property Details</h3>
-        <div class="row">
-          <span class="label">Property</span>
-          <span class="value">${propertyTitle}</span>
-        </div>
-        <div class="row">
-          <span class="label">Location</span>
-          <span class="value">${propertyLocation}</span>
-        </div>
-        <div class="row">
-          <span class="label">Type</span>
-          <span class="value">${propertyType}</span>
-        </div>
-        <div class="row">
-          <span class="label">Reference</span>
-          <span class="value">${orderId}</span>
-        </div>
-        <div class="row">
-          <span class="label">M-Pesa Code</span>
-          <span class="value">${mpesaRef}</span>
-        </div>
-        <div class="row">
-          <span class="label">Paid On</span>
-          <span class="value">${paidAt}</span>
-        </div>
+        <div class="row"><span class="label">Property</span><span class="value">${propertyTitle}</span></div>
+        <div class="row"><span class="label">Location</span><span class="value">${propertyLocation}</span></div>
+        <div class="row"><span class="label">Type</span><span class="value">${propertyType}</span></div>
+        <div class="row"><span class="label">Reference</span><span class="value">${orderId}</span></div>
+        <div class="row"><span class="label">M-Pesa Code</span><span class="value">${mpesaRef}</span></div>
+        <div class="row"><span class="label">Paid On</span><span class="value">${paidAt}</span></div>
       </div>
-
       <div class="details">
         <h3>Landlord / Agent Contact</h3>
-        <div class="row">
-          <span class="label">Name</span>
-          <span class="value">${landlordName}</span>
-        </div>
-        <div class="row">
-          <span class="label">Phone</span>
-          <span class="value">${landlordPhone}</span>
-        </div>
+        <div class="row"><span class="label">Name</span><span class="value">${landlordName}</span></div>
+        <div class="row"><span class="label">Phone</span><span class="value">${landlordPhone}</span></div>
       </div>
-
       <div class="note">
-        <strong>Next steps:</strong> The landlord or agent will contact you shortly to
-        arrange viewing, keys handover, or any outstanding paperwork. If you have
-        questions, reply to this email or contact support.
+        <strong>Next steps:</strong> The landlord or agent will contact you shortly to arrange viewing, keys handover, or any outstanding paperwork. If you have questions, reply to this email or contact support.
       </div>
-
       <div class="cta">
         <a href="${REAL_ESTATE_RECEIPT_URL}/${orderId}">View Receipt Online</a>
         <a href="https://marketmix-realestates.vercel.app" class="secondary">Browse More Properties</a>
       </div>
     </div>
-
     <div class="footer">
       <p style="margin: 0 0 6px 0;"><strong>MarketMix Real Estates</strong></p>
       <p style="margin: 0 0 6px 0;">MarketMix Kenya © ${new Date().getFullYear()}</p>
@@ -1103,17 +649,11 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
     if (emailSent) {
       try {
         await db.collection('realEstateEmails').add({
-          orderId,
-          userEmail,
-          propertyTitle,
-          amount,
-          mpesaReference: mpesaRef,
-          type: 'real_estate_confirmation',
+          orderId, userEmail, propertyTitle, amount,
+          mpesaReference: mpesaRef, type: 'real_estate_confirmation',
           sender: 'MarketMixKenya <sales@marketmix.site>',
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          authenticated: true,
-          dmarc: 'configured',
-          dkim: 'signed'
+          authenticated: true, dmarc: 'configured', dkim: 'signed'
         });
       } catch (logErr) {
         console.error('Failed to log real estate email:', logErr);
@@ -1136,9 +676,7 @@ const FIXED_FEE_ABOVE_THRESHOLD = 20.0;
 const AGENCY_FEE_RATE = 0.035;
 
 function getTieredFixedFee(amount) {
-  return amount < WITHDRAWAL_THRESHOLD
-    ? FIXED_FEE_BELOW_THRESHOLD
-    : FIXED_FEE_ABOVE_THRESHOLD;
+  return amount < WITHDRAWAL_THRESHOLD ? FIXED_FEE_BELOW_THRESHOLD : FIXED_FEE_ABOVE_THRESHOLD;
 }
 
 function calculateTotalFee(amount) {
@@ -1161,7 +699,6 @@ function sendServerError(res, err, msg = "Internal server error") {
   return res.status(500).json({ success: false, message: msg });
 }
 
-// Detect real estate orders by their api_ref prefix or explicit flag
 function isRealEstateRef(apiRef, orderData) {
   if (!apiRef) return false;
   if (apiRef.startsWith("PROP_")) return true;
@@ -1177,27 +714,21 @@ function isRealEstateRef(apiRef, orderData) {
 
 const validateSubscriptionPayment = (data) => {
   const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data;
-  
   if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
     return { valid: false, message: "Missing required fields" };
   }
-  
   const amt = parsePositiveNumber(amount);
   if (!amt) return { valid: false, message: "Invalid amount" };
-  
   if (!isValidPhone(phoneNumber)) {
     return { valid: false, message: "Invalid phone number format. Use 2547XXXXXXXX or 2541XXXXXXXX" };
   }
-  
   if (!email.includes("@")) return { valid: false, message: "Invalid email" };
-  
   return { valid: true, data: { ...data, amount: amt } };
 };
 
 const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
   try {
     const subscriptionRef = db.collection('subscriptions').doc(subscriptionData.orderId);
-    
     const subscriptionRecord = {
       sellerId: subscriptionData.sellerId,
       planId: subscriptionData.planId,
@@ -1215,7 +746,6 @@ const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
       paymentStatus: 'pending',
       mpesaReference: null
     };
-    
     await subscriptionRef.set(subscriptionRecord);
     return subscriptionRef.id;
   } catch (error) {
@@ -1227,14 +757,10 @@ const createSubscriptionRecord = async (subscriptionData, invoiceId) => {
 const getSubscriptionPaymentStatus = async (invoiceId) => {
   try {
     const subscriptionSnapshot = await db.collection('subscriptions')
-      .where('invoiceId', '==', invoiceId)
-      .limit(1)
-      .get();
-    
+      .where('invoiceId', '==', invoiceId).limit(1).get();
     if (subscriptionSnapshot.empty) {
       return { success: false, message: 'Subscription not found' };
     }
-    
     const subscription = subscriptionSnapshot.docs[0].data();
     return { 
       success: true, 
@@ -1253,14 +779,12 @@ const getSubscriptionPaymentStatus = async (invoiceId) => {
 const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
   try {
     const { orderId, planId, sellerId, sellerEmail } = subscriptionData;
-    
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
     
     const subscriptionRef = db.collection('subscriptions').doc(orderId);
     await subscriptionRef.update({
-      status: 'active',
-      paymentStatus: 'paid',
+      status: 'active', paymentStatus: 'paid',
       mpesaReference: mpesaReference,
       activatedAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt: expiresAt,
@@ -1269,38 +793,27 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
     
     const sellerRef = db.collection('users').doc(sellerId);
     await sellerRef.update({
-      subscriptionPlan: planId,
-      subscriptionStatus: 'active',
-      subscriptionActive: true,
-      subscriptionExpiresAt: expiresAt,
+      subscriptionPlan: planId, subscriptionStatus: 'active',
+      subscriptionActive: true, subscriptionExpiresAt: expiresAt,
       subscriptionStartedAt: admin.firestore.FieldValue.serverTimestamp(),
       lastSubscriptionPayment: {
         amount: subscriptionData.amount,
         date: admin.firestore.FieldValue.serverTimestamp(),
-        reference: mpesaReference,
-        orderId: orderId
+        reference: mpesaReference, orderId: orderId
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
     await db.collection('subscriptionPayments').add({
-      sellerId,
-      planId,
-      amount: subscriptionData.amount,
-      mpesaReference,
-      orderId,
-      status: 'completed',
-      sellerEmail,
+      sellerId, planId, amount: subscriptionData.amount,
+      mpesaReference, orderId, status: 'completed', sellerEmail,
       paymentDate: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt: expiresAt
     });
     
     await db.collection('subscriptionLogs').add({
-      sellerId,
-      action: 'subscription_activated',
-      planId,
-      amount: subscriptionData.amount,
-      orderId,
+      sellerId, action: 'subscription_activated', planId,
+      amount: subscriptionData.amount, orderId,
       timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
     
@@ -1318,76 +831,37 @@ const activateSellerSubscription = async (subscriptionData, mpesaReference) => {
 app.post("/api/send-proposal-status", async (req, res) => {
   try {
     const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body;
-    
     if (!to || !proposalId || !status) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing required fields: to, proposalId, status' 
-      });
+      return res.status(400).json({ success: false, message: 'Missing required fields: to, proposalId, status' });
     }
-
     const emailData = {
       to,
       subject: subject || `Your Installment Proposal Has Been ${status === 'approved' ? 'Approved' : 'Rejected'} - MarketMix Kenya`,
-      html,
-      proposalId,
-      studentName,
-      status,
-      notes,
-      amount,
-      institution
+      html, proposalId, studentName, status, notes, amount, institution
     };
-
     const emailSent = await sendProposalStatusEmail(emailData);
-    
     if (emailSent) {
-      res.json({ 
-        success: true, 
-        message: 'Proposal status email sent successfully',
-        data: {
-          to,
-          proposalId,
-          status,
-          sentAt: new Date().toISOString(),
-          sender: 'MarketMixKenya <sales@marketmix.site>'
-        }
+      res.json({ success: true, message: 'Proposal status email sent successfully',
+        data: { to, proposalId, status, sentAt: new Date().toISOString(), sender: 'MarketMixKenya <sales@marketmix.site>' }
       });
     } else {
-      res.status(500).json({ 
-        success: false, 
-        message: 'Failed to send proposal status email' 
-      });
+      res.status(500).json({ success: false, message: 'Failed to send proposal status email' });
     }
   } catch (error) {
     console.error('❌ Send proposal status email error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Internal server error while sending email' 
-    });
+    res.status(500).json({ success: false, message: 'Internal server error while sending email' });
   }
 });
 
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body;
-
     const amt = parsePositiveNumber(amount);
-    if (!amt)
-      return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid phone number format" });
-    if (!fullName)
-      return res
-        .status(400)
-        .json({ success: false, message: "Full name required" });
-    if (!email || !email.includes("@"))
-      return res.status(400).json({ success: false, message: "Invalid email" });
-    if (!orderId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing orderId" });
+    if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone number format" });
+    if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
+    if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
+    if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
 
     const [firstName, ...rest] = fullName.trim().split(" ");
     const lastName = rest.join(" ") || "N/A";
@@ -1395,30 +869,20 @@ app.post("/api/stk-push", async (req, res) => {
     let response;
     try {
       response = await intasend.collection().mpesaStkPush({
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        phone_number: phoneNumber,
-        amount: amt,
-        host: BACKEND_HOST,
-        api_ref: orderId,
+        first_name: firstName, last_name: lastName, email,
+        phone_number: phoneNumber, amount: amt,
+        host: BACKEND_HOST, api_ref: orderId,
       });
     } catch (intasendErr) {
-      console.error(
-        "❌ IntaSend STK Push failed:",
-        intasendErr?.response || intasendErr
-      );
-      return res
-        .status(502)
-        .json({ success: false, message: "Payment provider error" });
+      console.error("❌ IntaSend STK Push failed:", intasendErr?.response || intasendErr);
+      return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
-    // Store the amount in the order for later reference
     await db.collection("orders").doc(orderId).set(
       {
         invoiceId: response?.invoice?.invoice_id || null,
         status: "STK_PUSH_SENT",
-        totalAmount: amt, // ✅ Store the correct amount
+        totalAmount: amt,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -1433,47 +897,31 @@ app.post("/api/stk-push", async (req, res) => {
 app.post("/api/subscription-payment", async (req, res) => {
   try {
     console.log("📦 Subscription payment request:", req.body);
-    
     const validation = validateSubscriptionPayment(req.body);
     if (!validation.valid) {
       return res.status(400).json({ success: false, message: validation.message });
     }
-    
     const subscriptionData = validation.data;
     const { amount, phoneNumber, fullName, email, orderId } = subscriptionData;
-    
     const [firstName, ...rest] = fullName.trim().split(" ");
     const lastName = rest.join(" ") || "N/A";
 
     let intasendResponse;
     try {
       intasendResponse = await intasend.collection().mpesaStkPush({
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        phone_number: phoneNumber,
-        amount: amount,
-        host: BACKEND_HOST,
-        api_ref: orderId,
+        first_name: firstName, last_name: lastName, email,
+        phone_number: phoneNumber, amount: amount,
+        host: BACKEND_HOST, api_ref: orderId,
       });
     } catch (intasendErr) {
-      console.error(
-        "❌ IntaSend Subscription STK Push failed:",
-        intasendErr?.response || intasendErr
-      );
-      return res
-        .status(502)
-        .json({ success: false, message: "Payment provider error" });
+      console.error("❌ IntaSend Subscription STK Push failed:", intasendErr?.response || intasendErr);
+      return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
     const invoiceId = intasendResponse?.invoice?.invoice_id;
     await createSubscriptionRecord(subscriptionData, invoiceId);
 
-    return res.json({ 
-      success: true, 
-      data: intasendResponse,
-      message: "Subscription payment initiated successfully" 
-    });
+    return res.json({ success: true, data: intasendResponse, message: "Subscription payment initiated successfully" });
   } catch (error) {
     console.error("❌ Subscription payment error:", error);
     return sendServerError(res, error, "Subscription payment failed");
@@ -1483,20 +931,13 @@ app.post("/api/subscription-payment", async (req, res) => {
 app.get("/api/subscription-status/:invoiceId", async (req, res) => {
   try {
     const { invoiceId } = req.params;
-    
     if (!invoiceId) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Missing invoice ID" 
-      });
+      return res.status(400).json({ success: false, message: "Missing invoice ID" });
     }
-    
     const status = await getSubscriptionPaymentStatus(invoiceId);
-    
     if (!status.success) {
       return res.status(404).json(status);
     }
-    
     return res.json(status);
   } catch (error) {
     console.error("❌ Subscription status check error:", error);
@@ -1507,32 +948,15 @@ app.get("/api/subscription-status/:invoiceId", async (req, res) => {
 app.post("/api/confirm-subscription", async (req, res) => {
   try {
     const { orderId, mpesaReference, planId, sellerId, sellerEmail } = req.body;
-    
     console.log("✅ Confirming subscription:", { orderId, mpesaReference });
-    
     if (!orderId || !mpesaReference || !planId || !sellerId || !sellerEmail) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Missing required fields" 
-      });
+      return res.status(400).json({ success: false, message: "Missing required fields" });
     }
-    
     await activateSellerSubscription({
-      orderId,
-      planId,
-      sellerId,
-      sellerEmail,
-      amount: req.body.amount
+      orderId, planId, sellerId, sellerEmail, amount: req.body.amount
     }, mpesaReference);
-    
-    return res.json({ 
-      success: true, 
-      message: "Subscription activated successfully",
-      data: {
-        orderId,
-        activated: true,
-        timestamp: new Date().toISOString()
-      }
+    return res.json({ success: true, message: "Subscription activated successfully",
+      data: { orderId, activated: true, timestamp: new Date().toISOString() }
     });
   } catch (error) {
     console.error("❌ Confirm subscription error:", error);
@@ -1549,12 +973,8 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
 
     console.log(`📞 Callback received:`, {
-      api_ref,
-      state,
-      mpesa_reference,
-      invoice_id,
-      value: req.body.value, // Log the actual amount from callback
-      timestamp: new Date().toISOString()
+      api_ref, state, mpesa_reference, invoice_id,
+      value: req.body.value, timestamp: new Date().toISOString()
     });
 
     let paymentStatus = "pending";
@@ -1567,22 +987,18 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (isSubscription) {
       const subscriptionRef = db.collection('subscriptions').doc(api_ref);
       const subscriptionSnap = await subscriptionRef.get();
-      
       if (subscriptionSnap.exists) {
         await subscriptionRef.update({
           paymentStatus: paymentStatus,
           mpesaReference: mpesa_reference || null,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        
         console.log(`✅ Subscription ${api_ref} updated to: ${paymentStatus}`);
-        
         if (state === "COMPLETE") {
           const subscriptionData = subscriptionSnap.data();
           try {
             await activateSellerSubscription({
-              orderId: api_ref,
-              planId: subscriptionData.planId,
+              orderId: api_ref, planId: subscriptionData.planId,
               sellerId: subscriptionData.sellerId,
               sellerEmail: subscriptionData.email,
               amount: subscriptionData.amount
@@ -1596,41 +1012,29 @@ app.post("/api/intasend-callback", async (req, res) => {
       return res.send("OK");
     }
     
-    // Handle regular orders and wallet deposits
     const orderRef = db.collection("orders").doc(api_ref);
     let orderSnap = await orderRef.get();
-    
-    // ✅ Get the actual amount from the callback
     const callbackAmount = parseFloat(req.body.value);
     
-    // Auto-create order for wallet deposits if not exists
     if (!orderSnap.exists && isWalletDeposit) {
       console.log(`📝 Auto-creating wallet order: ${api_ref}`);
-      
       const parts = api_ref.split('_');
       const sellerId = parts[1];
-      
-      let amount = 1; // Default minimum
-      
+      let amount = 1;
       if (callbackAmount && callbackAmount > 0 && callbackAmount <= 500000) {
         amount = callbackAmount;
         console.log(`✅ Using amount from callback: KSH ${amount}`);
       } else {
         console.log(`⚠️ Invalid callback amount: ${callbackAmount}, using default: ${amount}`);
       }
-      
       await orderRef.set({
-        orderId: api_ref,
-        paymentStatus: paymentStatus,
+        orderId: api_ref, paymentStatus: paymentStatus,
         mpesaReference: mpesa_reference || null,
-        totalAmount: amount,
-        state: state,
+        totalAmount: amount, state: state,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        isWalletDeposit: true,
-        sellerId: sellerId
+        isWalletDeposit: true, sellerId: sellerId
       });
-      
       orderSnap = await orderRef.get();
       console.log(`✅ Auto-created wallet order: ${api_ref} with amount ${amount}`);
     }
@@ -1641,58 +1045,37 @@ app.post("/api/intasend-callback", async (req, res) => {
     }
 
     const orderData = orderSnap.data();
-    
-    // Update order status
     await orderRef.update({
       paymentStatus: paymentStatus,
       mpesaReference: mpesa_reference || null,
       state: state,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-
     console.log(`✅ Order ${api_ref} updated: ${paymentStatus}`);
 
-    // ============================================================
-    // Handle wallet deposit with correct amount
-    // ============================================================
     if (isWalletDeposit && state === "COMPLETE") {
       console.log(`💰 Processing wallet deposit: ${api_ref}`);
-      
       const parts = api_ref.split('_');
       const sellerId = parts[1];
-      
       let amount = callbackAmount;
-      
-      // If callback amount is invalid, try orderData
       if (!amount || amount <= 0 || amount > 500000) {
         amount = orderData.totalAmount;
         console.log(`⚠️ Using amount from orderData: ${amount}`);
       }
-      
-      // Final validation
       if (!amount || amount <= 0 || amount > 500000) {
         console.error(`❌ Invalid amount: ${amount} - marking transaction as failed`);
-        await orderRef.update({
-          paymentStatus: 'failed',
-          errorMessage: 'Invalid amount detected'
-        });
+        await orderRef.update({ paymentStatus: 'failed', errorMessage: 'Invalid amount detected' });
         return res.send("OK");
       }
-      
       console.log(`✅ Processing deposit amount: KSH ${amount}`);
       
-      // Create adTransaction with correct amount
       const adTxRef = db.collection('adTransactions').doc(api_ref);
-      
       await adTxRef.set({
-        paymentRef: api_ref,
-        sellerId: sellerId,
+        paymentRef: api_ref, sellerId: sellerId,
         sellerEmail: orderData.sellerEmail || null,
         sellerName: orderData.sellerName || null,
         sellerPhone: orderData.sellerPhone || null,
-        type: 'deposit',
-        amount: amount,
-        status: 'completed',
+        type: 'deposit', amount: amount, status: 'completed',
         paymentMethod: 'mpesa',
         mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
         description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
@@ -1701,13 +1084,10 @@ app.post("/api/intasend-callback", async (req, res) => {
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
-      
       console.log(`✅ AdTransaction created with amount: ${amount}`);
       
-      // Update seller's wallet balance
       const walletRef = db.collection('sellerAdCredits').doc(sellerId);
       const walletSnap = await walletRef.get();
-      
       if (walletSnap.exists) {
         await walletRef.update({
           balance: admin.firestore.FieldValue.increment(amount),
@@ -1717,26 +1097,18 @@ app.post("/api/intasend-callback", async (req, res) => {
         console.log(`💰 Wallet updated for ${sellerId}: +KSH ${amount}`);
       } else {
         await walletRef.set({
-          sellerId: sellerId,
-          balance: amount,
-          totalDeposited: amount,
-          totalSpent: 0,
-          reservedBalance: 0,
+          sellerId: sellerId, balance: amount, totalDeposited: amount,
+          totalSpent: 0, reservedBalance: 0,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
         console.log(`💰 Wallet created for ${sellerId} with KSH ${amount}`);
       }
-      
       console.log(`✅ Successfully processed deposit: ${api_ref} for KSH ${amount}`);
     }
 
-    // ============================================================
-    // Send confirmation emails on COMPLETE (real estate + regular orders)
-    // ============================================================
     if (state === "COMPLETE" && !isWalletDeposit) {
       let userEmail = orderData.userEmail || orderData.shippingDetails?.email || orderData.buyerEmail;
-      
       if (!userEmail && orderData.userId) {
         try {
           const userDoc = await db.collection('users').doc(orderData.userId).get();
@@ -1745,10 +1117,8 @@ app.post("/api/intasend-callback", async (req, res) => {
           console.error('Failed to fetch user email:', err);
         }
       }
-
       if (userEmail) {
         const realEstate = isRealEstateRef(api_ref, orderData);
-
         if (realEstate) {
           const realEstatePayload = {
             ...orderData,
@@ -1761,7 +1131,6 @@ app.post("/api/intasend-callback", async (req, res) => {
             landlordName: orderData.landlordName || orderData.sellerName,
             landlordPhone: orderData.landlordPhone || orderData.sellerPhone,
           };
-
           sendRealEstatePaymentEmail(realEstatePayload, userEmail, api_ref)
             .then(success => {
               if (success) console.log(`🏠 Real estate receipt sent for ${api_ref}`);
@@ -1791,28 +1160,20 @@ app.post("/api/intasend-callback", async (req, res) => {
 app.get("/api/transaction/:invoiceId", async (req, res) => {
   try {
     const invoiceId = req.params.invoiceId;
-    if (!invoiceId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing invoiceId" });
-
-    const docs = await db
-      .collection("orders")
-      .where("invoiceId", "==", invoiceId)
-      .get();
-
-    if (docs.empty)
-      return res
-        .status(404)
-        .json({ success: false, message: "Transaction not found" });
-
+    if (!invoiceId) {
+      return res.status(400).json({ success: false, message: "Missing invoiceId" });
+    }
+    const docs = await db.collection("orders").where("invoiceId", "==", invoiceId).get();
+    if (docs.empty) {
+      return res.status(404).json({ success: false, message: "Transaction not found" });
+    }
     return res.json({ success: true, data: docs.docs[0].data() });
   } catch (error) {
     return sendServerError(res, error, "Transaction lookup failed");
   }
 });
 
-// ✅ Ad Transaction lookup by paymentRef
+// ✅ Ad Transaction lookup by paymentRef — orders-first, with auto-heal
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   try {
     const paymentRef = req.params.paymentRef;
@@ -1820,58 +1181,63 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing paymentRef" });
     }
 
-    console.log(`🔍 Looking up ad transaction: ${paymentRef}`);
+    console.log(`🔍 Looking up transaction: ${paymentRef}`);
 
-    // Direct document lookup by ID
+    // 1. Check orders collection directly by doc ID
+    const orderDoc = await db.collection('orders').doc(paymentRef).get();
+    if (orderDoc.exists) {
+      const orderData = orderDoc.data();
+
+      // Auto-heal: create missing adTransaction for paid wallet deposits
+      if (
+        orderData.paymentStatus === 'paid' &&
+        orderData.isWalletDeposit &&
+        orderData.sellerId
+      ) {
+        const adTxRef = db.collection('adTransactions').doc(paymentRef);
+        const adTxSnap = await adTxRef.get();
+        if (!adTxSnap.exists) {
+          const amount = orderData.totalAmount || 1;
+          await adTxRef.set({
+            paymentRef,
+            sellerId: orderData.sellerId,
+            sellerEmail: orderData.sellerEmail || null,
+            type: 'deposit',
+            amount,
+            status: 'completed',
+            paymentMethod: 'mpesa',
+            mpesaCode: orderData.mpesaReference || 'SYNCED',
+            description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            completedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          console.log(`🔄 Auto-healed missing adTransaction for ${paymentRef}`);
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          ...orderData,
+          status: orderData.paymentStatus === 'paid' ? 'completed' : orderData.paymentStatus,
+          paymentStatus: orderData.paymentStatus
+        }
+      });
+    }
+
+    // 2. Check adTransactions collection
     const adTxDoc = await db.collection('adTransactions').doc(paymentRef).get();
-
     if (adTxDoc.exists) {
       const txData = adTxDoc.data();
       console.log(`✅ Found adTransaction: status=${txData.status}, amount=${txData.amount}`);
       return res.json({ success: true, data: txData });
     }
 
-    // Fallback: check orders collection
-    const orderSnapshot = await db
-      .collection("orders")
-      .where("orderId", "==", paymentRef)
-      .limit(1)
-      .get();
-
-    if (!orderSnapshot.empty) {
-      const orderData = orderSnapshot.docs[0].data();
-      console.log(`✅ Found order: paymentStatus=${orderData.paymentStatus}`);
-      
-      if (orderData.paymentStatus === 'paid' && orderData.isWalletDeposit) {
-        console.log(`🔄 Creating missing adTransaction for ${paymentRef}`);
-        
-        const correctAmount = orderData.totalAmount || 1;
-        
-        await db.collection('adTransactions').doc(paymentRef).set({
-          paymentRef: paymentRef,
-          sellerId: orderData.sellerId,
-          type: 'deposit',
-          amount: correctAmount,
-          status: 'completed',
-          paymentMethod: 'mpesa',
-          mpesaCode: orderData.mpesaReference || 'SYNCED',
-          description: `Ad wallet deposit - KSH ${correctAmount.toFixed(2)}`,
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          completedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        const newTx = await db.collection('adTransactions').doc(paymentRef).get();
-        return res.json({ success: true, data: newTx.data() });
-      }
-      
-      return res.json({ success: true, data: orderData });
-    }
-
     console.log(`❌ No transaction found for ${paymentRef}`);
     return res.status(404).json({ success: false, message: "Transaction not found" });
-    
+
   } catch (error) {
-    console.error("Ad transaction lookup failed:", error);
+    console.error("Transaction lookup failed:", error);
     return res.status(500).json({ success: false, message: "Lookup failed" });
   }
 });
@@ -1882,15 +1248,10 @@ app.post("/api/seller/withdraw", async (req, res) => {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body;
     console.log("📤 Withdrawal Request:", req.body);
 
-    if (!sellerId)
-      return res.status(400).json({ success: false, message: "Missing sellerId" });
+    if (!sellerId) return res.status(400).json({ success: false, message: "Missing sellerId" });
     const amount = parsePositiveNumber(requestedAmount);
-    if (!amount)
-      return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid phone number" });
+    if (!amount) return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone number" });
 
     const minFeeCheck = calculateTotalFee(amount);
     if (amount <= minFeeCheck) {
@@ -1900,8 +1261,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
       });
     }
 
-    const ordersSnap = await db
-      .collection("orders")
+    const ordersSnap = await db.collection("orders")
       .where("involvedSellerIds", "array-contains", sellerId)
       .where("paymentStatus", "==", "paid")
       .get();
@@ -1911,7 +1271,6 @@ app.post("/api/seller/withdraw", async (req, res) => {
       const data = doc.data();
       const items = data.items;
       if (!items) return;
-
       if (Array.isArray(items)) {
         items.forEach((item) => {
           if (item?.sellerId === sellerId) {
@@ -1939,19 +1298,16 @@ app.post("/api/seller/withdraw", async (req, res) => {
     }
 
     const netAvailableRevenue = totalRevenue - totalPreviouslyWithdrawn;
-
     console.log(`💰 Seller ${sellerId} live total revenue: ${totalRevenue.toFixed(2)}`);
     console.log(`💸 Total previously withdrawn: ${totalPreviouslyWithdrawn.toFixed(2)}`);
     console.log(`✅ Net available balance: ${netAvailableRevenue.toFixed(2)}`);
 
-    if (netAvailableRevenue < amount)
-      return res
-        .status(400)
-        .json({ success: false, message: "Insufficient balance" });
+    if (netAvailableRevenue < amount) {
+      return res.status(400).json({ success: false, message: "Insufficient balance" });
+    }
 
     const feeAmount = calculateTotalFee(amount);
     const netPayoutAmount = +(amount - feeAmount).toFixed(2);
-
     if (netPayoutAmount <= 0) {
       return res.status(400).json({
         success: false,
@@ -1961,28 +1317,19 @@ app.post("/api/seller/withdraw", async (req, res) => {
 
     const withdrawalDocRef = db.collection("withdrawals").doc();
     await withdrawalDocRef.set({
-      sellerId,
-      amount,
-      feeAmount,
-      netPayout: netPayoutAmount,
-      phoneNumber,
-      status: "PENDING_PAYOUT",
+      sellerId, amount, feeAmount, netPayout: netPayoutAmount,
+      phoneNumber, status: "PENDING_PAYOUT",
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     let payoutResponse;
     try {
       payoutResponse = await intasend.payouts().mpesa({
-        currency: "KES",
-        requires_approval: "NO",
-        transactions: [
-          {
-            name: "Seller Withdrawal",
-            account: phoneNumber,
-            amount: netPayoutAmount,
-            narrative: "Seller Payout",
-          },
-        ],
+        currency: "KES", requires_approval: "NO",
+        transactions: [{
+          name: "Seller Withdrawal", account: phoneNumber,
+          amount: netPayoutAmount, narrative: "Seller Payout",
+        }],
       });
     } catch (intasendErr) {
       console.error("❌ IntaSend payout failed:", intasendErr?.response || intasendErr);
@@ -1991,9 +1338,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
         intasendError: intasendErr?.response || intasendErr?.message || String(intasendErr),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      return res
-        .status(502)
-        .json({ success: false, message: "Payout provider error" });
+      return res.status(502).json({ success: false, message: "Payout provider error" });
     }
 
     await withdrawalDocRef.update({
@@ -2003,24 +1348,18 @@ app.post("/api/seller/withdraw", async (req, res) => {
       intasendResponse: payoutResponse,
     });
 
-    await db
-      .collection("sellerLedgers")
-      .doc(sellerId)
-      .set(
-        {
-          totalWithdrawn: admin.firestore.FieldValue.increment(amount),
-          lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+    await db.collection("sellerLedgers").doc(sellerId).set(
+      {
+        totalWithdrawn: admin.firestore.FieldValue.increment(amount),
+        lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 
     return res.json({
-      success: true,
-      message: "Withdrawal initiated",
+      success: true, message: "Withdrawal initiated",
       data: {
-        requestedAmount: amount,
-        fee: feeAmount,
-        netPayout: netPayoutAmount,
+        requestedAmount: amount, fee: feeAmount, netPayout: netPayoutAmount,
         trackingId: payoutResponse?.tracking_id || null,
         withdrawalId: withdrawalDocRef.id,
       },
@@ -2035,57 +1374,32 @@ app.post("/api/seller/withdraw", async (req, res) => {
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body;
-    
     if (!email || !userId) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Email and user ID are required' 
-      });
+      return res.status(400).json({ success: false, message: 'Email and user ID are required' });
     }
-
     const userDoc = await db.collection('users').doc(userId).get();
-    
     if (!userDoc.exists) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'User not found' 
-      });
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
-
     const userData = userDoc.data();
-    
     if (userData.email && userData.email !== email) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Email does not match user account' 
-      });
+      return res.status(403).json({ success: false, message: 'Email does not match user account' });
     }
-
     if (!userData.withdrawalPin) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'No PIN is set for this account' 
-      });
+      return res.status(400).json({ success: false, message: 'No PIN is set for this account' });
     }
 
     const replacementCode = generateReplacementCode();
     const codeStored = await storeReplacementCode(userId, email, replacementCode);
-    
     if (!codeStored) {
-      return res.status(500).json({ 
-        success: false, 
-        message: 'Failed to generate recovery code' 
-      });
+      return res.status(500).json({ success: false, message: 'Failed to generate recovery code' });
     }
 
     await db.collection('securityLogs').add({
-      userId: userId,
-      email: email,
-      action: 'PIN_RECOVERY_REQUESTED',
-      codeGenerated: true,
+      userId: userId, email: email,
+      action: 'PIN_RECOVERY_REQUESTED', codeGenerated: true,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      ipAddress: req.ip,
-      userAgent: req.get('User-Agent')
+      ipAddress: req.ip, userAgent: req.get('User-Agent')
     });
 
     const emailHtml = `
@@ -2113,21 +1427,13 @@ app.post("/api/seller/recover-pin", async (req, res) => {
             <div class="logo">MarketMix Kenya</div>
             <h2 style="margin: 10px 0 0 0; font-weight: 300;">Withdrawal PIN Recovery</h2>
           </div>
-          
           <div class="content">
             <h3 style="color: #333; text-align: center; margin-bottom: 10px;">Hello Seller,</h3>
-            <p style="color: #666; text-align: center; margin-bottom: 20px;">
-              You requested to reset your withdrawal PIN. Use the code below to verify your identity.
-            </p>
-            
-            <div class="code-box">
-              ${replacementCode}
-            </div>
-            
+            <p style="color: #666; text-align: center; margin-bottom: 20px;">You requested to reset your withdrawal PIN. Use the code below to verify your identity.</p>
+            <div class="code-box">${replacementCode}</div>
             <div class="timer">
               <p style="margin: 0; color: #666;"><strong>This code expires in 15 minutes</strong></p>
             </div>
-            
             <div class="security-note">
               <h4 style="margin-top: 0; color: #856404;">SECURITY ALERT</h4>
               <ul style="margin-bottom: 0; color: #856404;">
@@ -2137,7 +1443,6 @@ app.post("/api/seller/recover-pin", async (req, res) => {
                 <li>If you didn't request this, contact support immediately</li>
               </ul>
             </div>
-            
             <div class="info-box">
               <h4 style="margin-top: 0; color: #0c5460;">Request Details</h4>
               <p style="margin: 5px 0; color: #0c5460;"><strong>Time:</strong> ${new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</p>
@@ -2145,12 +1450,8 @@ app.post("/api/seller/recover-pin", async (req, res) => {
               <p style="margin: 5px 0; color: #0c5460;"><strong>Account ID:</strong> ${userId.slice(0, 8)}...</p>
               <p style="margin: 5px 0; color: #0c5460;"><strong>Valid Attempts:</strong> 3 attempts remaining</p>
             </div>
-            
-            <p style="text-align: center; color: #666; margin-top: 30px;">
-              Enter this code in the PIN recovery page to reset your withdrawal PIN.
-            </p>
+            <p style="text-align: center; color: #666; margin-top: 30px;">Enter this code in the PIN recovery page to reset your withdrawal PIN.</p>
           </div>
-          
           <div class="footer">
             <p style="margin: 0 0 10px 0;"><strong>MarketMix Kenya</strong></p>
             <p style="margin: 0 0 10px 0; font-size: 12px;">This email was sent from <strong>security@marketmix.site</strong></p>
@@ -2166,114 +1467,64 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       </html>
     `;
 
-    const emailSent = await sendEmail(
-      email,
-      'Your PIN Reset Code - MarketMix Kenya',
-      emailHtml,
-      'security'
-    );
-
+    const emailSent = await sendEmail(email, 'Your PIN Reset Code - MarketMix Kenya', emailHtml, 'security');
     if (!emailSent) {
-      return res.json({ 
-        success: false, 
+      return res.json({
+        success: false,
         message: 'Failed to send PIN recovery code. Please try again or contact support.',
         emailSent: false
       });
     }
-
-    res.json({ 
-      success: true, 
-      message: 'PIN recovery code sent to your email',
+    res.json({
+      success: true, message: 'PIN recovery code sent to your email',
       emailSent: true,
       note: 'Check your inbox and spam folder. The code expires in 15 minutes.'
     });
-
   } catch (error) {
     console.error('❌ PIN recovery error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to process PIN recovery request' 
-    });
+    res.status(500).json({ success: false, message: 'Failed to process PIN recovery request' });
   }
 });
 
 app.post("/api/seller/verify-recovery-code", async (req, res) => {
   try {
     const { userId, code } = req.body;
-    
     if (!userId || !code) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'User ID and code are required' 
-      });
+      return res.status(400).json({ success: false, message: 'User ID and code are required' });
     }
-
     const verification = await verifyReplacementCode(userId, code);
-    
     if (!verification.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        message: verification.message 
-      });
+      return res.status(400).json({ success: false, message: verification.message });
     }
-
     await db.collection('securityLogs').add({
-      userId: userId,
-      email: verification.data.email,
+      userId: userId, email: verification.data.email,
       action: 'PIN_RECOVERY_VERIFIED',
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       ipAddress: req.ip
     });
-
-    res.json({ 
-      success: true, 
-      message: 'Code verified successfully',
-      verified: true
-    });
-
+    res.json({ success: true, message: 'Code verified successfully', verified: true });
   } catch (error) {
     console.error('❌ Code verification error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to verify recovery code' 
-    });
+    res.status(500).json({ success: false, message: 'Failed to verify recovery code' });
   }
 });
 
 app.post("/api/seller/reset-pin", async (req, res) => {
   try {
     const { userId, code, newPin, confirmPin } = req.body;
-    
     if (!userId || !code || !newPin || !confirmPin) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'All fields are required' 
-      });
+      return res.status(400).json({ success: false, message: 'All fields are required' });
     }
-
     if (newPin !== confirmPin) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'PINs do not match' 
-      });
+      return res.status(400).json({ success: false, message: 'PINs do not match' });
     }
-
     if (newPin.length < 4 || !/^\d+$/.test(newPin)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'PIN must be at least 4 digits and contain only numbers' 
-      });
+      return res.status(400).json({ success: false, message: 'PIN must be at least 4 digits and contain only numbers' });
     }
-
     const verification = await verifyReplacementCode(userId, code);
-    
     if (!verification.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        message: verification.message 
-      });
+      return res.status(400).json({ success: false, message: verification.message });
     }
-
     const userRef = db.collection('users').doc(userId);
     await userRef.update({
       withdrawalPin: newPin,
@@ -2281,30 +1532,17 @@ app.post("/api/seller/reset-pin", async (req, res) => {
       pinSetMethod: 'recovery',
       pinLastChanged: admin.firestore.FieldValue.serverTimestamp()
     });
-
     await markCodeAsUsed(userId);
-
     await db.collection('securityLogs').add({
-      userId: userId,
-      email: verification.data.email,
-      action: 'PIN_RESET_SUCCESS',
-      method: 'recovery',
+      userId: userId, email: verification.data.email,
+      action: 'PIN_RESET_SUCCESS', method: 'recovery',
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       ipAddress: req.ip
     });
-
-    res.json({ 
-      success: true, 
-      message: 'PIN reset successfully',
-      reset: true
-    });
-
+    res.json({ success: true, message: 'PIN reset successfully', reset: true });
   } catch (error) {
     console.error('❌ PIN reset error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to reset PIN' 
-    });
+    res.status(500).json({ success: false, message: 'Failed to reset PIN' });
   }
 });
 
@@ -2313,11 +1551,8 @@ app.post("/api/update-stock", async (req, res) => {
   try {
     const { productId, quantity } = req.body;
     if (!productId || typeof quantity !== "number" || quantity <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid product or quantity" });
+      return res.status(400).json({ success: false, message: "Invalid product or quantity" });
     }
-
     const productRef = db.collection("products").doc(productId);
     await db.runTransaction(async (t) => {
       const doc = await t.get(productRef);
@@ -2326,7 +1561,6 @@ app.post("/api/update-stock", async (req, res) => {
       if (currentQuantity < quantity) throw new Error("Not enough stock");
       t.update(productRef, { quantity: currentQuantity - quantity });
     });
-
     return res.json({ success: true, message: "Stock updated successfully" });
   } catch (error) {
     console.error("❌ Stock update failed:", error);
@@ -2341,12 +1575,10 @@ app.post("/api/generate-ai-image", async (req, res) => {
     if (!prompt || typeof prompt !== "string" || prompt.trim().length < 3) {
       return res.status(400).json({ success: false, message: "Invalid prompt" });
     }
-
     if (!process.env.HF_API_KEY) {
       console.error("Missing HF_API_KEY in environment");
       return res.status(500).json({ success: false, message: "Server misconfiguration: HF_API_KEY is missing." });
     }
-
     const hfResponse = await fetch(
       "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
       {
@@ -2356,20 +1588,13 @@ app.post("/api/generate-ai-image", async (req, res) => {
           "Content-Type": "application/json",
           "Accept": "image/png"
         },
-        body: JSON.stringify({ 
-             inputs: prompt,
-             options: { wait_for_model: true }
-        })
+        body: JSON.stringify({ inputs: prompt, options: { wait_for_model: true } })
       }
     );
-
     if (!hfResponse.ok) {
       const status = hfResponse.status;
       let bodyText = "Hugging Face call failed.";
-      try {
-        bodyText = await hfResponse.text();
-      } catch (e) { }
-      
+      try { bodyText = await hfResponse.text(); } catch (e) { }
       console.error(`Hugging Face error ${status}:`, bodyText.slice(0, 300));
       return res.status(502).json({
         success: false,
@@ -2378,21 +1603,18 @@ app.post("/api/generate-ai-image", async (req, res) => {
         providerBody: bodyText.slice(0, 200)
       });
     }
-
     const contentType = hfResponse.headers.get("content-type") || "image/png";
     const arrBuf = await hfResponse.arrayBuffer();
     const imageBuffer = Buffer.from(arrBuf);
     const base64Image = imageBuffer.toString('base64');
     const imageUrl = `data:${contentType};base64,${base64Image}`;
-
     return res.json({ imageUrl: imageUrl, success: true });
-    
   } catch (err) {
     console.error("❌ AI generation error:", err);
-    return res.status(500).json({ 
-        success: false, 
-        message: "AI generation failed due to a server-side error.", 
-        detail: err.message
+    return res.status(500).json({
+      success: false,
+      message: "AI generation failed due to a server-side error.",
+      detail: err.message
     });
   }
 });
@@ -2414,23 +1636,11 @@ app.get("/api/test-email-auth", async (req, res) => {
         }
       });
     }
-
     res.json({
-      success: true,
-      message: "✅ Email authentication configured",
+      success: true, message: "✅ Email authentication configured",
       senders: {
-        security: {
-          name: "MarketMixKenya",
-          email: "security@marketmix.site",
-          purpose: "PIN recovery, security notifications",
-          status: "Verified"
-        },
-        sales: {
-          name: "MarketMixKenya",
-          email: "sales@marketmix.site",
-          purpose: "Order confirmations, customer support, proposal status",
-          status: "Verified"
-        }
+        security: { name: "MarketMixKenya", email: "security@marketmix.site", purpose: "PIN recovery, security notifications", status: "Verified" },
+        sales: { name: "MarketMixKenya", email: "sales@marketmix.site", purpose: "Order confirmations, customer support, proposal status", status: "Verified" }
       },
       authentication: {
         dkim: "Signature configured",
@@ -2439,67 +1649,40 @@ app.get("/api/test-email-auth", async (req, res) => {
         shared_ip: "Brevo shared IP pool"
       }
     });
-    
   } catch (error) {
     console.error('❌ Email auth test error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Email authentication test failed',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Email authentication test failed', error: error.message });
   }
 });
 
 app.post("/api/test-proposal-email", async (req, res) => {
   try {
     const testEmail = req.body.email || 'test@example.com';
-    
     const testData = {
-      to: testEmail,
-      proposalId: 'TEST_' + Date.now(),
-      studentName: 'Test Student',
-      status: 'approved',
+      to: testEmail, proposalId: 'TEST_' + Date.now(),
+      studentName: 'Test Student', status: 'approved',
       notes: 'This is a test email from the MarketMix proposal status system.',
-      amount: 15000,
-      institution: 'University of Nairobi'
+      amount: 15000, institution: 'University of Nairobi'
     };
-
     console.log(`📧 Sending test proposal email to: ${testEmail}`);
-    
     const emailSent = await sendProposalStatusEmail(testData);
-    
     if (emailSent) {
-      res.json({
-        success: true,
-        message: 'Test proposal status email sent successfully',
-        data: {
-          to: testEmail,
-          sentAt: new Date().toISOString(),
-          sender: 'MarketMixKenya <sales@marketmix.site>'
-        }
+      res.json({ success: true, message: 'Test proposal status email sent successfully',
+        data: { to: testEmail, sentAt: new Date().toISOString(), sender: 'MarketMixKenya <sales@marketmix.site>' }
       });
     } else {
-      res.status(500).json({
-        success: false,
-        message: 'Failed to send test email'
-      });
+      res.status(500).json({ success: false, message: 'Failed to send test email' });
     }
   } catch (error) {
     console.error('❌ Test proposal email error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Test email failed',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Test email failed', error: error.message });
   }
 });
 
-// Real estate email test endpoint
 app.post("/api/test-real-estate-email", async (req, res) => {
   try {
     const testEmail = req.body.email || 'test@example.com';
     const testRef = 'PROP_TEST_' + Date.now();
-
     const testData = {
       propertyTitle: 'Spacious Bedsitter - Kilimani',
       propertyLocation: 'Kilimani, Nairobi',
@@ -2510,9 +1693,7 @@ app.post("/api/test-real-estate-email", async (req, res) => {
       landlordName: 'Test Landlord',
       landlordPhone: '254712345678'
     };
-
     const sent = await sendRealEstatePaymentEmail(testData, testEmail, testRef);
-
     if (sent) {
       res.json({ success: true, message: 'Test real estate email sent', to: testEmail });
     } else {
@@ -2556,9 +1737,7 @@ app.get("/_health", (req, res) => {
 });
 
 // 404 fallback
-app.use((req, res) =>
-  res.status(404).json({ success: false, message: "Not Found" })
-);
+app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
 
 // Global error handlers
 process.on("uncaughtException", (err) => {
@@ -2585,7 +1764,6 @@ process.on("unhandledRejection", (reason) => {
   const BASE_INTERVAL_MS = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
   const JITTER_MS = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
   const REQUEST_TIMEOUT_MS = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
-
   const PAUSE_START_HOUR = 23;
   const PAUSE_END_HOUR = 5;
 
@@ -2607,9 +1785,7 @@ process.on("unhandledRejection", (reason) => {
       clearTimeout(keepAliveTimeout);
       keepAliveTimeout = null;
     }
-
     const isPauseTime = isOvernightPause();
-    
     if (isPauseTime) {
       if (!isPaused) {
         isPaused = true;
@@ -2621,34 +1797,24 @@ process.on("unhandledRejection", (reason) => {
       if (keepAliveTimeout.unref) keepAliveTimeout.unref();
       return;
     }
-
     if (isPaused) {
       isPaused = false;
       console.log(`☀️ Exiting overnight pause mode - Resuming keep-alive pings`);
     }
-
     const jitter = Math.floor(Math.random() * (JITTER_MS * 2 + 1)) - JITTER_MS;
     const delay = Math.max(1000, BASE_INTERVAL_MS + jitter);
-
     keepAliveTimeout = setTimeout(() => {
       if (!isOvernightPause()) {
         try {
           const options = {
-            host: "127.0.0.1",
-            port: PORT,
-            path: "/_health",
-            method: "GET",
-            timeout: REQUEST_TIMEOUT_MS,
+            host: "127.0.0.1", port: PORT, path: "/_health",
+            method: "GET", timeout: REQUEST_TIMEOUT_MS,
           };
-
           const req = http.request(options, (res) => {
             res.on("data", () => {});
             res.on("end", () => {});
           });
-
-          req.on("timeout", () => {
-            try { req.destroy(); } catch (e) {}
-          });
+          req.on("timeout", () => { try { req.destroy(); } catch (e) {} });
           req.on("error", () => {});
           req.end();
         } catch (err) {
@@ -2657,12 +1823,10 @@ process.on("unhandledRejection", (reason) => {
       }
       scheduleNext();
     }, delay);
-
     if (keepAliveTimeout.unref) keepAliveTimeout.unref();
   };
 
   scheduleNext();
-
   console.log(`🌀 Smart keep-alive initialized with overnight pause (${PAUSE_START_HOUR}:00 - ${PAUSE_END_HOUR}:00 EAT)`);
   console.log(`   Ping interval: ~${BASE_INTERVAL_MS / 1000}s ±${JITTER_MS / 1000}s`);
   console.log(`   Overnight pause: 11 PM - 5 AM (East African Time)`);
