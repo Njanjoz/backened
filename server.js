@@ -3,6 +3,7 @@
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
 // Uses only existing env vars.
+// Emails can optionally mirror to WhatsApp by passing a phone number.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -116,9 +117,9 @@ const SENDERS = {
   moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "support@marketmix.site" },
 };
 
-const sendEmail = async (to, subject, html, type = "security") => {
+const sendEmail = async (to, subject, html, type = "security", phone = null) => {
   try {
-    console.log("📧 Sending email:", { to, subject, type });
+    console.log("📧 Sending email:", { to, subject, type, phone: phone || "—" });
     if (!BREVO_API_KEY) {
       console.log("❌ BREVO_API_KEY not configured");
       return false;
@@ -147,6 +148,32 @@ const sendEmail = async (to, subject, html, type = "security") => {
       throw new Error(data.message || `Brevo API error: ${response.status}`);
     }
     console.log(`✅ Email sent (id=${data.messageId}) from ${sender.email}`);
+
+    // Mirror to WhatsApp if a phone was provided
+    if (phone) {
+      const emoji =
+        type === "bookings" ? "🏠" :
+        type === "moving" ? "🚚" :
+        type === "security" ? "🔐" : "🛍️";
+      const brand =
+        type === "bookings" ? "MarketMix Real Estates" :
+        type === "moving" ? "MarketMix Moving" : "MarketMix Kenya";
+
+      const plain = String(html)
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 220);
+
+      enqueueWhatsApp(phone, `${emoji} ${brand}\n${subject}\n\n${plain}`, {
+        kind: `companion-${type}`,
+        emailTo: to,
+      });
+    }
+
     return true;
   } catch (error) {
     console.error("❌ Email sending failed:", error.message);
@@ -465,7 +492,8 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       userEmail,
       `Order Confirmation #${String(orderId).slice(0, 8)} - MarketMix Kenya`,
       html,
-      "sales"
+      "sales",
+      orderData.shippingDetails?.phoneNumber || orderData.phoneNumber || null
     );
 
     if (ok) {
@@ -530,7 +558,8 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
       userEmail,
       `Payment Confirmed - ${data.propertyTitle || "Property"} (${displayId})`,
       html,
-      "bookings"
+      "bookings",
+      null // real-estate already fires dedicated WhatsApps in the callback
     );
 
     if (ok) {
@@ -611,7 +640,8 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
       userEmail,
       `Your move is ${statusLabel} · MarketMix Moving #${String(requestId).slice(0, 8)}`,
       html,
-      "moving"
+      "moving",
+      null // moving notify endpoint already sends dedicated WhatsApp
     );
 
     if (ok) {
