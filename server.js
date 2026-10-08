@@ -1225,6 +1225,158 @@ app.post("/api/driver/decision", async (req, res) => {
 });
 
 // ============================
+// WhatsApp notify — generic (used by admin pages)
+// ============================
+app.post("/api/whatsapp/notify", async (req, res) => {
+  try {
+    const { phone, title, message } = req.body || {};
+    if (!phone || !message) {
+      return res.status(400).json({ success: false, message: "phone and message required" });
+    }
+    const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
+    const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
+    if (!queued) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+    return res.json({ success: true, queued: true, phone: normalizePhoneForWa(phone) });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/notify failed:", e);
+    return sendServerError(res, e, "WhatsApp notify failed");
+  }
+});
+
+// ============================
+// Service request update → notify customer
+// ============================
+app.post("/api/service-request/notify", async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
+
+    let snap = await db.collection("serviceRequests").doc(requestId).get();
+    let sourceDb = "shop";
+    if (!snap.exists) {
+      snap = await reDb.collection("serviceRequests").doc(requestId).get();
+      sourceDb = "realestate";
+    }
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const d = snap.data() || {};
+    const phone = d.userPhone || d.phoneNumber || null;
+    const email = d.userEmail || d.email || null;
+    const status = String(d.status || "new").toUpperCase();
+    const note = d.adminNote || "";
+    const label = d.packageTitle || d.packageId || "Move-in request";
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (phone) {
+      whatsappQueued = enqueueWhatsApp(
+        phone,
+        `🏠 MarketMix Real Estates\n${label}\nStatus: ${status}${note ? `\n\nNote: ${note}` : ""}`,
+        { kind: "service-request-update", requestId, sourceDb }
+      );
+    }
+
+    if (email) {
+      const html = marketMixEmailShell({
+        preheader: `${label} · ${status}`,
+        eyebrow: "MarketMix Real Estates",
+        title: `${label} update`,
+        subtitle: `Status: ${status}`,
+        bodyHtml: `
+          ${emailSectionLabel("Update")}
+          ${emailInfoCard([
+            ["Request", label],
+            ["Status", status, true],
+            ["Area", d.area || "—"],
+          ])}
+          ${note ? emailBodyText(`<strong>Note from our team:</strong><br/>${note}`) : ""}
+        `,
+        ctaLabel: "Open MarketMix",
+        ctaUrl: REAL_ESTATE_APP_URL,
+      });
+      emailSent = await sendEmail(email, `${label} · ${status}`, html, "bookings");
+    }
+
+    try {
+      await reDb.collection("serviceRequestNotifications").add({
+        requestId, sourceDb, phone, email, whatsappQueued, emailSent, status, note,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
+  } catch (e) {
+    console.error("❌ service-request/notify failed:", e);
+    return sendServerError(res, e, "Service request notify failed");
+  }
+});
+
+// ============================
+// Moving request update → notify customer
+// ============================
+app.post("/api/moving/notify", async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
+
+    let snap = await reDb.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) snap = await db.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const d = snap.data() || {};
+    const phone = d.userPhone || d.phoneNumber || d.user?.phone || null;
+    const email = d.userEmail || d.email || null;
+    const statusLabel = String(d.status || "REQUESTED").replace(/_/g, " ").toLowerCase();
+    const quote = d.quotedPrice != null ? `KSh ${Number(d.quotedPrice).toLocaleString("en-KE")}` : "Pending";
+    const driver = d.driverName ? `${d.driverName}${d.driverPhone ? ` · ${d.driverPhone}` : ""}` : "Not yet assigned";
+    const vehicle = d.vehicleLabel || "—";
+    const eta = d.etaMinutes != null ? `${d.etaMinutes} min` : "—";
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (phone) {
+      whatsappQueued = enqueueWhatsApp(
+        phone,
+        `🚚 MarketMix Moving\nStatus: ${statusLabel.toUpperCase()}\nQuote: ${quote}\nDriver: ${driver}\nVehicle: ${vehicle}\nETA: ${eta}\nTrack: ${MOVING_URL}`,
+        { kind: "moving-admin-update", requestId: snap.id }
+      );
+    }
+
+    if (email) {
+      const html = marketMixEmailShell({
+        preheader: `Your move is ${statusLabel}`,
+        eyebrow: "MarketMix Moving",
+        title: "Move update",
+        subtitle: `Status: ${statusLabel}`,
+        bodyHtml: `
+          ${emailSectionLabel("Update")}
+          ${emailInfoCard([
+            ["Status", statusLabel.toUpperCase(), true],
+            ["Quote", quote],
+            ["Driver", driver],
+            ["Vehicle", vehicle],
+            ["ETA", eta],
+          ])}
+          ${emailBodyText("Open the tracking page for live updates.")}
+        `,
+        ctaLabel: "Open tracking page",
+        ctaUrl: MOVING_URL,
+      });
+      emailSent = await sendEmail(email, `Move update · ${statusLabel}`, html, "moving");
+    }
+
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
+  } catch (e) {
+    console.error("❌ moving/notify failed:", e);
+    return sendServerError(res, e, "Moving notify failed");
+  }
+});
+
+// ============================
 // IntaSend callback
 // ============================
 app.post("/api/intasend-callback", async (req, res) => {
@@ -1856,6 +2008,9 @@ app.get("/_health", (req, res) => {
     senders: SENDERS,
     whatsappQueue: waQueue.length,
     endpoints: [
+      "/api/whatsapp/notify",
+      "/api/service-request/notify",
+      "/api/moving/notify",
       "/api/stk-push",
       "/api/store/seed",
       "/api/real-estate/seed",
@@ -1930,6 +2085,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚚 Moving URL: ${MOVING_URL}`);
   console.log(`🧑‍✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
   console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
+  console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/service-request/notify, /api/moving/notify)`);
 });
 
 const shutdown = () => {
