@@ -129,11 +129,20 @@ const intasend = new IntaSend(
 );
 
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
+
+// Real Estates receipt page
 const REAL_ESTATE_RECEIPT_URL =
   process.env.REAL_ESTATE_RECEIPT_URL ||
   "https://marketmix-realestates.vercel.app/receipt";
-const MARKETPLACE_URL = "https://marketmix.site";
-const MOVING_URL = "https://marketmix.site/transport";
+
+// Shop frontend (order receipts, proposals, marketplace)
+const MARKETPLACE_URL = "https://my-campus-store-frontend.vercel.app";
+
+// Real Estates frontend (driver, transport/moving, room bookings)
+const REAL_ESTATE_APP_URL = "https://marketmix-realestates.vercel.app";
+const MOVING_URL = `${REAL_ESTATE_APP_URL}/`;
+const DRIVER_DASHBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
+const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 
 // ============================
 // Brevo senders
@@ -1347,7 +1356,7 @@ app.post("/api/driver/decision", async (req, res) => {
             ${emailBodyText("Open the driver dashboard to see live offers and manage trips.")}
           `,
           ctaLabel: "Open driver dashboard",
-          ctaUrl: "https://marketmix.site/transport/driver",
+          ctaUrl: DRIVER_DASHBOARD_URL,
           footerNote: "Questions? Reply to this email and we'll help.",
         });
         sendEmail(driverEmail, "You're approved · MarketMix Moving", html, "moving")
@@ -1355,7 +1364,7 @@ app.post("/api/driver/decision", async (req, res) => {
       }
       if (driverPhone) {
         enqueueWhatsApp(driverPhone,
-          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: https://marketmix.site/transport/driver`,
+          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: ${DRIVER_DASHBOARD_URL}`,
           { kind: "driver-approved", userId }
         );
       }
@@ -1373,7 +1382,7 @@ app.post("/api/driver/decision", async (req, res) => {
             ${emailBodyText("If you believe this is a mistake, reply to this email and we'll review again.")}
           `,
           ctaLabel: "Update my details",
-          ctaUrl: "https://marketmix.site/transport/driver/onboard",
+          ctaUrl: DRIVER_ONBOARD_URL,
           footerNote: "MarketMix Kenya · support@marketmix.site",
         });
         sendEmail(driverEmail, "Update on your driver application · MarketMix Moving", html, "moving")
@@ -1381,7 +1390,7 @@ app.post("/api/driver/decision", async (req, res) => {
       }
       if (driverPhone) {
         enqueueWhatsApp(driverPhone,
-          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at /transport/driver/onboard`,
+          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at ${DRIVER_ONBOARD_URL}`,
           { kind: "driver-rejected", userId }
         );
       }
@@ -2016,6 +2025,14 @@ app.get("/_health", (req, res) => {
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
+    urls: {
+      marketplace: MARKETPLACE_URL,
+      realEstateApp: REAL_ESTATE_APP_URL,
+      realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
+      moving: MOVING_URL,
+      driverDashboard: DRIVER_DASHBOARD_URL,
+      driverOnboard: DRIVER_ONBOARD_URL,
+    },
     senders: SENDERS,
     whatsappQueue: waQueue.length,
     endpoints: [
@@ -2099,6 +2116,9 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"} — queued (cold ${WAHA_TIMEOUT_MS}ms / warm ${WAHA_COLD_GRACE_MS}ms)`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
+  console.log(`🛍️ Shop frontend: ${MARKETPLACE_URL}`);
+  console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
+  console.log(`🚚 Moving URL: ${MOVING_URL}`);
   console.log(`📦 Store: ✅ email + WhatsApp`);
   console.log(`🏠 Real estate: ✅ email + WhatsApp (buyer + landlord)`);
   console.log(`🚚 Moving: ✅ email + WhatsApp`);
