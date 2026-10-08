@@ -1,6 +1,7 @@
 // server.js — MarketMix backend
 // Real-estate site (marketmix-realestates.vercel.app) uses the M-Pesa ref as the customer-facing ID.
 // Nothing else (store, wallet, subscription, moving, PIN) is affected.
+// WhatsApp (WAHA) integration is isolated to real-estate endpoints only.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -172,6 +173,63 @@ const sendEmail = async (to, subject, html, type = "security") => {
 })();
 
 // ============================
+// WhatsApp (WAHA) — real-estate only
+// ============================
+const WAHA_URL = process.env.WAHA_URL;
+const WAHA_API_KEY = process.env.WAHA_API_KEY;
+
+async function wahaFetch(path, opts = {}) {
+  if (!WAHA_URL) throw new Error("WAHA_URL not configured");
+  return fetch(`${WAHA_URL}${path}`, {
+    ...opts,
+    headers: {
+      "X-Api-Key": WAHA_API_KEY || "",
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
+  });
+}
+
+const sendWhatsApp = async (phoneNumber, message) => {
+  if (!WAHA_URL || !WAHA_API_KEY) {
+    console.log("⚠️ WAHA not configured, skipping WhatsApp");
+    return false;
+  }
+  try {
+    const chatId = `${String(phoneNumber).replace(/\D/g, "")}@c.us`;
+    const res = await wahaFetch("/api/sendText", {
+      method: "POST",
+      body: JSON.stringify({ session: "default", chatId, text: message }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error("❌ WAHA send failed:", res.status, data);
+      return false;
+    }
+    console.log(`📱 WhatsApp sent to ${phoneNumber}`);
+    return true;
+  } catch (e) {
+    console.error("❌ WAHA error:", e.message);
+    return false;
+  }
+};
+
+// Keep WAHA awake on Render free tier
+(function pingWaha() {
+  if (!WAHA_URL) {
+    console.log("🛑 WAHA ping disabled (WAHA_URL not set)");
+    return;
+  }
+  const INTERVAL = 4 * 60 * 1000;
+  const ping = () => {
+    wahaFetch("/health").catch(() => {});
+    setTimeout(ping, INTERVAL).unref?.();
+  };
+  setTimeout(ping, 30 * 1000).unref?.();
+  console.log("🌀 WAHA keep-alive active (every 4 min)");
+})();
+
+// ============================
 // Helpers
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
@@ -272,7 +330,7 @@ const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
 // ============================
-// Order confirmation email (store) — unchanged
+// Order confirmation email (store)
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -346,7 +404,7 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
     if (!BREVO_API_KEY) return false;
 
     const mpesaRef = data.mpesaReference || data.mpesaCode || "—";
-    const displayId = mpesaRef; // customer-facing ID = M-Pesa ref
+    const displayId = mpesaRef;
     const amount = Number(data.totalAmount || data.amount || 0);
 
     const bodyHtml = `
@@ -408,7 +466,7 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
 };
 
 // ============================
-// Moving confirmation email — unchanged
+// Moving confirmation email
 // ============================
 const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   try {
@@ -777,6 +835,103 @@ app.post("/api/real-estate/seed", async (req, res) => {
 });
 
 // ============================
+// REAL-ESTATE WhatsApp endpoints (WAHA)
+// ============================
+
+app.post("/api/real-estate/notify", async (req, res) => {
+  try {
+    const { phoneNumber, message, kind = "general" } = req.body || {};
+    if (!phoneNumber || !message) {
+      return res.status(400).json({ success: false, message: "phoneNumber and message required" });
+    }
+    const ok = await sendWhatsApp(phoneNumber, message);
+    if (ok) {
+      await db.collection("realEstateWhatsAppLogs").add({
+        phoneNumber, message, kind,
+        status: "sent",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return res.json({ success: ok });
+  } catch (e) {
+    return sendServerError(res, e, "Real-estate WhatsApp notify failed");
+  }
+});
+
+app.get("/api/real-estate/whatsapp/status", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/sessions/default");
+    if (r.status === 404) return res.json({ success: true, status: "NOT_STARTED" });
+    const data = await r.json();
+    return res.json({ success: true, status: data.status || "UNKNOWN" });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.post("/api/real-estate/whatsapp/start", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/sessions/start", {
+      method: "POST",
+      body: JSON.stringify({ name: "default" }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.json({ success: r.ok, data });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.post("/api/real-estate/whatsapp/stop", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/sessions/default/stop", { method: "POST" });
+    return res.json({ success: r.ok });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.post("/api/real-estate/whatsapp/restart", async (req, res) => {
+  try {
+    await wahaFetch("/api/sessions/default/logout", { method: "POST" }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 1500));
+    const r = await wahaFetch("/api/sessions/start", {
+      method: "POST",
+      body: JSON.stringify({ name: "default" }),
+    });
+    return res.json({ success: r.ok });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.get("/api/real-estate/whatsapp/qr", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/default/auth/qr", {
+      headers: { Accept: "image/png" },
+    });
+    if (!r.ok) return res.status(404).json({ success: false, message: "QR not ready" });
+    const buf = Buffer.from(await r.arrayBuffer());
+    return res.json({ success: true, qr: `data:image/png;base64,${buf.toString("base64")}` });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.post("/api/real-estate/whatsapp/send-test", async (req, res) => {
+  try {
+    const { phoneNumber, message } = req.body || {};
+    if (!phoneNumber || !message) {
+      return res.status(400).json({ success: false, message: "phoneNumber and message required" });
+    }
+    const ok = await sendWhatsApp(phoneNumber, message);
+    return res.json({ success: ok });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ============================
 // MOVING endpoints
 // ============================
 app.post("/api/moving/notify", async (req, res) => {
@@ -1067,6 +1222,21 @@ app.post("/api/intasend-callback", async (req, res) => {
           sendRealEstatePaymentEmail(payload, userEmail, api_ref)
             .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
             .catch((e) => console.error("RE email error:", e));
+
+          // Real-estate WhatsApp notifications
+          const buyerPhone = orderData.shippingDetails?.phoneNumber || orderData.phoneNumber;
+          if (buyerPhone) {
+            sendWhatsApp(
+              buyerPhone,
+              `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${Number(orderData.totalAmount || callbackAmount || 0).toLocaleString()}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}`
+            ).catch(() => {});
+          }
+          if (orderData.landlordPhone) {
+            sendWhatsApp(
+              orderData.landlordPhone,
+              `🏠 MarketMix Real Estates\nNew payment received for ${orderData.propertyTitle || "your property"}\nAmount: KES ${Number(orderData.totalAmount || callbackAmount || 0).toLocaleString()}\nRef: ${mpesa_reference || "—"}`
+            ).catch(() => {});
+          }
         } else {
           sendOrderConfirmationEmail(orderData, userEmail, api_ref)
             .then((ok) => console.log(ok ? `✅ Confirmation sent for ${api_ref}` : `❌ Confirmation failed for ${api_ref}`))
@@ -1084,7 +1254,6 @@ app.post("/api/intasend-callback", async (req, res) => {
 
 // ============================
 // Universal transaction lookup
-// — includes real-estate fallback by M-Pesa ref
 // ============================
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
@@ -1486,12 +1655,19 @@ app.get("/_health", (req, res) => {
   res.json({
     ok: true,
     timestamp: Date.now(),
-    services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true },
+    services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     senders: SENDERS,
     endpoints: [
       "/api/stk-push",
       "/api/store/seed",
       "/api/real-estate/seed",
+      "/api/real-estate/notify",
+      "/api/real-estate/whatsapp/status",
+      "/api/real-estate/whatsapp/start",
+      "/api/real-estate/whatsapp/stop",
+      "/api/real-estate/whatsapp/restart",
+      "/api/real-estate/whatsapp/qr",
+      "/api/real-estate/whatsapp/send-test",
       "/api/moving/notify",
       "/api/moving/request",
       "/api/moving/request/:id",
@@ -1559,9 +1735,10 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
+  console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
   console.log(`📦 Store: ✅ (ORD_ / TEST_PAY_)`);
-  console.log(`🏠 Real estate: ✅ (PROP_, M-Pesa ref as ID)`);
+  console.log(`🏠 Real estate: ✅ (PROP_, M-Pesa ref as ID, WhatsApp enabled)`);
   console.log(`🚚 Moving: ✅ (MOVE_)`);
   console.log(`💰 Subscriptions: ✅ (SUB_)`);
   console.log(`🪙 Wallet: ✅ (WALLET_)`);
