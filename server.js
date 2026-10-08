@@ -53,7 +53,7 @@ app.use(cors({
 // ============================
 // Middleware
 // ============================
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "15mb" }));
 
 app.use((req, res, next) => {
   try {
@@ -241,6 +241,9 @@ const WAHA_API_KEY = process.env.WAHA_API_KEY;
 const WAHA_TIMEOUT_MS = 8000;
 const WAHA_COLD_GRACE_MS = 30000;
 
+const WAHA_SEND_IMAGE_PATH = "/api/sendImage";
+const WAHA_SEND_FILE_PATH  = "/api/sendFile";
+
 async function wahaFetch(path, opts = {}) {
   if (!WAHA_URL) throw new Error("WAHA_URL not configured");
   const timeoutMs = opts.timeoutMs ?? WAHA_TIMEOUT_MS;
@@ -293,12 +296,35 @@ function enqueueWhatsApp(phoneNumber, message, meta = {}) {
   }
   waQueue.push({
     phone: normalized,
+    kind: "text",
     message,
     meta,
     attempts: 0,
     enqueuedAt: Date.now(),
   });
   console.log(`📥 WA queued → ${normalized} (queue size ${waQueue.length})`, meta);
+  drainWaQueue();
+  return true;
+}
+
+// Image jobs go through the same queue so retries/cold-WAHA grace apply.
+function enqueueWhatsAppImage(phoneNumber, imageUrl, caption = "", meta = {}) {
+  const normalized = normalizePhoneForWa(phoneNumber);
+  if (!normalized) {
+    console.log("⚠️ WA image skipped — invalid phone:", phoneNumber, meta);
+    return false;
+  }
+  waQueue.push({
+    phone: normalized,
+    kind: "image",
+    imageUrl,
+    caption,
+    message: caption,
+    meta: { ...meta, kind: meta.kind || "image" },
+    attempts: 0,
+    enqueuedAt: Date.now(),
+  });
+  console.log(`🖼️ WA image queued → ${normalized} (queue size ${waQueue.length})`, meta);
   drainWaQueue();
   return true;
 }
@@ -332,9 +358,36 @@ async function attemptWaSend(job) {
     console.log("⚠️ WAHA not configured, dropping queued message");
     return true;
   }
-  const timeoutMs = timeoutForAttempt(job.attempts);
+  // Image uploads need longer than plain text
+  const timeoutMs = job.kind === "image"
+    ? Math.max(timeoutForAttempt(job.attempts), 20000)
+    : timeoutForAttempt(job.attempts);
+
   try {
     const chatId = `${job.phone}@c.us`;
+
+    if (job.kind === "image" && job.imageUrl) {
+      const res = await wahaFetch(WAHA_SEND_IMAGE_PATH, {
+        method: "POST",
+        timeoutMs,
+        body: JSON.stringify({
+          session: "default",
+          chatId,
+          file: job.imageUrl.startsWith("data:")
+            ? { mimetype: "image/jpeg", filename: "image.jpg", data: job.imageUrl.split(",")[1] }
+            : { url: job.imageUrl },
+          caption: job.caption || "",
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error(`❌ WAHA image failed (${res.status}, attempt ${job.attempts + 1}) → ${job.phone}`, data);
+        return false;
+      }
+      console.log(`🖼️ WhatsApp image sent → ${job.phone} (attempt ${job.attempts + 1})`);
+      return true;
+    }
+
     const res = await wahaFetch("/api/sendText", {
       method: "POST",
       timeoutMs,
@@ -358,6 +411,72 @@ async function attemptWaSend(job) {
 }
 
 const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
+
+// Direct (non-queued) helpers used by the paced bulk sender so we can
+// accurately report per-recipient results.
+async function wahaSendImage({ phone, imageUrl, caption, filename }) {
+  const normalized = normalizePhoneForWa(phone);
+  if (!normalized) throw new Error(`Invalid phone: ${phone}`);
+  const chatId = `${normalized}@c.us`;
+
+  const body = {
+    session: "default",
+    chatId,
+    file: imageUrl.startsWith("data:")
+      ? { mimetype: "image/jpeg", filename: filename || "image.jpg", data: imageUrl.split(",")[1] }
+      : { url: imageUrl, filename: filename || undefined },
+    caption: caption || "",
+  };
+
+  const res = await wahaFetch(WAHA_SEND_IMAGE_PATH, {
+    method: "POST",
+    timeoutMs: WAHA_COLD_GRACE_MS,
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data?.message || `WAHA sendImage failed (${res.status})`);
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+  return data;
+}
+
+async function wahaSendFile({ phone, fileUrl, filename, caption }) {
+  const normalized = normalizePhoneForWa(phone);
+  if (!normalized) throw new Error(`Invalid phone: ${phone}`);
+  const chatId = `${normalized}@c.us`;
+
+  const body = {
+    session: "default",
+    chatId,
+    file: fileUrl.startsWith("data:")
+      ? { mimetype: "application/octet-stream", filename: filename || "file.bin", data: fileUrl.split(",")[1] }
+      : { url: fileUrl, filename: filename || undefined },
+    caption: caption || "",
+  };
+
+  const res = await wahaFetch(WAHA_SEND_FILE_PATH, {
+    method: "POST",
+    timeoutMs: WAHA_COLD_GRACE_MS,
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data?.message || `WAHA sendFile failed (${res.status})`);
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+  return data;
+}
+
+function personalizeBulkMessage(template, { name } = {}) {
+  let msg = String(template || "");
+  if (name) msg = msg.replace(/\{\{\s*name\s*\}\}/gi, name);
+  return msg.replace(/[ \t]+\n/g, "\n").trim();
+}
 
 (function pingWaha() {
   if (!WAHA_URL) {
@@ -690,7 +809,6 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
 
 // ============================
 // Real Estates — welcome email (signup + role switch)
-// Copy is supplied by the frontend (label, desc, perks) — no roles defined here.
 // ============================
 const sendRealEstateWelcomeEmail = async ({
   userEmail,
@@ -1071,7 +1189,6 @@ app.post("/api/real-estate/seed", async (req, res) => {
 
 // ============================
 // Real Estates — welcome (signup + role switch)
-// Frontend sends roleLabel / roleDesc / rolePerks from its own constants.
 // ============================
 app.post("/api/re/welcome", async (req, res) => {
   try {
@@ -1147,6 +1264,116 @@ app.post("/api/re/welcome", async (req, res) => {
 });
 
 // ============================
+// WhatsApp bulk — paced text + optional image/file (WAHA)
+// ============================
+app.post("/api/whatsapp/send-media", async (req, res) => {
+  try {
+    const {
+      recipients = [],
+      message = "",
+      mediaUrl = null,
+      mediaType = "image",
+      filename = null,
+      pace = "safe",
+      dryRun = false,
+    } = req.body || {};
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ success: false, message: "recipients[] required" });
+    }
+    if (!message && !mediaUrl) {
+      return res.status(400).json({ success: false, message: "message or mediaUrl required" });
+    }
+    if (recipients.length > 300) {
+      return res.status(400).json({ success: false, message: "Max 300 recipients per batch" });
+    }
+
+    const PACE = {
+      safe:   { base: 6000, jitter: 0.35 },
+      normal: { base: 4000, jitter: 0.30 },
+      fast:   { base: 2500, jitter: 0.25 },
+    };
+    const { base, jitter } = PACE[pace] || PACE.safe;
+    const delay = () => base + Math.floor(base * jitter * (Math.random() * 2 - 1));
+
+    const results = [];
+    const startedAt = Date.now();
+
+    for (let i = 0; i < recipients.length; i++) {
+      const r = recipients[i] || {};
+      const phone = r.phone;
+      const name = r.name || null;
+      const text = personalizeBulkMessage(message, { name });
+
+      if (dryRun) {
+        results.push({
+          phone, name,
+          status: "validated",
+          message: text.slice(0, 120) + (text.length > 120 ? "…" : ""),
+        });
+        continue;
+      }
+
+      try {
+        if (mediaUrl) {
+          const sender = mediaType === "file" ? wahaSendFile : wahaSendImage;
+          await sender({
+            phone,
+            ...(mediaType === "file" ? { fileUrl: mediaUrl } : { imageUrl: mediaUrl }),
+            caption: text,
+            filename,
+          });
+        } else {
+          enqueueWhatsApp(phone, text, { kind: "bulk-text" });
+        }
+        results.push({ phone, name, status: "sent" });
+        console.log(`📤 Bulk ${i + 1}/${recipients.length} → ${phone}`);
+      } catch (e) {
+        results.push({
+          phone, name,
+          status: "failed",
+          error: e.message || "send failed",
+        });
+        console.error(`❌ Bulk fail → ${phone}:`, e.message);
+      }
+
+      if (i < recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delay()));
+      }
+    }
+
+    const sent = results.filter((x) => x.status === "sent").length;
+    const failed = results.filter((x) => x.status === "failed").length;
+
+    await reDb.collection("bulkWhatsAppLogs").add({
+      total: recipients.length,
+      sent,
+      failed,
+      pace,
+      mediaType: mediaUrl ? mediaType : "text",
+      mediaUrl: mediaUrl || null,
+      messagePreview: String(message).slice(0, 300),
+      durationMs: Date.now() - startedAt,
+      results,
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      total: recipients.length,
+      sent,
+      failed,
+      dryRun: !!dryRun,
+      durationMs: Date.now() - startedAt,
+      results,
+    });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/send-media failed:", e);
+    return sendServerError(res, e, "Bulk WhatsApp send failed");
+  }
+});
+
+// ============================
 // ADMIN → USER NOTIFICATION
 // ============================
 app.post("/api/admin/notify-user", async (req, res) => {
@@ -1188,7 +1415,6 @@ app.post("/api/admin/notify-user", async (req, res) => {
       return res.status(403).json({ success: false, message: "Admin access required" });
     }
 
-    // Resolve target — prefer Real Estate Firestore, fall back to Shop Firestore
     let target = null;
     let targetDb = "realestate";
 
@@ -2176,6 +2402,7 @@ app.get("/_health", (req, res) => {
     whatsappQueue: waQueue.length,
     endpoints: [
       "/api/whatsapp/notify",
+      "/api/whatsapp/send-media",
       "/api/service-request/notify",
       "/api/moving/notify",
       "/api/re/welcome",
@@ -2253,7 +2480,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚚 Moving URL: ${MOVING_URL}`);
   console.log(`🧑‍✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
   console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
-  console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/service-request/notify, /api/moving/notify)`);
+  console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/whatsapp/send-media, /api/service-request/notify, /api/moving/notify)`);
   console.log(`👋 Real Estates welcome: ✅ (/api/re/welcome)`);
 });
 
