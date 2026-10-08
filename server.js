@@ -113,7 +113,7 @@ const SENDERS = {
   sales:    { name: "MarketMix Kenya",        email: process.env.SENDER_SALES    || "sales@marketmix.site" },
   security: { name: "MarketMix Kenya",        email: process.env.SENDER_SECURITY || "security@marketmix.site" },
   bookings: { name: "MarketMix Real Estates", email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
-  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "support@marketmix.site" },
+  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "marketmixkenya@gmail.com" },
 };
 
 const sendEmail = async (to, subject, html, type = "security") => {
@@ -387,7 +387,7 @@ const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", titl
         </td></tr>
         <tr><td style="padding:20px 12px 0 12px;text-align:center;font-size:11px;line-height:1.6;color:#64748b;">
           MarketMix Kenya © ${new Date().getFullYear()}<br/>
-          <a href="mailto:support@marketmix.site" style="color:#047857;text-decoration:none;">support@marketmix.site</a>
+          <a href="mailto:marketmixkenya@gmail.com" style="color:#047857;text-decoration:none;">marketmixkenya@gmail.com</a>
         </td></tr>
       </table>
     </td></tr>
@@ -1025,8 +1025,6 @@ app.post("/api/real-estate/whatsapp/send-test", async (req, res) => {
 // MOVING endpoints
 // ============================
 
-// Fires email + WhatsApp to the customer when admin updates a move request.
-// Only needs { requestId } — reads everything else from Firestore.
 app.post("/api/moving/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
@@ -1055,7 +1053,6 @@ app.post("/api/moving/notify", async (req, res) => {
     const statusLabel = String(status).replace(/_/g, " ").toLowerCase();
     const quote = Number(data.quotedPrice || 0);
 
-    // Email (non-blocking)
     if (email) {
       sendMovingConfirmationEmail({
         userName: data.userName,
@@ -1074,7 +1071,6 @@ app.post("/api/moving/notify", async (req, res) => {
         .catch((e) => console.error("Moving notify email error:", e));
     }
 
-    // WhatsApp (queued)
     if (phone) {
       const lines = [
         "🚚 MarketMix Moving",
