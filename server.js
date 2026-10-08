@@ -1,2092 +1,1941 @@
+// server.js — MarketMix backend
+// Real-estate site uses M-Pesa ref as the customer-facing ID.
+// WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
+// WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
+// Uses only existing env vars.
+// Emails can optionally mirror to WhatsApp by passing a phone number.
+// Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
+// Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
 
-ADMIN@DESKTOP-2NOEEN2 MINGW64 ~/Desktop/marketmix real estate/marketmix-realestates (main)
-$ sed -n '1,200p' src/components/dashboards/AdminDashboard.jsx | head -n 200
-// src/components/dashboards/AdminDashboard.jsx - FULL FIXED & ENHANCED VERSION WITH ALL PAGES EDITOR (HOME, EXPLORE, ABOUT, AGENTS)
-import React, { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import {
-  Users, Building, BarChart, TrendingUp, DollarSign, Eye,
-  RefreshCw, Settings, Upload, Trash2, Edit, Plus, MapPin,
-  Bed, Bath, Square, Home, Tag, Star, Layout,
-  Globe, Mail, Phone, Award, CheckCircle, XCircle,
-  Save, AlertCircle, Crown, Shield, Image as ImageIcon,
-  Facebook, Twitter, Instagram, Linkedin, Youtube, MessageCircle,
-  Maximize2, Crop, Loader, UserCog, UserCheck, UserX, Filter, Search,
-  Briefcase, User, Shield as ShieldIcon, UserMinus, Clock, Check, X,
-  Eye as EyeIcon, Calendar, Flag, Info, Truck, Package, Building2, Compass
-} from 'lucide-react';
-import { db } from '../../firebase/config';
-import {
-  collection, getDocs, query, orderBy, deleteDoc, doc,
-  addDoc, serverTimestamp, setDoc, getDoc, updateDoc, where,
-  limit
-} from 'firebase/firestore';
-import toast from 'react-hot-toast';
-import { resolvePropertyImage } from '../../utils/propertyMapping';
-import PromotePropertyModal from '../PromotePropertyModal';
-import AgencyPackagesPage from '../../pages/admin/AgencyPackagesPage';
-import SightseeingPackagesPage from '../../pages/admin/SightseeingPackagesPage';
-import MovingPackagesPage from '../../pages/admin/MovingPackagesPage';
-import TransportRequestsPage from '../../pages/admin/TransportRequestsPage';
-import AdminServiceRequestsPage from '../../pages/admin/ServiceRequestsPage';
-import WhatsAppControl from '../../pages/admin/WhatsAppControl';
-import { useAuth } from '../../context/AuthContext';
+const express = require("express");
+const bodyParser = require("body-parser");
+const dotenv = require("dotenv");
+const IntaSend = require("intasend-node");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const http = require("http");
+const Buffer = require('buffer').Buffer;
+const fetch = require("node-fetch");
 
-const YOUTUBE_ADMIN_API = import.meta.env.VITE_YOUTUBE_API_URL || 'https://marketmix-youtube-server.onrender.com';
+dotenv.config();
 
-const YOUR_ADMIN_BACKEND =
-  import.meta.env.VITE_BACKEND_URL || 'https://backened-lt67.onrender.com';
+const app = express();
+const PORT = Number(process.env.PORT) || 3001;
 
-// Glassmorphism styles
-const glass = {
-  background: 'rgba(255,255,255,0.62)',
-  backdropFilter: 'blur(20px) saturate(1.3)',
-  WebkitBackdropFilter: 'blur(20px) saturate(1.3)',
-  border: '1px solid rgba(255,255,255,0.45)',
-  borderRadius: 20,
-};
+// ============================
+// CORS
+// ============================
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://backened-lt67.onrender.com",
+  "https://my-campus-store-frontend.vercel.app",
+  "https://marketmix.site",
+  "https://marketmix-realestates.vercel.app",
+  "https://localhost",
+];
 
-const serif = "'Cormorant Garamond', 'Georgia', serif";
-const sans = "'Inter', system-ui, sans-serif";
-const ink = '#1c1c1e';
-const ink2 = '#4a4a52';
-const ink3 = '#8e8e99';
-const rule = 'rgba(255,255,255,0.2)';
-const red = '#dc2626';
-const redLight = 'rgba(220,38,38,0.12)';
-const green = '#10b981';
-const greenLight = 'rgba(16,185,129,0.12)';
-const yellow = '#f59e0b';
-const yellowLight = 'rgba(245,158,11,0.12)';
-
-const AdminDashboard = () => {
-  const { currentUser } = useAuth();
-  const [activeSection, setActiveSection] = useState('listings');
-  const [loading, setLoading] = useState(false);
-  const [properties, setProperties] = useState([]);
-  const [pendingListings, setPendingListings] = useState([]);
-  const [approvedListings, setApprovedListings] = useState([]);
-  const [rejectedListings, setRejectedListings] = useState([]);
-  const [featuredListings, setFeaturedListings] = useState([]);
-  const [users, setUsers] = useState([]);
-  const [filteredUsers, setFilteredUsers] = useState([]);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [selectedRole, setSelectedRole] = useState('all');
-  const [selectedStatus, setSelectedStatus] = useState('pending');
-  const [allowedOrigins, setAllowedOrigins] = useState([]);
-  const [originInput, setOriginInput] = useState('');
-  const [originLoading, setOriginLoading] = useState(false);
-  const [originSaving, setOriginSaving] = useState(false);
-  const [originError, setOriginError] = useState('');
-  const [promoteProperty, setPromoteProperty] = useState(null);
-  const [agentProfileUserId, setAgentProfileUserId] = useState(null);
-  const [showAgentProfileModal, setShowAgentProfileModal] = useState(false);
-  const [agentProfileDraft, setAgentProfileDraft] = useState({
-    name: '',
-    email: '',
-    phone: '',
-    photo: '',
-    title: 'Real Estate Agent',
-    bio: '',
-    specialties: ['Residential'],
-    languages: ['English'],
-    experience: 1,
-    rating: 4.8,
-    propertiesSold: 0,
-    office: ''
-  });
-
-  // Full Seller Info Modal State
-  const [showInfoModal, setShowInfoModal] = useState(false);
-  const [selectedPropertyInfo, setSelectedPropertyInfo] = useState(null);
-
-  // Approval with Homepage Placement Modal State
-  const [showApprovalModal, setShowApprovalModal] = useState(false);
-  const [approvalPropertyId, setApprovalPropertyId] = useState(null);
-  const [selectedPlacements, setSelectedPlacements] = useState(['featured', 'main']);
-
-  // Pages Editor Sub-tab State
-  const [editorSubTab, setEditorSubTab] = useState('homepage');
-
-  // Homepage Settings Form State
-  const [homepageForm, setHomepageForm] = useState({
-    hero: {
-      title: 'Discover Timeless Properties in Kenya',
-      subtitle: 'Premium real estate with uncompromising standards.',
-      backgroundImage: '/images/property-hero.svg',
-      searchPlaceholder: 'Search properties by location or type...'
-    },
-    cta: {
-      title: 'Begin Your Property Journey',
-      subtitle: 'Connect with our expert agents for personalized property consultations',
-      button1Text: 'Browse Properties',
-      button1Link: '/properties',
-      button2Text: 'Schedule Consultation',
-      button2Link: '/contact'
-    },
-    contactInfo: {
-      email: 'info@realestate.com',
-      phone: '0115988107',
-      address: 'Nairobi, Kenya'
-    },
-    socialLinks: {
-      facebook: '',
-      twitter: '',
-      instagram: '',
-      linkedin: '',
-      youtube: ''
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
+      return callback(null, true);
     }
-  });
-
-  // Explore Page Settings Form State
-  const [exploreForm, setExploreForm] = useState({
-    title: 'Find Your Dream Property',
-    subtitle: 'Discover homes, apartments, and commercial spaces across Kenya'
-  });
-
-  // About Page Settings Form State
-  const [aboutForm, setAboutForm] = useState({
-    title: 'About MarketMix',
-    subtitle: 'Redefining real estate in Kenya with transparency, luxury, and trust.',
-    story: 'MarketMix Real Estates is Kenya’s premier property platform connecting verified sellers, agents, investors, and buyers with world-class digital tools.'
-  });
-
-  // Agents Page Settings Form State
-  const [agentsForm, setAgentsForm] = useState({
-    title: 'Meet Our Real Estate Experts',
-    subtitle: 'Connect with top-rated agents specializing in luxury homes, commercial properties, and rentals.',
-    ctaTitle: 'Join Our Team of Experts',
-    ctaSubtitle: 'Are you a real estate professional? Join MarketMix Real Estates and grow your career with us.'
-  });
-
-  const [customPageSlug, setCustomPageSlug] = useState('homepage');
-  const [customPageJson, setCustomPageJson] = useState(JSON.stringify({
-    title: 'Homepage',
-    subtitle: 'Customize this page from the admin dashboard.'
-  }, null, 2));
-
-  // ---- Driver approvals ----
-  const [allDrivers, setAllDrivers] = useState([]);
-  const [driverFilter, setDriverFilter] = useState('pending');
-  const [driverSavingId, setDriverSavingId] = useState('');
-
-
-  const [stats, setStats] = useState({
-    totalUsers: 0,
-    totalProperties: 0,
-    activeListings: 0,
-    pendingApproval: 0,
-    totalRevenue: 0
-  });
-
-  const roles = [
-    { value: 'admin', label: 'Administrator', icon: <ShieldIcon size={16} /> },
-    { value: 'moderator', label: 'Moderator', icon: <CheckCircle size={16} /> },
-    { value: 'agent', label: 'Real Estate Agent', icon: <Briefcase size={16} /> },
-    { value: 'seller', label: 'Seller/Landlord', icon: <Home size={16} /> },
-    { value: 'investor', label: 'Investor', icon: <TrendingUp size={16} /> },
-    { value: 'user', label: 'Regular User', icon: <Users size={16} /> }
-  ];
-
-  const loadProperties = async () => {
-    setLoading(true);
-    try {
-      const propertiesRef = collection(db, 'properties');
-      const querySnapshot = await getDocs(propertiesRef);
-      const allProperties = querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-
-      const pending = allProperties.filter(p => p.verificationStatus === 'pending' || p.approvalStatus === 'pending' || (!p.verificationStatus && !p.approvalStatus));
-      const approved = allProperties.filter(p => p.verificationStatus === 'approved' || p.approvalStatus === 'approved');
-      const rejected = allProperties.filter(p => p.verificationStatus === 'rejected' || p.approvalStatus === 'rejected');
-
-ADMIN@DESKTOP-2NOEEN2 MINGW64 ~/Desktop/marketmix real estate/marketmix-realestates (main)
-$ ^C
-
-ADMIN@DESKTOP-2NOEEN2 MINGW64 ~/Desktop/marketmix real estate/marketmix-realestates (main)
-$ sed -n '1,2000p' src/components/dashboards/AdminDashboard.jsx > /tmp/AdminDashboard-current.txt
-wc -l /tmp/AdminDashboard-current.txt
-cat /tmp/AdminDashboard-current.txt
-1877 /tmp/AdminDashboard-current.txt
-// src/components/dashboards/AdminDashboard.jsx - FULL FIXED & ENHANCED VERSION WITH ALL PAGES EDITOR (HOME, EXPLORE, ABOUT, AGENTS)
-import React, { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import {
-  Users, Building, BarChart, TrendingUp, DollarSign, Eye,
-  RefreshCw, Settings, Upload, Trash2, Edit, Plus, MapPin,
-  Bed, Bath, Square, Home, Tag, Star, Layout,
-  Globe, Mail, Phone, Award, CheckCircle, XCircle,
-  Save, AlertCircle, Crown, Shield, Image as ImageIcon,
-  Facebook, Twitter, Instagram, Linkedin, Youtube, MessageCircle,
-  Maximize2, Crop, Loader, UserCog, UserCheck, UserX, Filter, Search,
-  Briefcase, User, Shield as ShieldIcon, UserMinus, Clock, Check, X,
-  Eye as EyeIcon, Calendar, Flag, Info, Truck, Package, Building2, Compass
-} from 'lucide-react';
-import { db } from '../../firebase/config';
-import {
-  collection, getDocs, query, orderBy, deleteDoc, doc,
-  addDoc, serverTimestamp, setDoc, getDoc, updateDoc, where,
-  limit
-} from 'firebase/firestore';
-import toast from 'react-hot-toast';
-import { resolvePropertyImage } from '../../utils/propertyMapping';
-import PromotePropertyModal from '../PromotePropertyModal';
-import AgencyPackagesPage from '../../pages/admin/AgencyPackagesPage';
-import SightseeingPackagesPage from '../../pages/admin/SightseeingPackagesPage';
-import MovingPackagesPage from '../../pages/admin/MovingPackagesPage';
-import TransportRequestsPage from '../../pages/admin/TransportRequestsPage';
-import AdminServiceRequestsPage from '../../pages/admin/ServiceRequestsPage';
-import WhatsAppControl from '../../pages/admin/WhatsAppControl';
-import { useAuth } from '../../context/AuthContext';
-
-const YOUTUBE_ADMIN_API = import.meta.env.VITE_YOUTUBE_API_URL || 'https://marketmix-youtube-server.onrender.com';
-
-const YOUR_ADMIN_BACKEND =
-  import.meta.env.VITE_BACKEND_URL || 'https://backened-lt67.onrender.com';
-
-// Glassmorphism styles
-const glass = {
-  background: 'rgba(255,255,255,0.62)',
-  backdropFilter: 'blur(20px) saturate(1.3)',
-  WebkitBackdropFilter: 'blur(20px) saturate(1.3)',
-  border: '1px solid rgba(255,255,255,0.45)',
-  borderRadius: 20,
-};
-
-const serif = "'Cormorant Garamond', 'Georgia', serif";
-const sans = "'Inter', system-ui, sans-serif";
-const ink = '#1c1c1e';
-const ink2 = '#4a4a52';
-const ink3 = '#8e8e99';
-const rule = 'rgba(255,255,255,0.2)';
-const red = '#dc2626';
-const redLight = 'rgba(220,38,38,0.12)';
-const green = '#10b981';
-const greenLight = 'rgba(16,185,129,0.12)';
-const yellow = '#f59e0b';
-const yellowLight = 'rgba(245,158,11,0.12)';
-
-const AdminDashboard = () => {
-  const { currentUser } = useAuth();
-  const [activeSection, setActiveSection] = useState('listings');
-  const [loading, setLoading] = useState(false);
-  const [properties, setProperties] = useState([]);
-  const [pendingListings, setPendingListings] = useState([]);
-  const [approvedListings, setApprovedListings] = useState([]);
-  const [rejectedListings, setRejectedListings] = useState([]);
-  const [featuredListings, setFeaturedListings] = useState([]);
-  const [users, setUsers] = useState([]);
-  const [filteredUsers, setFilteredUsers] = useState([]);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [selectedRole, setSelectedRole] = useState('all');
-  const [selectedStatus, setSelectedStatus] = useState('pending');
-  const [allowedOrigins, setAllowedOrigins] = useState([]);
-  const [originInput, setOriginInput] = useState('');
-  const [originLoading, setOriginLoading] = useState(false);
-  const [originSaving, setOriginSaving] = useState(false);
-  const [originError, setOriginError] = useState('');
-  const [promoteProperty, setPromoteProperty] = useState(null);
-  const [agentProfileUserId, setAgentProfileUserId] = useState(null);
-  const [showAgentProfileModal, setShowAgentProfileModal] = useState(false);
-  const [agentProfileDraft, setAgentProfileDraft] = useState({
-    name: '',
-    email: '',
-    phone: '',
-    photo: '',
-    title: 'Real Estate Agent',
-    bio: '',
-    specialties: ['Residential'],
-    languages: ['English'],
-    experience: 1,
-    rating: 4.8,
-    propertiesSold: 0,
-    office: ''
-  });
-
-  // Full Seller Info Modal State
-  const [showInfoModal, setShowInfoModal] = useState(false);
-  const [selectedPropertyInfo, setSelectedPropertyInfo] = useState(null);
-
-  // Approval with Homepage Placement Modal State
-  const [showApprovalModal, setShowApprovalModal] = useState(false);
-  const [approvalPropertyId, setApprovalPropertyId] = useState(null);
-  const [selectedPlacements, setSelectedPlacements] = useState(['featured', 'main']);
-
-  // Pages Editor Sub-tab State
-  const [editorSubTab, setEditorSubTab] = useState('homepage');
-
-  // Homepage Settings Form State
-  const [homepageForm, setHomepageForm] = useState({
-    hero: {
-      title: 'Discover Timeless Properties in Kenya',
-      subtitle: 'Premium real estate with uncompromising standards.',
-      backgroundImage: '/images/property-hero.svg',
-      searchPlaceholder: 'Search properties by location or type...'
-    },
-    cta: {
-      title: 'Begin Your Property Journey',
-      subtitle: 'Connect with our expert agents for personalized property consultations',
-      button1Text: 'Browse Properties',
-      button1Link: '/properties',
-      button2Text: 'Schedule Consultation',
-      button2Link: '/contact'
-    },
-    contactInfo: {
-      email: 'info@realestate.com',
-      phone: '0115988107',
-      address: 'Nairobi, Kenya'
-    },
-    socialLinks: {
-      facebook: '',
-      twitter: '',
-      instagram: '',
-      linkedin: '',
-      youtube: ''
-    }
-  });
-
-  // Explore Page Settings Form State
-  const [exploreForm, setExploreForm] = useState({
-    title: 'Find Your Dream Property',
-    subtitle: 'Discover homes, apartments, and commercial spaces across Kenya'
-  });
-
-  // About Page Settings Form State
-  const [aboutForm, setAboutForm] = useState({
-    title: 'About MarketMix',
-    subtitle: 'Redefining real estate in Kenya with transparency, luxury, and trust.',
-    story: 'MarketMix Real Estates is Kenya’s premier property platform connecting verified sellers, agents, investors, and buyers with world-class digital tools.'
-  });
-
-  // Agents Page Settings Form State
-  const [agentsForm, setAgentsForm] = useState({
-    title: 'Meet Our Real Estate Experts',
-    subtitle: 'Connect with top-rated agents specializing in luxury homes, commercial properties, and rentals.',
-    ctaTitle: 'Join Our Team of Experts',
-    ctaSubtitle: 'Are you a real estate professional? Join MarketMix Real Estates and grow your career with us.'
-  });
-
-  const [customPageSlug, setCustomPageSlug] = useState('homepage');
-  const [customPageJson, setCustomPageJson] = useState(JSON.stringify({
-    title: 'Homepage',
-    subtitle: 'Customize this page from the admin dashboard.'
-  }, null, 2));
-
-  // ---- Driver approvals ----
-  const [allDrivers, setAllDrivers] = useState([]);
-  const [driverFilter, setDriverFilter] = useState('pending');
-  const [driverSavingId, setDriverSavingId] = useState('');
-
-
-  const [stats, setStats] = useState({
-    totalUsers: 0,
-    totalProperties: 0,
-    activeListings: 0,
-    pendingApproval: 0,
-    totalRevenue: 0
-  });
-
-  const roles = [
-    { value: 'admin', label: 'Administrator', icon: <ShieldIcon size={16} /> },
-    { value: 'moderator', label: 'Moderator', icon: <CheckCircle size={16} /> },
-    { value: 'agent', label: 'Real Estate Agent', icon: <Briefcase size={16} /> },
-    { value: 'seller', label: 'Seller/Landlord', icon: <Home size={16} /> },
-    { value: 'investor', label: 'Investor', icon: <TrendingUp size={16} /> },
-    { value: 'user', label: 'Regular User', icon: <Users size={16} /> }
-  ];
-
-  const loadProperties = async () => {
-    setLoading(true);
-    try {
-      const propertiesRef = collection(db, 'properties');
-      const querySnapshot = await getDocs(propertiesRef);
-      const allProperties = querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-
-      const pending = allProperties.filter(p => p.verificationStatus === 'pending' || p.approvalStatus === 'pending' || (!p.verificationStatus && !p.approvalStatus));
-      const approved = allProperties.filter(p => p.verificationStatus === 'approved' || p.approvalStatus === 'approved');
-      const rejected = allProperties.filter(p => p.verificationStatus === 'rejected' || p.approvalStatus === 'rejected');
-      const featured = allProperties.filter(p => p.featured === true && (p.verificationStatus === 'approved' || p.approvalStatus === 'approved'));
-
-      setPendingListings(pending);
-      setApprovedListings(approved);
-      setRejectedListings(rejected);
-      setFeaturedListings(featured);
-      setProperties(allProperties);
-
-      setStats(prev => ({
-        ...prev,
-        totalProperties: allProperties.length,
-        activeListings: approved.length,
-        pendingApproval: pending.length
-      }));
-
-    } catch (error) {
-      console.error('Error loading properties:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadUsers = async () => {
-    try {
-      const usersRef = collection(db, 'users');
-      const querySnapshot = await getDocs(usersRef);
-      const usersList = querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      setUsers(usersList);
-      setFilteredUsers(usersList);
-      setStats(prev => ({ ...prev, totalUsers: usersList.length }));
-    } catch (error) {
-      console.error('Error loading users:', error);
-    }
-  };
-
-  const loadAllowedOrigins = async () => {
-    if (!currentUser) return;
-    setOriginLoading(true);
-    setOriginError('');
-    try {
-      const token = await currentUser.getIdToken();
-      const response = await fetch(`${YOUTUBE_ADMIN_API}/api/admin/allowed-origins`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Unable to load website domains');
-      setAllowedOrigins(result.allowedOrigins || []);
-    } catch (error) {
-      console.error('Error loading YouTube API domains:', error);
-      setOriginError(error.message || 'Unable to connect to the YouTube server');
-    } finally {
-      setOriginLoading(false);
-    }
-  };
-
-  const handleAddOrigin = (event) => {
-    event.preventDefault();
-    setOriginError('');
-    try {
-      const input = originInput.trim();
-      const url = new URL(input);
-      const localHttp = url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname);
-      if ((url.protocol !== 'https:' && !localHttp) || url.origin !== input) {
-        throw new Error('Enter a secure website origin only, such as https://example.com (no path).');
-      }
-      if (allowedOrigins.includes(url.origin)) {
-        throw new Error('That domain is already allowed.');
-      }
-      setAllowedOrigins((origins) => [...origins, url.origin]);
-      setOriginInput('');
-    } catch (error) {
-      setOriginError(error.message || 'Enter a valid website origin.');
-    }
-  };
-
-  const handleSaveOrigins = async () => {
-    if (!currentUser) return;
-    setOriginSaving(true);
-    setOriginError('');
-    try {
-      const token = await currentUser.getIdToken();
-      const response = await fetch(`${YOUTUBE_ADMIN_API}/api/admin/allowed-origins`, {
-        method: 'PUT',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ allowedOrigins }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Unable to save website domains');
-      setAllowedOrigins(result.allowedOrigins || []);
-      toast.success('Allowed website domains updated.');
-    } catch (error) {
-      console.error('Error saving YouTube API domains:', error);
-      setOriginError(error.message || 'Unable to save website domains');
-      toast.error('Could not save allowed domains.');
-    } finally {
-      setOriginSaving(false);
-    }
-  };
-
-  useEffect(() => {
-    if (activeSection === 'apiDomains') loadAllowedOrigins();
-  }, [activeSection, currentUser]);
-
-  useEffect(() => {
-    const term = searchTerm.trim().toLowerCase();
-    const nextUsers = users.filter(user => {
-      const role = user.role || 'user';
-      const matchesRole = selectedRole === 'all' || role === selectedRole;
-      const haystack = `${user.name || ''} ${user.email || ''} ${role}`.toLowerCase();
-      const matchesSearch = !term || haystack.includes(term);
-      return matchesRole && matchesSearch;
-    });
-    setFilteredUsers(nextUsers);
-  }, [users, searchTerm, selectedRole]);
-
-  const loadAllPagesSettings = async () => {
-    try {
-      const homeSnap = await getDoc(doc(db, 'settings', 'homepage'));
-      if (homeSnap.exists()) setHomepageForm(prev => ({ ...prev, ...homeSnap.data() }));
-
-      const exploreSnap = await getDoc(doc(db, 'settings', 'explore'));
-      if (exploreSnap.exists()) setExploreForm(prev => ({ ...prev, ...exploreSnap.data() }));
-
-      const aboutSnap = await getDoc(doc(db, 'settings', 'about'));
-      if (aboutSnap.exists()) setAboutForm(prev => ({ ...prev, ...aboutSnap.data() }));
-
-      const agentsSnap = await getDoc(doc(db, 'settings', 'agents'));
-      if (agentsSnap.exists()) setAgentsForm(prev => ({ ...prev, ...agentsSnap.data() }));
-    } catch (error) {
-      console.error('Error loading pages settings:', error);
-    }
-  };
-
-  const loadDrivers = async () => {
-    try {
-      const snap = await getDocs(collection(db, 'users'));
-      const all = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      const drivers = all.filter(u =>
-        u.driverProfile ||
-        u.driverApproved === true ||
-        u.driverStatus === 'approved' ||
-        u.driverStatus === 'rejected' ||
-        u.driverStatus === 'pending'
-      );
-      setAllDrivers(drivers);
-    } catch (e) {
-      console.error('Error loading drivers:', e);
-      toast.error('Could not load driver applications.');
-    }
-  };
-
-  useEffect(() => {
-    loadProperties();
-    loadUsers();
-    loadAllPagesSettings();
-    loadDrivers();
-  }, []);
-
-  const handleSaveHomepageSettings = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      await setDoc(doc(db, 'settings', 'homepage'), homepageForm, { merge: true });
-      toast.success('Homepage updated successfully!');
-    } catch (error) {
-      console.error('Error saving homepage:', error);
-      toast.error('Failed to update homepage');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSaveExploreSettings = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      await setDoc(doc(db, 'settings', 'explore'), exploreForm, { merge: true });
-      toast.success('Explore Page updated successfully!');
-    } catch (error) {
-      console.error('Error saving explore page:', error);
-      toast.error('Failed to update explore page');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSaveAboutSettings = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      await setDoc(doc(db, 'settings', 'about'), aboutForm, { merge: true });
-      toast.success('About Page updated successfully!');
-    } catch (error) {
-      console.error('Error saving about page:', error);
-      toast.error('Failed to update about page');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSaveAgentsSettings = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      await setDoc(doc(db, 'settings', 'agents'), agentsForm, { merge: true });
-      toast.success('Agents Page updated successfully!');
-    } catch (error) {
-      console.error('Error saving agents page:', error);
-      toast.error('Failed to update agents page');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleLoadCustomPage = async (pageSlug) => {
-    try {
-      const pageSnap = await getDoc(doc(db, 'settings', pageSlug));
-      if (pageSnap.exists()) {
-        setCustomPageJson(JSON.stringify(pageSnap.data(), null, 2));
-      } else {
-        setCustomPageJson(JSON.stringify({ title: `${pageSlug} page`, subtitle: 'Page content', status: 'draft' }, null, 2));
-      }
-    } catch (error) {
-      console.error('Error loading custom page:', error);
-      toast.error('Unable to load the selected page');
-    }
-  };
-
-  const handleSaveCustomPageSettings = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const parsed = JSON.parse(customPageJson);
-      await setDoc(doc(db, 'settings', customPageSlug), parsed, { merge: true });
-      toast.success(`Page "${customPageSlug}" updated successfully.`);
-    } catch (error) {
-      console.error('Error saving custom page:', error);
-      toast.error('Custom page JSON is invalid. Fix the format and try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Open Approval Modal
-  const handleOpenApproval = (listingId) => {
-    setApprovalPropertyId(listingId);
-    setSelectedPlacements(['featured', 'main']);
-    setShowApprovalModal(true);
-  };
-
-  // Confirm Approval with Homepage Placements
-  const handleConfirmApproval = async () => {
-    if (!approvalPropertyId) return;
-    setLoading(true);
-    try {
-      const listingRef = doc(db, 'properties', approvalPropertyId);
-      await updateDoc(listingRef, {
-        verificationStatus: 'approved',
-        approvalStatus: 'approved',
-        status: 'active',
-        featured: selectedPlacements.includes('featured'),
-        homepagePlacements: selectedPlacements,
-        approvedAt: serverTimestamp()
-      });
-
-      toast.success('Listing approved & published to selected homepage sections!');
-      setShowApprovalModal(false);
-      setApprovalPropertyId(null);
-      await loadProperties();
-    } catch (error) {
-      console.error('Error approving listing:', error);
-      toast.error('Failed to approve listing');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleUpdatePlacements = async (listingId, newPlacements) => {
-    setLoading(true);
-    try {
-      const listingRef = doc(db, 'properties', listingId);
-      await updateDoc(listingRef, {
-        homepagePlacements: newPlacements,
-        featured: newPlacements.includes('featured'),
-        updatedAt: serverTimestamp()
-      });
-      toast.success('Homepage placements updated successfully.');
-      await loadProperties();
-    } catch (error) {
-      console.error('Error updating placements:', error);
-      toast.error('Failed to update placements');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleRejectListing = async (listingId) => {
-    const reason = prompt('Please provide a reason for rejection:');
-    if (reason === null) return;
-
-    setLoading(true);
-    try {
-      const listingRef = doc(db, 'properties', listingId);
-      await updateDoc(listingRef, {
-        verificationStatus: 'rejected',
-        approvalStatus: 'rejected',
-        rejectionReason: reason,
-        rejectedAt: serverTimestamp(),
-        status: 'rejected'
-      });
-
-      await loadProperties();
-      toast.warning(`Listing rejected: ${reason}`);
-    } catch (error) {
-      console.error('Error rejecting listing:', error);
-      toast.error('Failed to reject listing');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleRevokeApproval = async (listingId) => {
-    if (window.confirm('Are you sure you want to revoke approval for this listing? It will go back to pending status.')) {
-      setLoading(true);
-      try {
-        const listingRef = doc(db, 'properties', listingId);
-        await updateDoc(listingRef, {
-          verificationStatus: 'pending',
-          approvalStatus: 'pending',
-          revokedAt: serverTimestamp(),
-          featured: false,
-          homepagePlacements: []
-        });
-
-        await loadProperties();
-        toast.warning('Listing approval revoked. It is now pending review again.');
-      } catch (error) {
-        console.error('Error revoking approval:', error);
-        toast.error('Failed to revoke approval');
-      } finally {
-        setLoading(false);
-      }
-    }
-  };
-
-  const handleDeleteListing = async (listingId) => {
-    if (window.confirm('Are you sure you want to permanently delete this listing?')) {
-      setLoading(true);
-      try {
-        await deleteDoc(doc(db, 'properties', listingId));
-        await loadProperties();
-        toast.success('Listing deleted successfully');
-      } catch (error) {
-        console.error('Error deleting listing:', error);
-        toast.error('Failed to delete listing');
-      } finally {
-        setLoading(false);
-      }
-    }
-  };
-
-  const handleUpdateUserRole = async (userId, newRole) => {
-    try {
-      const userRef = doc(db, 'users', userId);
-      await updateDoc(userRef, {
-        role: newRole,
-        userType: newRole,
-        updatedAt: serverTimestamp()
-      });
-      setUsers(prev => prev.map(user => user.id === userId ? { ...user, role: newRole, userType: newRole } : user));
-      toast.success('User role updated successfully');
-    } catch (error) {
-      console.error('Error updating user role:', error);
-      toast.error('Failed to update user role');
-    }
-  };
-
-  const openAgentProfileEditor = (user) => {
-    const profile = user.agentProfile || {};
-    setAgentProfileUserId(user.id);
-    setAgentProfileDraft({
-      name: profile.name || user.name || '',
-      email: profile.email || user.email || '',
-      phone: profile.phone || user.phone || '',
-      photo: profile.photo || '',
-      title: profile.title || 'Real Estate Agent',
-      bio: profile.bio || '',
-      specialties: Array.isArray(profile.specialties) && profile.specialties.length ? profile.specialties : ['Residential'],
-      languages: Array.isArray(profile.languages) && profile.languages.length ? profile.languages : ['English'],
-      experience: Number(profile.experience ?? user.experience ?? 1),
-      rating: Number(profile.rating ?? user.rating ?? 4.8),
-      propertiesSold: Number(profile.propertiesSold ?? user.propertiesSold ?? 0),
-      office: profile.office || ''
-    });
-    setShowAgentProfileModal(true);
-  };
-
-  const handleSaveAgentProfile = async (e) => {
-    e.preventDefault();
-    if (!agentProfileUserId) return;
-
-    try {
-      const userRef = doc(db, 'users', agentProfileUserId);
-      const payload = {
-        role: 'agent',
-        userType: 'agent',
-        email: agentProfileDraft.email,
-        name: agentProfileDraft.name,
-        phone: agentProfileDraft.phone,
-        photo: agentProfileDraft.photo,
-        agentProfile: {
-          name: agentProfileDraft.name,
-          email: agentProfileDraft.email,
-          phone: agentProfileDraft.phone,
-          photo: agentProfileDraft.photo,
-          title: agentProfileDraft.title,
-          bio: agentProfileDraft.bio,
-          specialties: Array.isArray(agentProfileDraft.specialties) ? agentProfileDraft.specialties : String(agentProfileDraft.specialties || '').split(',').map(item => item.trim()).filter(Boolean),
-          languages: Array.isArray(agentProfileDraft.languages) ? agentProfileDraft.languages : String(agentProfileDraft.languages || '').split(',').map(item => item.trim()).filter(Boolean),
-          experience: Number(agentProfileDraft.experience || 1),
-          rating: Number(agentProfileDraft.rating || 4.8),
-          propertiesSold: Number(agentProfileDraft.propertiesSold || 0),
-          office: agentProfileDraft.office,
-          updatedAt: serverTimestamp()
-        },
-        updatedAt: serverTimestamp()
-      };
-
-      await updateDoc(userRef, payload);
-      setUsers(prev => prev.map(user => user.id === agentProfileUserId ? { ...user, ...payload, agentProfile: payload.agentProfile } : user));
-      setShowAgentProfileModal(false);
-      toast.success('Agent profile saved successfully.');
-    } catch (error) {
-      console.error('Error saving agent profile:', error);
-      toast.error('Failed to save agent profile.');
-    }
-  };
-
-  const handleDeleteUser = async (userId, userName) => {
-    if (window.confirm(`Are you sure you want to delete user "${userName}"?`)) {
-      try {
-        await deleteDoc(doc(db, 'users', userId));
-        setUsers(prev => prev.filter(user => user.id !== userId));
-        toast.success('User deleted successfully');
-      } catch (error) {
-        console.error('Error deleting user:', error);
-        toast.error('Failed to delete user');
-      }
-    }
-  };
-
-  const handleDriverDecision = async (driver, decision) => {
-    if (!driver) return;
-    if (!currentUser) { toast.error('Sign in as admin.'); return; }
-    let reason = '';
-    if (decision === 'reject') {
-      reason = window.prompt('Reason for rejection (sent to driver):', 'Documents unclear');
-      if (reason === null) return;
-    }
-    setDriverSavingId(driver.id);
-    try {
-      const userRef = doc(db, 'users', driver.id);
-      const updateData = decision === 'approve'
-        ? { driverApproved: true, driverStatus: 'approved', role: 'driver', driverRejectionReason: null, updatedAt: serverTimestamp() }
-        : { driverApproved: false, driverStatus: 'rejected', driverRejectionReason: reason || 'Documents unclear', updatedAt: serverTimestamp() };
-
-      await updateDoc(userRef, updateData);
-      toast.success(decision === 'approve' ? `Approved ${driver.name || driver.email}` : `Rejected ${driver.name || driver.email}`);
-      await loadDrivers();
-    } catch (e) {
-      console.error('Error updating driver decision:', e);
-      toast.error(e.message || 'Could not update driver.');
-    } finally {
-      setDriverSavingId('');
-    }
-  };
-
-  const getStatusBadge = (status) => {
-    switch(status) {
-      case 'pending':
-        return { bg: yellowLight, color: yellow, label: 'Pending Review', icon: <Clock size={12} /> };
-      case 'approved':
-        return { bg: greenLight, color: green, label: 'Approved', icon: <Check size={12} /> };
-      case 'rejected':
-        return { bg: redLight, color: red, label: 'Rejected', icon: <X size={12} /> };
-      default:
-        return { bg: yellowLight, color: yellow, label: 'Pending', icon: <Clock size={12} /> };
-    }
-  };
-
-  const statsCards = [
-    { label: 'Total Users', value: stats.totalUsers.toString(), delta: '+12%', icon: <Users size={20} /> },
-    { label: 'Total Properties', value: stats.totalProperties.toString(), delta: '+8%', icon: <Building size={20} /> },
-    { label: 'Active Listings', value: stats.activeListings.toString(), delta: '+5%', icon: <EyeIcon size={20} /> },
-    { label: 'Pending Approval', value: stats.pendingApproval.toString(), delta: '+3', icon: <Clock size={20} /> },
-  ];
-
-  const sections = [
-    { id: 'listings', label: 'Listing Approval & Info', icon: <CheckCircle size={18} /> },
-    { id: 'homepageManager', label: 'Homepage Placements', icon: <Layout size={18} /> },
-    { id: 'homepageEditor', label: 'Edit All Pages', icon: <Edit size={18} /> },
-    { id: 'transportRequests', label: 'Moving Requests', icon: <Truck size={18} /> },
-    { id: 'driverApprovals', label: 'Driver Approvals', icon: <UserCheck size={18} /> },
-    { id: 'serviceRequests', label: 'Move-in Requests', icon: <Briefcase size={18} /> },
-    { id: 'movingPackages', label: 'Moving Packages', icon: <Package size={18} /> },
-    { id: 'agencyPackages', label: 'Agency Packages', icon: <Building2 size={18} /> },
-    { id: 'sightseeingPackages', label: 'Sightseeing Packages', icon: <Compass size={18} /> },
-    { id: 'whatsappControl', label: 'WhatsApp Control', icon: <MessageCircle size={18} /> },
-    { id: 'users', label: 'User Management', icon: <Users size={18} /> },
-    { id: 'allProperties', label: 'All Properties', icon: <Building size={18} /> },
-    { id: 'analytics', label: 'Analytics', icon: <BarChart size={18} /> },
-    { id: 'apiDomains', label: 'API Domains', icon: <Globe size={18} /> }
-  ];
-
-  const getCurrentListings = () => {
-    switch(selectedStatus) {
-      case 'pending': return pendingListings;
-      case 'approved': return approvedListings;
-      case 'rejected': return rejectedListings;
-      default: return pendingListings;
-    }
-  };
-
-  // Recursive tree renderer for Full Seller Info Modal
-  const renderInfoTree = (obj) => {
-    if (!obj || typeof obj !== 'object') return <span>{String(obj)}</span>;
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 8 }}>
-        {Object.entries(obj).map(([k, v]) => {
-          if (k === 'id' || k === 'userId') return null;
-          if (v && typeof v === 'object' && !Array.isArray(v)) {
-            return (
-              <div key={k} style={{ marginTop: 6, background: 'rgba(0,0,0,0.02)', padding: 8, borderRadius: 8 }}>
-                <strong style={{ textTransform: 'capitalize', color: red }}>{k.replace(/([A-Z])/g, ' $1')}:</strong>
-                {renderInfoTree(v)}
-              </div>
-            );
-          }
-          if (Array.isArray(v)) {
-            return (
-              <div key={k} style={{ marginTop: 6 }}>
-                <strong style={{ textTransform: 'capitalize', color: red }}>{k.replace(/([A-Z])/g, ' $1')}:</strong>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
-                  {v.map((item, idx) => (
-                    <span key={idx} style={{ background: 'rgba(0,0,0,0.05)', padding: '2px 8px', borderRadius: 12, fontSize: 11 }}>
-                      {typeof item === 'object' ? JSON.stringify(item) : String(item)}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            );
-          }
-          return (
-            <div key={k} style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(0,0,0,0.03)', paddingBottom: 3 }}>
-              <span style={{ color: ink2, textTransform: 'capitalize' }}>{k.replace(/([A-Z])/g, ' $1')}:</span>
-              <span style={{ fontWeight: 500, textAlign: 'right' }}>{String(v)}</span>
-            </div>
-          );
-        })}
-      </div>
-    );
-  };
-
-  return (
-    <div style={{
-      background: 'linear-gradient(145deg, #fef2f2 0%, #fee2e2 30%, #fef2f2 60%, #fecaca 100%)',
-      minHeight: '100vh',
-      padding: '32px 40px 56px',
-      fontFamily: sans,
-      fontWeight: 300,
-      color: ink,
-      position: 'relative',
-      overflow: 'hidden',
-    }}>
-      <div style={{ position: 'absolute', top: '8%', left: '18%', width: 340, height: 340, borderRadius: '50%', background: 'rgba(220,38,38,0.1)', filter: 'blur(60px)', pointerEvents: 'none' }} />
-      <div style={{ position: 'absolute', bottom: '12%', right: '14%', width: 280, height: 280, borderRadius: '50%', background: 'rgba(239,68,68,0.08)', filter: 'blur(50px)', pointerEvents: 'none' }} />
-
-      <div style={{ width: '100%', position: 'relative', zIndex: 1 }}>
-        {/* Navigation */}
-        <nav style={{ ...glass, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 22px', marginBottom: 24 }}>
-          <div style={{ fontFamily: serif, fontSize: 22, fontWeight: 400, color: ink, letterSpacing: -0.2 }}>
-            Admin <em style={{ fontStyle: 'italic', color: red }}>Control Center</em>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: red, opacity: 1 }} />
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: ink3, opacity: 0.35 }} />
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: ink3, opacity: 0.35 }} />
-            <div style={{ fontFamily: sans, fontSize: 11, color: ink2, background: 'rgba(255,255,255,0.18)', border: `1px solid ${rule}`, borderRadius: 20, padding: '7px 16px' }}>
-              {new Date().toLocaleDateString()}
-            </div>
-          </div>
-        </nav>
-
-        {/* Welcome Section */}
-        <div style={{ ...glass, padding: '24px 28px', marginBottom: 24 }}>
-          <div>
-            <div style={{ fontFamily: serif, fontSize: 24, fontWeight: 400 }}>Listing Approval & Site Pages Publisher</div>
-            <div style={{ fontSize: 13, color: ink2, marginTop: 4 }}>Review seller details, assign homepage placements, and edit all site pages (Home, Explore, About, Agents)</div>
-          </div>
-        </div>
-
-        {/* Stats Grid */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
-          {statsCards.map((stat, idx) => (
-            <div key={idx} style={{ ...glass, padding: '20px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-                <div style={{ background: redLight, borderRadius: 12, padding: '8px' }}>
-                  {stat.icon}
-                </div>
-                <span style={{ fontSize: 11, color: green }}>{stat.delta}</span>
-              </div>
-              <div style={{ fontFamily: serif, fontSize: 32, fontWeight: 300 }}>{stat.value}</div>
-              <div style={{ fontSize: 11, color: ink2 }}>{stat.label}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* Section Tabs */}
-        <div style={{ ...glass, display: 'flex', gap: 8, padding: '8px', marginBottom: 24, flexWrap: 'wrap' }}>
-          {sections.map(section => (
-            <button
-              key={section.id}
-              onClick={() => setActiveSection(section.id)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '10px 20px',
-                borderRadius: 12,
-                background: activeSection === section.id ? red : 'transparent',
-                color: activeSection === section.id ? 'white' : ink2,
-                border: 'none',
-                cursor: 'pointer',
-                fontFamily: sans,
-                fontSize: 13,
-                transition: 'all 0.2s'
-              }}
-            >
-              {section.icon}
-              {section.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Listing Approval Section */}
-        {activeSection === 'listings' && (
-          <div style={{ ...glass, padding: '24px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 16 }}>
-              <div>
-                <div style={{ fontFamily: serif, fontSize: 18, fontWeight: 500 }}>Seller Submission Queue</div>
-                <div style={{ fontSize: 12, color: ink2 }}>Inspect all seller-submitted information and assign homepage placements</div>
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                  onClick={() => setSelectedStatus('pending')}
-                  style={{ padding: '8px 16px', borderRadius: 20, background: selectedStatus === 'pending' ? yellow : 'transparent', color: selectedStatus === 'pending' ? 'white' : ink2, border: `1px solid ${rule}`, cursor: 'pointer' }}
-                >
-                  Pending ({pendingListings.length})
-                </button>
-                <button
-                  onClick={() => setSelectedStatus('approved')}
-                  style={{ padding: '8px 16px', borderRadius: 20, background: selectedStatus === 'approved' ? green : 'transparent', color: selectedStatus === 'approved' ? 'white' : ink2, border: `1px solid ${rule}`, cursor: 'pointer' }}
-                >
-                  Approved ({approvedListings.length})
-                </button>
-                <button
-                  onClick={() => setSelectedStatus('rejected')}
-                  style={{ padding: '8px 16px', borderRadius: 20, background: selectedStatus === 'rejected' ? red : 'transparent', color: selectedStatus === 'rejected' ? 'white' : ink2, border: `1px solid ${rule}`, cursor: 'pointer' }}
-                >
-                  Rejected ({rejectedListings.length})
-                </button>
-              </div>
-            </div>
-
-            {loading ? (
-              <div style={{ textAlign: 'center', padding: 40 }}>
-                <Loader size={32} className="animate-spin" style={{ color: red, margin: '0 auto' }} />
-              </div>
-            ) : getCurrentListings().length === 0 ? (
-              <div style={{ textAlign: 'center', padding: 60, color: ink2 }}>
-                <CheckCircle size={48} style={{ marginBottom: 16, opacity: 0.5 }} />
-                <p>No {selectedStatus} listings found</p>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                {getCurrentListings().map((listing) => {
-                  const statusBadge = getStatusBadge(listing.verificationStatus || listing.approvalStatus || 'pending');
-                  const primaryImage = resolvePropertyImage(listing);
-                  return (
-                    <div key={listing.id} style={{ background: 'rgba(255,255,255,0.38)', border: `1px solid ${rule}`, borderRadius: 16, padding: '16px' }}>
-                      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-                        <img
-                          src={primaryImage || '/images/property-hero.svg'}
-                          alt={listing.title}
-                          style={{ width: 120, height: 80, objectFit: 'cover', borderRadius: 12 }}
-                        />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 8 }}>
-                            <div>
-                              <h3 style={{ fontFamily: serif, fontSize: 18, fontWeight: 500, marginBottom: 4 }}>{listing.title}</h3>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 12, color: ink2, flexWrap: 'wrap' }}>
-                                <span><MapPin size={12} /> {listing.location}</span>
-                                <span><Bed size={12} /> {listing.bedrooms || 0} beds</span>
-                                <span><Bath size={12} /> {listing.bathrooms || 0} baths</span>
-                                <span><Square size={12} /> {listing.area || 0} sqft</span>
-                              </div>
-                              <div style={{ fontSize: 11, color: ink3, marginTop: 4 }}>
-                                Submitted by: {listing.userName || listing.userEmail || 'Seller'} ({listing.userType || 'seller'})
-                              </div>
-                            </div>
-                            <div style={{ textAlign: 'right' }}>
-                              <div style={{ fontFamily: serif, fontSize: 20, fontWeight: 500, color: red }}>KES {listing.price?.toLocaleString()}</div>
-                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '4px 8px', borderRadius: 20, background: statusBadge.bg, color: statusBadge.color, fontSize: 11, marginTop: 4 }}>
-                                {statusBadge.icon} {statusBadge.label}
-                              </div>
-                            </div>
-                          </div>
-
-                          {listing.homepagePlacements?.length > 0 && (
-                            <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-                              <span style={{ fontSize: 11, color: ink3, alignSelf: 'center' }}>Homepage Sections:</span>
-                              {listing.homepagePlacements.map(p => (
-                                <span key={p} style={{ fontSize: 10, background: 'rgba(220,38,38,0.1)', color: red, padding: '2px 8px', borderRadius: 10, textTransform: 'capitalize' }}>
-                                  {p}
-                                </span>
-                              ))}
-                            </div>
-                          )}
-
-                          <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-                            <button
-                              onClick={() => { setSelectedPropertyInfo(listing); setShowInfoModal(true); }}
-                              style={{ padding: '8px 16px', background: 'rgba(0,0,0,0.06)', color: ink, border: 'none', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                            >
-                              <Info size={14} /> View All Seller Info
-                            </button>
-
-                            <button
-                              onClick={() => setPromoteProperty(listing)}
-                              style={{ padding: '8px 16px', background: greenLight, color: green, border: '1px solid rgba(16,185,129,0.35)', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                            >
-                              <MessageCircle size={14} /> Promote
-                            </button>
-
-                            {listing.verificationStatus !== 'approved' && listing.approvalStatus !== 'approved' && (
-                              <button
-                                onClick={() => handleOpenApproval(listing.id)}
-                                disabled={loading}
-                                style={{ padding: '8px 16px', background: green, color: 'white', border: 'none', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                              >
-                                <Check size={14} /> Approve & Publish
-                              </button>
-                            )}
-                            {listing.verificationStatus !== 'rejected' && listing.approvalStatus !== 'rejected' && (
-                              <button
-                                onClick={() => handleRejectListing(listing.id)}
-                                disabled={loading}
-                                style={{ padding: '8px 16px', background: red, color: 'white', border: 'none', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                              >
-                                <X size={14} /> Reject
-                              </button>
-                            )}
-                            {(listing.verificationStatus === 'approved' || listing.approvalStatus === 'approved') && (
-                              <button
-                                onClick={() => handleRevokeApproval(listing.id)}
-                                disabled={loading}
-                                style={{ padding: '8px 16px', background: '#f59e0b', color: 'white', border: 'none', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                              >
-                                <AlertCircle size={14} /> Revoke Approval
-                              </button>
-                            )}
-                            <button
-                              onClick={() => handleDeleteListing(listing.id)}
-                              disabled={loading}
-                              style={{ padding: '8px 16px', background: 'rgba(107,114,128,0.2)', color: ink2, border: 'none', borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
-                            >
-                              <Trash2 size={14} /> Delete
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Homepage Placements Section */}
-        {activeSection === 'homepageManager' && (
-          <div style={{ ...glass, padding: '24px' }}>
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontFamily: serif, fontSize: 18, fontWeight: 500 }}>Homepage Placement Manager</div>
-              <div style={{ fontSize: 12, color: ink2 }}>Choose exactly where approved properties render on the homepage sections</div>
-            </div>
-
-            {approvedListings.length === 0 ? (
-              <div style={{ textAlign: 'center', padding: 40, color: ink2 }}>
-                <Layout size={48} style={{ marginBottom: 12, opacity: 0.5 }} />
-                <p>No approved listings available to manage.</p>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                {approvedListings.map((listing) => {
-                  const currentPlacements = listing.homepagePlacements || ['featured', 'main'];
-                  return (
-                    <div key={listing.id} style={{ background: 'rgba(255,255,255,0.4)', padding: 16, borderRadius: 16, border: `1px solid ${rule}` }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                          <img src={resolvePropertyImage(listing) || '/images/property-hero.svg'} alt="" style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 8 }} />
-                          <div>
-                            <div style={{ fontWeight: 500, fontSize: 16 }}>{listing.title}</div>
-                            <div style={{ fontSize: 12, color: ink2 }}>{listing.location} · KES {listing.price?.toLocaleString()}</div>
-                          </div>
-                        </div>
-                        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-                          <span style={{ fontSize: 12, color: ink2 }}>Show on:</span>
-                          {['featured', 'hero', 'trending', 'main'].map(sec => {
-                            const isChecked = currentPlacements.includes(sec);
-                            return (
-                              <label key={sec} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, cursor: 'pointer', background: isChecked ? redLight : 'rgba(255,255,255,0.6)', padding: '6px 12px', borderRadius: 12, border: `1px solid ${isChecked ? red : rule}` }}>
-                                <input
-                                  type="checkbox"
-                                  checked={isChecked}
-                                  onChange={(e) => {
-                                    const updated = e.target.checked
-                                      ? [...currentPlacements, sec]
-                                      : currentPlacements.filter(p => p !== sec);
-                                    handleUpdatePlacements(listing.id, updated);
-                                  }}
-                                  style={{ accentColor: red }}
-                                />
-                                <span style={{ textTransform: 'capitalize', fontWeight: isChecked ? 500 : 400 }}>{sec}</span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Edit All Pages Section (Homepage, Explore, About, Agents) */}
-        {activeSection === 'homepageEditor' && (
-          <div style={{ ...glass, padding: '28px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24, flexWrap: 'wrap', gap: 16 }}>
-              <div>
-                <div style={{ fontFamily: serif, fontSize: 20, fontWeight: 500 }}>Edit Site Pages Content</div>
-                <div style={{ fontSize: 12, color: ink2 }}>Select a page to edit its title, hero text, and content</div>
-              </div>
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {[
-                  { id: 'homepage', label: 'Homepage' },
-                  { id: 'explore', label: 'Explore Page' },
-                  { id: 'about', label: 'About Page' },
-                  { id: 'agents', label: 'Agents Page' },
-                  { id: 'custom', label: 'Custom Page' }
-                ].map(tab => (
-                  <button
-                    key={tab.id}
-                    onClick={() => setEditorSubTab(tab.id)}
-                    style={{
-                      padding: '8px 16px',
-                      borderRadius: 12,
-                      background: editorSubTab === tab.id ? red : 'rgba(255,255,255,0.6)',
-                      color: editorSubTab === tab.id ? 'white' : ink2,
-                      border: `1px solid ${editorSubTab === tab.id ? red : rule}`,
-                      cursor: 'pointer',
-                      fontSize: 12,
-                      fontWeight: 500
-                    }}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* HOMEPAGE EDITOR FORM */}
-            {editorSubTab === 'homepage' && (
-              <form onSubmit={handleSaveHomepageSettings} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>Homepage Hero Section</h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Hero Title</label>
-                      <input
-                        type="text"
-                        value={homepageForm.hero.title}
-                        onChange={(e) => setHomepageForm({...homepageForm, hero: {...homepageForm.hero, title: e.target.value}})}
-                        style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                      />
-                    </div>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Search Placeholder</label>
-                      <input
-                        type="text"
-                        value={homepageForm.hero.searchPlaceholder}
-                        onChange={(e) => setHomepageForm({...homepageForm, hero: {...homepageForm.hero, searchPlaceholder: e.target.value}})}
-                        style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Hero Subtitle</label>
-                    <textarea
-                      rows="2"
-                      value={homepageForm.hero.subtitle}
-                      onChange={(e) => setHomepageForm({...homepageForm, hero: {...homepageForm.hero, subtitle: e.target.value}})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div style={{ marginTop: 12 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Default Hero Background Image URL</label>
-                    <input
-                      type="text"
-                      value={homepageForm.hero.backgroundImage}
-                      onChange={(e) => setHomepageForm({...homepageForm, hero: {...homepageForm.hero, backgroundImage: e.target.value}})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                </div>
-
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>Call to Action (CTA) Banner</h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>CTA Title</label>
-                      <input
-                        type="text"
-                        value={homepageForm.cta.title}
-                        onChange={(e) => setHomepageForm({...homepageForm, cta: {...homepageForm.cta, title: e.target.value}})}
-                        style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                      />
-                    </div>
-                    <div>
-                      <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Button 1 Text</label>
-                      <input
-                        type="text"
-                        value={homepageForm.cta.button1Text}
-                        onChange={(e) => setHomepageForm({...homepageForm, cta: {...homepageForm.cta, button1Text: e.target.value}})}
-                        style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>CTA Subtitle</label>
-                    <textarea
-                      rows="2"
-                      value={homepageForm.cta.subtitle}
-                      onChange={(e) => setHomepageForm({...homepageForm, cta: {...homepageForm.cta, subtitle: e.target.value}})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    style={{ padding: '12px 28px', background: red, color: 'white', border: 'none', borderRadius: 14, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
-                  >
-                    <Save size={16} /> {loading ? 'Saving...' : 'Save Homepage Changes'}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {/* EXPLORE PAGE EDITOR FORM */}
-            {editorSubTab === 'explore' && (
-              <form onSubmit={handleSaveExploreSettings} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>Explore Page Header</h3>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page Title</label>
-                    <input
-                      type="text"
-                      value={exploreForm.title}
-                      onChange={(e) => setExploreForm({...exploreForm, title: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page Subtitle</label>
-                    <textarea
-                      rows="3"
-                      value={exploreForm.subtitle}
-                      onChange={(e) => setExploreForm({...exploreForm, subtitle: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    style={{ padding: '12px 28px', background: red, color: 'white', border: 'none', borderRadius: 14, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
-                  >
-                    <Save size={16} /> {loading ? 'Saving...' : 'Save Explore Page Changes'}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {/* ABOUT PAGE EDITOR FORM */}
-            {editorSubTab === 'about' && (
-              <form onSubmit={handleSaveAboutSettings} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>About Page Content</h3>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page Title</label>
-                    <input
-                      type="text"
-                      value={aboutForm.title}
-                      onChange={(e) => setAboutForm({...aboutForm, title: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Subtitle</label>
-                    <input
-                      type="text"
-                      value={aboutForm.subtitle}
-                      onChange={(e) => setAboutForm({...aboutForm, subtitle: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Company Story & Mission</label>
-                    <textarea
-                      rows="6"
-                      value={aboutForm.story}
-                      onChange={(e) => setAboutForm({...aboutForm, story: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    style={{ padding: '12px 28px', background: red, color: 'white', border: 'none', borderRadius: 14, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
-                  >
-                    <Save size={16} /> {loading ? 'Saving...' : 'Save About Page Changes'}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {/* AGENTS PAGE EDITOR FORM */}
-            {editorSubTab === 'agents' && (
-              <form onSubmit={handleSaveAgentsSettings} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>Agents Page Header & CTA</h3>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page Title</label>
-                    <input
-                      type="text"
-                      value={agentsForm.title}
-                      onChange={(e) => setAgentsForm({...agentsForm, title: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page Subtitle</label>
-                    <textarea
-                      rows="2"
-                      value={agentsForm.subtitle}
-                      onChange={(e) => setAgentsForm({...agentsForm, subtitle: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Join Team CTA Title</label>
-                    <input
-                      type="text"
-                      value={agentsForm.ctaTitle}
-                      onChange={(e) => setAgentsForm({...agentsForm, ctaTitle: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Join Team CTA Subtitle</label>
-                    <textarea
-                      rows="2"
-                      value={agentsForm.ctaSubtitle}
-                      onChange={(e) => setAgentsForm({...agentsForm, ctaSubtitle: e.target.value})}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    style={{ padding: '12px 28px', background: red, color: 'white', border: 'none', borderRadius: 14, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
-                  >
-                    <Save size={16} /> {loading ? 'Saving...' : 'Save Agents Page Changes'}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {editorSubTab === 'custom' && (
-              <form onSubmit={handleSaveCustomPageSettings} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                <div style={{ background: 'rgba(255,255,255,0.5)', padding: 20, borderRadius: 16, border: `1px solid ${rule}` }}>
-                  <h3 style={{ fontFamily: serif, fontSize: 16, fontWeight: 600, marginBottom: 12, color: red }}>Custom Page Editor</h3>
-                  <div style={{ marginBottom: 16 }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page slug</label>
-                    <input
-                      type="text"
-                      value={customPageSlug}
-                      onChange={(e) => setCustomPageSlug(e.target.value.trim() || 'homepage')}
-                      style={{ width: '100%', padding: '10px', borderRadius: 10, border: '1px solid #d1d5db', background: '#fff' }}
-                    />
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
-                    <button
-                      type="button"
-                      onClick={() => handleLoadCustomPage(customPageSlug)}
-                      style={{ padding: '8px 12px', borderRadius: 10, border: `1px solid ${rule}`, background: 'rgba(255,255,255,0.8)', color: ink2, cursor: 'pointer' }}
-                    >
-                      Load page
-                    </button>
-                  </div>
-                  <div>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Page JSON</label>
-                    <textarea
-                      rows="18"
-                      value={customPageJson}
-                      onChange={(e) => setCustomPageJson(e.target.value)}
-                      style={{ width: '100%', padding: '12px', borderRadius: 12, border: '1px solid #d1d5db', background: '#fff', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    style={{ padding: '12px 28px', background: red, color: 'white', border: 'none', borderRadius: 14, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
-                  >
-                    <Save size={16} /> {loading ? 'Saving...' : 'Save Custom Page'}
-                  </button>
-                </div>
-              </form>
-            )}
-          </div>
-        )}
-
-        {/* Users Section */}
-        {activeSection === 'users' && (
-          <div style={{ ...glass, padding: '24px' }}>
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontFamily: serif, fontSize: 18, fontWeight: 500 }}>User Management</div>
-              <div style={{ fontSize: 12, color: ink2 }}>Manage users, agents, sellers, and staff access</div>
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 18, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {['all', ...roles.map(role => role.value)].map(roleValue => {
-                  const roleMeta = roles.find(role => role.value === roleValue) || { label: 'All Users', value: 'all' };
-                  const count = roleValue === 'all' ? users.length : users.filter(user => (user.role || 'user') === roleValue).length;
-                  return (
-                    <button
-                      key={roleValue}
-                      onClick={() => setSelectedRole(roleValue)}
-                      style={{
-                        padding: '8px 12px',
-                        borderRadius: 20,
-                        border: '1px solid rgba(255,255,255,0.2)',
-                        background: selectedRole === roleValue ? red : 'rgba(255,255,255,0.15)',
-                        color: selectedRole === roleValue ? 'white' : ink2,
-                        cursor: 'pointer',
-                        fontSize: 11,
-                        fontWeight: 500,
-                      }}
-                    >
-                      {roleMeta.label} ({count})
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div style={{ minWidth: 220, flex: 1, maxWidth: 340 }}>
-                <input
-                  type="text"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Search user name or email"
-                  style={{ width: '100%', padding: '10px 12px', borderRadius: 12, border: `1px solid ${rule}`, background: 'rgba(255,255,255,0.5)', color: ink }}
-                />
-              </div>
-            </div>
-
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: `1px solid ${rule}` }}>
-                    <th style={{ textAlign: 'left', padding: '12px', fontSize: 11, fontWeight: 500, color: ink3 }}>User</th>
-                    <th style={{ textAlign: 'left', padding: '12px', fontSize: 11, fontWeight: 500, color: ink3 }}>Contact</th>
-                    <th style={{ textAlign: 'left', padding: '12px', fontSize: 11, fontWeight: 500, color: ink3 }}>Role</th>
-                    <th style={{ textAlign: 'right', padding: '12px', fontSize: 11, fontWeight: 500, color: ink3 }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredUsers.slice(0, 15).map((user) => (
-                    <tr key={user.id} style={{ borderBottom: `1px solid ${rule}` }}>
-                      <td style={{ padding: '12px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                          <div style={{ width: 36, height: 36, borderRadius: '50%', background: `linear-gradient(135deg, ${red}, #ef4444)`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontWeight: 'bold' }}>
-                            {user.name?.charAt(0) || user.email?.charAt(0) || 'U'}
-                          </div>
-                          <div>
-                            <div style={{ fontWeight: 500 }}>{user.name || 'No Name'}</div>
-                            <div style={{ fontSize: 11, color: ink3 }}>{user.email}</div>
-                          </div>
-                        </div>
-                      </td>
-                      <td style={{ padding: '12px' }}>
-                        <div style={{ fontSize: 11, color: ink2 }}>{user.phone || 'No phone'}</div>
-                      </td>
-                      <td style={{ padding: '12px' }}>
-                        <select
-                          value={user.role || 'user'}
-                          onChange={(e) => handleUpdateUserRole(user.id, e.target.value)}
-                          style={{ padding: '4px 8px', borderRadius: 12, fontSize: 11, border: `1px solid ${rule}` }}
-                        >
-                          {roles.map(role => <option key={role.value} value={role.value}>{role.label}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ padding: '12px', textAlign: 'right' }}>
-                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
-                          {(user.role === 'agent' || user.role === 'seller') && (
-                            <button onClick={() => openAgentProfileEditor(user)} style={{ padding: 6, background: 'rgba(59,130,246,0.12)', border: 'none', borderRadius: 8, cursor: 'pointer', color: '#2563eb' }}>
-                              <UserCheck size={14} />
-                            </button>
-                          )}
-                          <button onClick={() => handleDeleteUser(user.id, user.name || user.email)} style={{ padding: 6, background: redLight, border: 'none', borderRadius: 8, cursor: 'pointer' }}>
-                            <Trash2 size={14} color={red} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-
-              {filteredUsers.length === 0 && (
-                <div style={{ padding: '24px 12px', textAlign: 'center', color: ink2 }}>
-                  No users found for this role or search.
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* All Properties Section */}
-        {activeSection === 'allProperties' && (
-          <div style={{ ...glass, padding: '24px' }}>
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontFamily: serif, fontSize: 18, fontWeight: 500 }}>All Properties</div>
-              <div style={{ fontSize: 12, color: ink2 }}>Complete list of all property listings in database</div>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 16 }}>
-              {properties.map((property) => (
-                <div key={property.id} style={{ background: 'rgba(255,255,255,0.38)', border: `1px solid ${rule}`, borderRadius: 12, overflow: 'hidden' }}>
-                  <img src={resolvePropertyImage(property) || '/images/property-hero.svg'} alt={property.title} style={{ width: '100%', height: 150, objectFit: 'cover' }} />
-                  <div style={{ padding: 12 }}>
-                    <div style={{ fontWeight: 500, fontSize: 14 }}>{property.title}</div>
-                    <div style={{ fontSize: 11, color: ink2 }}>{property.location}</div>
-                    <div style={{ fontSize: 14, fontWeight: 500, color: red, marginTop: 4 }}>KES {property.price?.toLocaleString()}</div>
-                    <div style={{ fontSize: 10, color: ink3, marginTop: 4 }}>Status: {property.verificationStatus || property.approvalStatus || 'pending'}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {showAgentProfileModal && (
-          <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, zIndex: 1000 }}>
-            <div style={{ width: '100%', maxWidth: 620, maxHeight: '85vh', overflowY: 'auto', background: '#fff', borderRadius: 18, boxShadow: '0 20px 60px rgba(0,0,0,0.25)', padding: 20 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-                <div>
-                  <div style={{ fontFamily: serif, fontSize: 20, fontWeight: 600, color: red }}>Agent Profile</div>
-                  <div style={{ fontSize: 12, color: ink2 }}>Update the account profile associated with this agent login email.</div>
-                </div>
-                <button onClick={() => setShowAgentProfileModal(false)} style={{ border: 'none', background: 'transparent', fontSize: 22, cursor: 'pointer', color: ink2 }}>×</button>
-              </div>
-
-              <form onSubmit={handleSaveAgentProfile} style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 14 }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Full name</label>
-                  <input value={agentProfileDraft.name} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, name: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Login email</label>
-                  <input value={agentProfileDraft.email} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, email: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Phone</label>
-                  <input value={agentProfileDraft.phone} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, phone: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Role title</label>
-                  <input value={agentProfileDraft.title} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, title: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div style={{ gridColumn: '1 / -1' }}>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Photo URL</label>
-                  <input value={agentProfileDraft.photo} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, photo: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div style={{ gridColumn: '1 / -1' }}>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Bio</label>
-                  <textarea rows="3" value={agentProfileDraft.bio} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, bio: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Specialties</label>
-                  <input value={agentProfileDraft.specialties.join(', ')} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, specialties: e.target.value.split(',').map(item => item.trim()).filter(Boolean) })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Languages</label>
-                  <input value={agentProfileDraft.languages.join(', ')} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, languages: e.target.value.split(',').map(item => item.trim()).filter(Boolean) })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Experience (years)</label>
-                  <input type="number" value={agentProfileDraft.experience} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, experience: Number(e.target.value || 1) })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Rating</label>
-                  <input type="number" step="0.1" min="0" max="5" value={agentProfileDraft.rating} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, rating: Number(e.target.value || 4.8) })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Properties sold</label>
-                  <input type="number" value={agentProfileDraft.propertiesSold} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, propertiesSold: Number(e.target.value || 0) })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, marginBottom: 6, color: ink2 }}>Office / branch</label>
-                  <input value={agentProfileDraft.office} onChange={(e) => setAgentProfileDraft({ ...agentProfileDraft, office: e.target.value })} style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db' }} />
-                </div>
-
-                <div style={{ gridColumn: '1 / -1', display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
-                  <button type="button" onClick={() => setShowAgentProfileModal(false)} style={{ padding: '10px 18px', borderRadius: 12, border: `1px solid ${rule}`, background: '#fff', color: ink2, cursor: 'pointer' }}>Cancel</button>
-                  <button type="submit" style={{ padding: '10px 18px', borderRadius: 12, border: 'none', background: red, color: '#fff', cursor: 'pointer' }}>Save agent profile</button>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
-
-        {/* Analytics Section */}
-        {activeSection === 'transportRequests' && <TransportRequestsPage />}
-        {activeSection === 'driverApprovals' && (
-          <div style={{ ...glass, padding: '24px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 20 }}>
-              <div>
-                <div style={{ fontFamily: serif, fontSize: 20, fontWeight: 500 }}>Driver Approvals</div>
-                <div style={{ fontSize: 12, color: ink2, marginTop: 4 }}>
-                  Drivers self-register at <a href="/driver/onboard" target="_blank" rel="noreferrer" style={{ color: red, fontWeight: 600, textDecoration: 'underline' }}>/driver/onboard</a>. Review vehicle + license, then approve or reject.
-                </div>
-              </div>
-              <button type="button" onClick={loadDrivers} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 12, background: '#fff', color: ink2, border: `1px solid ${rule}`, cursor: 'pointer' }}>
-                <RefreshCw size={15} /> Refresh
-              </button>
-            </div>
-
-            <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
-              {[
-                { id: 'pending', label: 'Pending', count: allDrivers.filter(d => d.driverStatus !== 'approved' && d.driverStatus !== 'rejected').length },
-                { id: 'approved', label: 'Approved', count: allDrivers.filter(d => d.driverStatus === 'approved' || d.driverApproved === true).length },
-                { id: 'rejected', label: 'Rejected', count: allDrivers.filter(d => d.driverStatus === 'rejected').length },
-                { id: 'all', label: 'All', count: allDrivers.length },
-              ].map(tab => (
-                <button key={tab.id} onClick={() => setDriverFilter(tab.id)} style={{ padding: '8px 16px', borderRadius: 20, background: driverFilter === tab.id ? red : 'transparent', color: driverFilter === tab.id ? 'white' : ink2, border: `1px solid ${driverFilter === tab.id ? red : rule}`, cursor: 'pointer', fontSize: 12, fontWeight: 500 }}>
-                  {tab.label} · {tab.count}
-                </button>
-              ))}
-            </div>
-
-            {(() => {
-              const visible = allDrivers.filter(d => {
-                if (driverFilter === 'all') return true;
-                if (driverFilter === 'approved') return d.driverStatus === 'approved' || d.driverApproved === true;
-                if (driverFilter === 'rejected') return d.driverStatus === 'rejected';
-                return d.driverStatus !== 'approved' && d.driverStatus !== 'rejected' && d.driverApproved !== true;
-              });
-
-              if (!visible.length) return (
-                <div style={{ padding: 40, textAlign: 'center', color: ink2, border: `1px dashed ${rule}`, borderRadius: 16 }}>
-                  <UserCheck size={40} style={{ opacity: 0.4, marginBottom: 12 }} />
-                  <p style={{ margin: 0 }}>No {driverFilter} driver applications.</p>
-                </div>
-              );
-
-              return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                  {visible.map(driver => {
-                    const profile = driver.driverProfile || {};
-                    const status = driver.driverApproved === true || driver.driverStatus === 'approved' ? 'approved' : driver.driverStatus === 'rejected' ? 'rejected' : 'pending';
-                    const badge = status === 'approved' ? { bg: greenLight, color: green, label: 'Approved' } : status === 'rejected' ? { bg: redLight, color: red, label: 'Rejected' } : { bg: yellowLight, color: yellow, label: 'Pending review' };
-                    return (
-                      <div key={driver.id} style={{ background: 'rgba(255,255,255,0.55)', border: `1px solid ${rule}`, borderRadius: 16, padding: 16, display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-                        <div style={{ width: 56, height: 56, borderRadius: '50%', background: `linear-gradient(135deg, ${red}, #ef4444)`, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 20, flex: '0 0 auto' }}>
-                          {(driver.name || driver.email || 'D').charAt(0).toUpperCase()}
-                        </div>
-                        <div style={{ flex: '1 1 320px', minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                            <span style={{ fontWeight: 600, fontSize: 15 }}>{driver.name || 'No name'}</span>
-                            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 10px', borderRadius: 10, background: badge.bg, color: badge.color, textTransform: 'uppercase', letterSpacing: 0.4 }}>{badge.label}</span>
-                          </div>
-                          <div style={{ fontSize: 12, color: ink2, marginTop: 3 }}>{driver.email || '—'} · {profile.phone || driver.phone || '—'}</div>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8, marginTop: 12 }}>
-                            <div style={{ background: 'rgba(0,0,0,0.03)', padding: '8px 10px', borderRadius: 10 }}>
-                              <div style={{ fontSize: 10, color: ink3, textTransform: 'uppercase', letterSpacing: 0.4 }}>Vehicle</div>
-                              <div style={{ fontSize: 13, fontWeight: 500 }}>{profile.vehicleId || '—'}</div>
-                            </div>
-                            <div style={{ background: 'rgba(0,0,0,0.03)', padding: '8px 10px', borderRadius: 10 }}>
-                              <div style={{ fontSize: 10, color: ink3, textTransform: 'uppercase', letterSpacing: 0.4 }}>Plate</div>
-                              <div style={{ fontSize: 13, fontWeight: 500 }}>{profile.plate || '—'}</div>
-                            </div>
-                            <div style={{ background: 'rgba(0,0,0,0.03)', padding: '8px 10px', borderRadius: 10 }}>
-                              <div style={{ fontSize: 10, color: ink3, textTransform: 'uppercase', letterSpacing: 0.4 }}>License</div>
-                              <div style={{ fontSize: 13, fontWeight: 500 }}>{profile.licenseNumber || '—'}</div>
-                            </div>
-                          </div>
-                          {driver.driverRejectionReason && status === 'rejected' && (
-                            <div style={{ marginTop: 10, fontSize: 12, color: red, background: redLight, padding: '6px 10px', borderRadius: 8 }}>Reason: {driver.driverRejectionReason}</div>
-                          )}
-                        </div>
-                        <div style={{ display: 'flex', gap: 8, flex: '0 0 auto' }}>
-                          {status !== 'approved' && (
-                            <button onClick={() => handleDriverDecision(driver, 'approve')} disabled={driverSavingId === driver.id} style={{ padding: '9px 16px', background: green, color: '#fff', border: 'none', borderRadius: 12, cursor: 'pointer', fontSize: 12, fontWeight: 600, opacity: driverSavingId === driver.id ? 0.6 : 1 }}>{driverSavingId === driver.id ? 'Working…' : 'Approve'}</button>
-                          )}
-                          {status !== 'rejected' && (
-                            <button onClick={() => handleDriverDecision(driver, 'reject')} disabled={driverSavingId === driver.id} style={{ padding: '9px 16px', background: red, color: '#fff', border: 'none', borderRadius: 12, cursor: 'pointer', fontSize: 12, fontWeight: 600, opacity: driverSavingId === driver.id ? 0.6 : 1 }}>Reject</button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })()}
-          </div>
-        )}
-
-        {activeSection === 'serviceRequests' && <AdminServiceRequestsPage />}
-        {activeSection === 'movingPackages' && <MovingPackagesPage />}
-        {activeSection === 'agencyPackages' && <AgencyPackagesPage />}
-        {activeSection === 'sightseeingPackages' && <SightseeingPackagesPage />}
-        {activeSection === 'whatsappControl' && <WhatsAppControl />}
-
-        {activeSection === 'analytics' && (
-          <div style={{ ...glass, padding: '24px', textAlign: 'center' }}>
-            <BarChart size={48} style={{ margin: '40px auto 16px', opacity: 0.5 }} />
-            <div style={{ fontFamily: serif, fontSize: 18, fontWeight: 500, marginBottom: 8 }}>Analytics Dashboard</div>
-            <div style={{ fontSize: 13, color: ink2 }}>Platform metrics, inquiries, and revenue overview.</div>
-          </div>
-        )}
-
-        {activeSection === 'apiDomains' && (
-          <div style={{ ...glass, padding: '24px', maxWidth: 900 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 20 }}>
-              <div>
-                <div style={{ fontFamily: serif, fontSize: 20, fontWeight: 500 }}>YouTube API Website Domains</div>
-                <div style={{ fontSize: 12, color: ink2, marginTop: 4 }}>
-                  Control which MarketMix websites may call the video API. Changes apply immediately.
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={loadAllowedOrigins}
-                disabled={originLoading}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 12, background: '#fff', color: ink2, border: `1px solid ${rule}`, cursor: originLoading ? 'wait' : 'pointer' }}
-              >
-                <RefreshCw size={15} className={originLoading ? 'animate-spin' : ''} />
-                Refresh
-              </button>
-            </div>
-
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20 }}>
-              <a href={`${YOUTUBE_ADMIN_API}/health`} target="_blank" rel="noreferrer" style={{ color: red, fontSize: 12, fontWeight: 600 }}>
-                Open YouTube API health
-              </a>
-              <span style={{ color: ink3, fontSize: 12 }}>{YOUTUBE_ADMIN_API}</span>
-            </div>
-
-            <form onSubmit={handleAddOrigin} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
-              <input
-                type="url"
-                value={originInput}
-                onChange={(event) => setOriginInput(event.target.value)}
-                placeholder="https://your-new-domain.com"
-                aria-label="Website origin to allow"
-                style={{ flex: '1 1 280px', minWidth: 0, padding: '11px 12px', border: '1px solid #d1d5db', borderRadius: 10, background: '#fff', fontSize: 13 }}
-              />
-              <button type="submit" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 16px', border: 0, borderRadius: 10, background: red, color: '#fff', fontWeight: 600, cursor: 'pointer' }}>
-                <Plus size={16} /> Add domain
-              </button>
-            </form>
-
-            <div style={{ fontSize: 11, color: ink3, marginBottom: 16 }}>
-              Enter the origin only: HTTPS scheme and domain, with no page path. Localhost is allowed for local development.
-            </div>
-
-            {originError && (
-              <div role="alert" style={{ marginBottom: 16, padding: 12, color: '#991b1b', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, fontSize: 12 }}>
-                {originError}
-              </div>
-            )}
-
-            {originLoading ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: ink2, padding: 18 }}>
-                <Loader size={16} className="animate-spin" /> Loading allowed domains…
-              </div>
-            ) : allowedOrigins.length === 0 ? (
-              <div style={{ padding: 18, border: `1px dashed ${rule}`, borderRadius: 12, color: ink2, fontSize: 13 }}>
-                No domains loaded. Check the YouTube server connection and Firebase admin credentials.
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {allowedOrigins.map((origin) => (
-                  <div key={origin} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '11px 12px', border: `1px solid ${rule}`, borderRadius: 10, background: 'rgba(255,255,255,0.65)' }}>
-                    <span style={{ minWidth: 0, overflowWrap: 'anywhere', color: ink, fontSize: 13 }}>{origin}</span>
-                    <button
-                      type="button"
-                      onClick={() => setAllowedOrigins((origins) => origins.filter((item) => item !== origin))}
-                      aria-label={`Remove ${origin}`}
-                      title="Remove domain"
-                      style={{ flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 34, height: 34, border: 0, borderRadius: 8, background: redLight, color: red, cursor: 'pointer' }}
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
-              <button
-                type="button"
-                onClick={handleSaveOrigins}
-                disabled={originLoading || originSaving}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '11px 18px', border: 0, borderRadius: 12, background: green, color: '#fff', fontWeight: 600, cursor: originSaving ? 'wait' : 'pointer', opacity: originLoading || originSaving ? 0.6 : 1 }}
-              >
-                {originSaving ? <Loader size={15} className="animate-spin" /> : <Save size={15} />}
-                {originSaving ? 'Saving…' : 'Save domains'}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* FULL SELLER INFO MODAL */}
-      {showInfoModal && selectedPropertyInfo && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-          <div style={{ background: '#fff', borderRadius: 20, maxWidth: 700, width: '100%', maxHeight: '90vh', overflowY: 'auto', padding: 30, boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #e5e7eb', paddingBottom: 16, marginBottom: 20 }}>
-              <div>
-                <h2 style={{ fontFamily: serif, fontSize: 22, fontWeight: 600 }}>Complete Seller Submission Info</h2>
-                <p style={{ fontSize: 12, color: ink2 }}>All data provided by seller for review before approval</p>
-              </div>
-              <button onClick={() => setShowInfoModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
-                <X size={20} />
-              </button>
-            </div>
-
-            {selectedPropertyInfo.images?.length > 0 && (
-              <div style={{ marginBottom: 20 }}>
-                <h4 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: ink }}>Uploaded Photos ({selectedPropertyInfo.images.length})</h4>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 8 }}>
-                  {selectedPropertyInfo.images.map((imgUrl, i) => (
-                    <img key={i} src={imgUrl} alt="" style={{ width: '100px', height: 80, objectFit: 'cover', borderRadius: 8 }} />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div style={{ background: '#f9fafb', borderRadius: 12, padding: 16, border: '1px solid #e5e7eb' }}>
-              {renderInfoTree(selectedPropertyInfo)}
-            </div>
-
-            <div style={{ marginTop: 24, textAlign: 'right' }}>
-              <button
-                onClick={() => setShowInfoModal(false)}
-                style={{ background: red, color: '#fff', border: 'none', borderRadius: 12, padding: '10px 24px', fontSize: 13, cursor: 'pointer', fontWeight: 500 }}
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* APPROVAL WITH HOMEPAGE PLACEMENT MODAL */}
-      {showApprovalModal && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-          <div style={{ background: '#fff', borderRadius: 20, maxWidth: 500, width: '100%', padding: 30, boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #e5e7eb', paddingBottom: 16, marginBottom: 20 }}>
-              <h2 style={{ fontFamily: serif, fontSize: 20, fontWeight: 600 }}>Approve & Choose Homepage Placements</h2>
-              <button onClick={() => setShowApprovalModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
-                <X size={20} />
-              </button>
-            </div>
-
-            <p style={{ fontSize: 13, color: ink2, marginBottom: 16 }}>
-              Select where this property should be rendered on the homepage after approval:
-            </p>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 24 }}>
-              {[
-                { id: 'featured', label: '🌟 Featured Properties Section', desc: 'Display in the main featured properties grid on homepage' },
-                { id: 'hero', label: '🚀 Hero Banner / Spotlight', desc: 'Highlight in the top hero showcase banner' },
-                { id: 'trending', label: '🔥 Trending & Popular', desc: 'Show in trending/popular section' },
-                { id: 'main', label: '🏠 General Main Feed', desc: 'Show in general listing feeds and explore page' },
-              ].map(item => {
-                const checked = selectedPlacements.includes(item.id);
-                return (
-                  <label key={item.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, background: checked ? 'rgba(220,38,38,0.04)' : '#f9fafb', border: `1px solid ${checked ? red : '#e5e7eb'}`, padding: 12, borderRadius: 12, cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={(e) => {
-                        setSelectedPlacements(
-                          e.target.checked
-                            ? [...selectedPlacements, item.id]
-                            : selectedPlacements.filter(p => p !== item.id)
-                        );
-                      }}
-                      style={{ marginTop: 2, accentColor: red }}
-                    />
-                    <div>
-                      <div style={{ fontWeight: 500, fontSize: 14 }}>{item.label}</div>
-                      <div style={{ fontSize: 11, color: ink2, marginTop: 2 }}>{item.desc}</div>
-                    </div>
-                  </label>
-                );
-              })}
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
-              <button
-                onClick={() => setShowApprovalModal(false)}
-                style={{ background: 'transparent', color: ink, border: '1px solid #d1d5db', borderRadius: 12, padding: '10px 20px', fontSize: 13, cursor: 'pointer' }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmApproval}
-                disabled={loading || selectedPlacements.length === 0}
-                style={{ background: green, color: '#fff', border: 'none', borderRadius: 12, padding: '10px 24px', fontSize: 13, cursor: 'pointer', fontWeight: 500 }}
-              >
-                {loading ? 'Approving...' : 'Confirm & Publish'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
+    console.error(`CORS blocked: ${origin}`);
+    return callback(new Error(`CORS blocked: ${origin}`), false);
+  },
+  credentials: true,
+}));
+
+// ============================
+// Middleware
+// ============================
+app.use(bodyParser.json());
+
+app.use((req, res, next) => {
+  try {
+    console.log(`${new Date().toISOString()} → ${req.method} ${req.originalUrl}`, req.body || {});
+  } catch (e) {
+    console.error("Logging error:", e);
+  }
+  next();
+});
+
+// ============================
+// ENV CHECK
+// ============================
+const requiredEnv = [
+  "INTASEND_PUBLISHABLE_KEY",
+  "INTASEND_SECRET_KEY",
+  "FIREBASE_SERVICE_ACCOUNT_KEY",
+  "FIREBASE_REALESTATE_KEY",
+];
+const missing = requiredEnv.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error("❌ Missing env vars:", missing.join(", "));
+  process.exit(1);
+}
+
+// ============================
+// Firebase — two Admin apps
+// ============================
+let shopApp;
+let reApp;
+let db;
+let reDb;
+
+try {
+  const shopSA = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+  shopApp = admin.initializeApp({ credential: admin.credential.cert(shopSA) });
+  console.log("✅ Firebase Admin (shop) initialized");
+
+  const reSA = JSON.parse(process.env.FIREBASE_REALESTATE_KEY);
+  reApp = admin.initializeApp(
+    { credential: admin.credential.cert(reSA) },
+    "realestate"
   );
+  console.log("✅ Firebase Admin (realestate) initialized");
+} catch (e) {
+  console.error("❌ Firebase Admin init failed:", e);
+  process.exit(1);
+}
+
+db = shopApp.firestore();   // Shop Firestore
+reDb = reApp.firestore();   // Real Estate Firestore
+
+async function verifyAnyToken(idToken) {
+  try {
+    return await shopApp.auth().verifyIdToken(idToken);
+  } catch (_) {}
+  try {
+    return await reApp.auth().verifyIdToken(idToken);
+  } catch (_) {}
+  throw new Error("Invalid auth token");
+}
+
+// ============================
+// IntaSend
+// ============================
+const intasend = new IntaSend(
+  process.env.INTASEND_PUBLISHABLE_KEY,
+  process.env.INTASEND_SECRET_KEY,
+  false
+);
+
+const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
+
+const REAL_ESTATE_RECEIPT_URL =
+  process.env.REAL_ESTATE_RECEIPT_URL ||
+  "https://marketmix-realestates.vercel.app/receipt";
+
+const MARKETPLACE_URL = "https://my-campus-store-frontend.vercel.app";
+
+const REAL_ESTATE_APP_URL = "https://marketmix-realestates.vercel.app";
+const MOVING_URL = `${REAL_ESTATE_APP_URL}/`;
+const DRIVER_DASHBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
+const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
+
+// ============================
+// Brevo senders
+// ============================
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+
+const SENDERS = {
+  sales:    { name: "MarketMix Kenya",        email: process.env.SENDER_SALES    || "sales@marketmix.site" },
+  security: { name: "MarketMix Kenya",        email: process.env.SENDER_SECURITY || "security@marketmix.site" },
+  bookings: { name: "MarketMix Real Estates", email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
+  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "support@marketmix.site" },
 };
 
-export default AdminDashboard;
+const sendEmail = async (to, subject, html, type = "security", phone = null) => {
+  try {
+    console.log("📧 Sending email:", { to, subject, type, phone: phone || "—" });
+    if (!BREVO_API_KEY) {
+      console.log("❌ BREVO_API_KEY not configured");
+      return false;
+    }
 
-ADMIN@DESKTOP-2NOEEN2 MINGW64 ~/Desktop/marketmix real estate/marketmix-realestates (main)
-$
+    const sender = SENDERS[type] || SENDERS.security;
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email: to, name: to.split("@")[0] || "User" }],
+        subject,
+        htmlContent: html,
+        tags: [type],
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error("❌ Brevo API error:", JSON.stringify(data, null, 2));
+      throw new Error(data.message || `Brevo API error: ${response.status}`);
+    }
+    console.log(`✅ Email sent (id=${data.messageId}) from ${sender.email}`);
+
+    if (phone) {
+      const emoji =
+        type === "bookings" ? "🏠" :
+        type === "moving" ? "🚚" :
+        type === "security" ? "🔐" : "🛍️";
+      const brand =
+        type === "bookings" ? "MarketMix Real Estates" :
+        type === "moving" ? "MarketMix Moving" : "MarketMix Kenya";
+
+      const plain = String(html)
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 220);
+
+      enqueueWhatsApp(phone, `${emoji} ${brand}\n${subject}\n\n${plain}`, {
+        kind: `companion-${type}`,
+        emailTo: to,
+      });
+    }
+
+    return true;
+  } catch (error) {
+    console.error("❌ Email sending failed:", error.message);
+    return false;
+  }
+};
+
+(async () => {
+  if (!BREVO_API_KEY) {
+    console.warn("⚠️ BREVO_API_KEY not set — emails will not be sent");
+    return;
+  }
+  try {
+    const r = await fetch("https://api.brevo.com/v3/account", {
+      headers: { accept: "application/json", "api-key": BREVO_API_KEY },
+    });
+    if (r.ok) {
+      const d = await r.json();
+      console.log(`✅ Brevo connected as ${d.email}`);
+    } else {
+      console.warn("⚠️ Brevo key may be invalid");
+    }
+  } catch (e) {
+    console.warn("⚠️ Brevo startup check failed:", e.message);
+  }
+})();
+
+// ============================
+// WhatsApp (WAHA) — queued sender
+// ============================
+const WAHA_URL = process.env.WAHA_URL;
+const WAHA_API_KEY = process.env.WAHA_API_KEY;
+const WAHA_TIMEOUT_MS = 8000;
+const WAHA_COLD_GRACE_MS = 30000;
+
+async function wahaFetch(path, opts = {}) {
+  if (!WAHA_URL) throw new Error("WAHA_URL not configured");
+  const timeoutMs = opts.timeoutMs ?? WAHA_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(`${WAHA_URL}${path}`, {
+      ...opts,
+      signal: controller.signal,
+      headers: {
+        "X-Api-Key": WAHA_API_KEY || "",
+        "Content-Type": "application/json",
+        ...(opts.headers || {}),
+      },
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizePhoneForWa(phoneNumber) {
+  if (!phoneNumber) return null;
+  let digits = String(phoneNumber).replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.startsWith("0")) digits = "254" + digits.slice(1);
+  if (digits.length === 9 && (digits.startsWith("7") || digits.startsWith("1"))) {
+    digits = "254" + digits;
+  }
+  if (!digits.startsWith("254")) digits = "254" + digits;
+  return digits;
+}
+
+const waQueue = [];
+let waRunning = false;
+const WA_MAX_ATTEMPTS = 4;
+
+function timeoutForAttempt(attempts) {
+  return attempts === 0 ? WAHA_TIMEOUT_MS : WAHA_COLD_GRACE_MS;
+}
+
+function backoffForAttempt(attempts) {
+  return [1000, 3000, 8000][attempts - 1] || 8000;
+}
+
+function enqueueWhatsApp(phoneNumber, message, meta = {}) {
+  const normalized = normalizePhoneForWa(phoneNumber);
+  if (!normalized) {
+    console.log("⚠️ WhatsApp skipped — invalid phone:", phoneNumber, meta);
+    return false;
+  }
+  waQueue.push({
+    phone: normalized,
+    message,
+    meta,
+    attempts: 0,
+    enqueuedAt: Date.now(),
+  });
+  console.log(`📥 WA queued → ${normalized} (queue size ${waQueue.length})`, meta);
+  drainWaQueue();
+  return true;
+}
+
+async function drainWaQueue() {
+  if (waRunning) return;
+  waRunning = true;
+  while (waQueue.length > 0) {
+    const job = waQueue.shift();
+    const ok = await attemptWaSend(job);
+
+    if (!ok && job.attempts < WA_MAX_ATTEMPTS) {
+      job.attempts += 1;
+      const delay = backoffForAttempt(job.attempts);
+      console.log(`🔁 WA retry ${job.attempts}/${WA_MAX_ATTEMPTS} in ${delay}ms → ${job.phone}`);
+      setTimeout(() => {
+        waQueue.push(job);
+        drainWaQueue();
+      }, delay).unref?.();
+    } else if (!ok) {
+      console.error(`❌ WA giving up after ${WA_MAX_ATTEMPTS} attempts → ${job.phone}`, job.meta);
+    }
+
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  waRunning = false;
+}
+
+async function attemptWaSend(job) {
+  if (!WAHA_URL || !WAHA_API_KEY) {
+    console.log("⚠️ WAHA not configured, dropping queued message");
+    return true;
+  }
+  const timeoutMs = timeoutForAttempt(job.attempts);
+  try {
+    const chatId = `${job.phone}@c.us`;
+    const res = await wahaFetch("/api/sendText", {
+      method: "POST",
+      timeoutMs,
+      body: JSON.stringify({ session: "default", chatId, text: job.message }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`❌ WAHA send failed (${res.status}, attempt ${job.attempts + 1}, ${timeoutMs}ms) → ${job.phone}`, data);
+      return false;
+    }
+    console.log(`📱 WhatsApp sent → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms)`);
+    return true;
+  } catch (e) {
+    const isAbort = e.name === "AbortError";
+    console.error(
+      `❌ WAHA ${isAbort ? "aborted" : "error"} → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms):`,
+      e.message
+    );
+    return false;
+  }
+}
+
+const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
+
+(function pingWaha() {
+  if (!WAHA_URL) {
+    console.log("🛑 WAHA ping disabled (WAHA_URL not set)");
+    return;
+  }
+  const INTERVAL = 4 * 60 * 1000;
+  const ping = () => {
+    wahaFetch("/health", { timeoutMs: 5000 }).catch(() => {});
+    setTimeout(ping, INTERVAL).unref?.();
+  };
+  setTimeout(ping, 30 * 1000).unref?.();
+  console.log("🌀 WAHA keep-alive active (every 4 min)");
+})();
+
+// ============================
+// Helpers
+// ============================
+const WITHDRAWAL_THRESHOLD = 100.0;
+const FIXED_FEE_BELOW_THRESHOLD = 10.0;
+const FIXED_FEE_ABOVE_THRESHOLD = 20.0;
+const AGENCY_FEE_RATE = 0.035;
+
+function getTieredFixedFee(amount) {
+  return amount < WITHDRAWAL_THRESHOLD ? FIXED_FEE_BELOW_THRESHOLD : FIXED_FEE_ABOVE_THRESHOLD;
+}
+function calculateTotalFee(amount) {
+  const percentageFee = amount * AGENCY_FEE_RATE;
+  const fixedFee = getTieredFixedFee(amount);
+  return +(percentageFee + fixedFee).toFixed(2);
+}
+function isValidPhone(phone) {
+  return typeof phone === "string" && /^(2547|2541)\d{8}$/.test(phone);
+}
+function parsePositiveNumber(value) {
+  const n = parseFloat(value);
+  return !isNaN(n) && n > 0 ? n : null;
+}
+function sendServerError(res, err, msg = "Internal server error") {
+  console.error(msg, err);
+  return res.status(500).json({ success: false, message: msg });
+}
+
+const isWalletRef       = (r) => typeof r === "string" && r.startsWith("WALLET_");
+const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
+const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
+const isMovingRef       = (r) => typeof r === "string" && r.startsWith("MOVE_");
+const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY_");
+
+function isRealEstateOrder(apiRef, orderData) {
+  return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
+}
+
+// ============================
+// EMAIL SHELL
+// ============================
+const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", title, subtitle, bodyHtml, ctaLabel, ctaUrl, footerNote = "" }) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${title}</title>
+</head>
+<body style="margin:0;padding:0;background:#eef2f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <div style="display:none;font-size:1px;color:#eef2f0;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">${preheader}</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#eef2f0;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;width:100%;">
+        <tr><td style="background:linear-gradient(135deg,#0b231c 0%,#123528 55%,#0e2b22 100%);border-radius:28px 28px 0 0;padding:32px 28px 28px 28px;color:#ffffff;">
+          <div style="font-size:11px;letter-spacing:.19em;text-transform:uppercase;color:#a7f3d0;font-weight:700;">${eyebrow}</div>
+          <div style="padding-top:12px;font-size:26px;line-height:1.25;font-weight:600;">${title}</div>
+          ${subtitle ? `<div style="padding-top:10px;font-size:14px;line-height:1.6;color:rgba(255,255,255,0.72);">${subtitle}</div>` : ""}
+        </td></tr>
+        <tr><td style="background:#ffffff;border:1px solid #e2e8e6;border-top:none;border-radius:0 0 28px 28px;padding:28px;">
+          ${bodyHtml}
+          ${ctaLabel && ctaUrl ? `
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:22px;">
+              <tr><td align="center">
+                <a href="${ctaUrl}" style="display:inline-block;background:#123528;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:12px;padding:14px 26px;">${ctaLabel}</a>
+              </td></tr>
+            </table>` : ""}
+          ${footerNote ? `<p style="margin:22px 0 0 0;font-size:12px;line-height:1.6;color:#94a3b8;text-align:center;">${footerNote}</p>` : ""}
+        </td></tr>
+        <tr><td style="padding:20px 12px 0 12px;text-align:center;font-size:11px;line-height:1.6;color:#64748b;">
+          MarketMix Kenya © ${new Date().getFullYear()}<br/>
+          <a href="mailto:marketmixkenya@gmail.com" style="color:#047857;text-decoration:none;">marketmixkenya@gmail.com</a>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+const emailInfoCard = (rows) => `
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+    <tr><td style="padding:18px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        ${rows.map(([label, value, highlight]) => `
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:#64748b;width:50%;">${label}</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:700;color:${highlight ? "#047857" : "#0f172a"};text-align:right;">${value}</td>
+          </tr>
+        `).join("")}
+      </table>
+    </td></tr>
+  </table>`;
+
+const emailBodyText = (text) => `
+  <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:#475569;">${text}</p>`;
+
+const emailSectionLabel = (label) => `
+  <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
+
+// ============================
+// Order confirmation email
+// ============================
+const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
+  try {
+    console.log("📧 Order confirmation →", userEmail);
+    if (!BREVO_API_KEY) return false;
+
+    const items = orderData.items || [];
+    const itemsTotal = items.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0);
+    const deliveryTotal = (orderData.sellerGroups || []).reduce((s, g) => s + (g.deliveryCost || 0), 0);
+    const total = orderData.totalAmount || (itemsTotal + deliveryTotal);
+
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${orderData.shippingDetails?.fullName || userEmail.split("@")[0]}</strong>, your payment is confirmed.`)}
+      ${emailSectionLabel("Order")}
+      ${emailInfoCard([
+        ["Order ID", String(orderId)],
+        ["Date", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
+        ["Buyer", orderData.shippingDetails?.fullName || "—"],
+      ])}
+      ${emailSectionLabel("Items")}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+        <tr><td style="padding:18px;font-size:13px;line-height:1.9;color:#334155;">
+          ${items.length ? items.map(i => `${i.name} × ${i.quantity} — Ksh ${((i.price||0)*(i.quantity||1)).toFixed(2)}`).join("<br/>") : "No items"}
+        </td></tr>
+      </table>
+      ${emailSectionLabel("Totals")}
+      ${emailInfoCard([
+        ["Items Total", `Ksh ${itemsTotal.toFixed(2)}`],
+        ["Delivery", `Ksh ${deliveryTotal.toFixed(2)}`],
+        ["Total Paid", `Ksh ${total.toFixed(2)}`, true],
+      ])}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Order #${String(orderId).slice(0,8)} confirmed`,
+      eyebrow: "MarketMix Kenya",
+      title: "Thank you for shopping with us",
+      subtitle: "Your payment is confirmed and your order is being prepared.",
+      bodyHtml,
+      ctaLabel: "View order receipt",
+      ctaUrl: `${MARKETPLACE_URL}/order-receipt/${orderId}`,
+      footerNote: "Need help? Reply to this email and we'll get back to you.",
+    });
+
+    const ok = await sendEmail(
+      userEmail,
+      `Order Confirmation #${String(orderId).slice(0, 8)} - MarketMix Kenya`,
+      html,
+      "sales",
+      orderData.shippingDetails?.phoneNumber || orderData.phoneNumber || null
+    );
+
+    if (ok) {
+      await db.collection("orderEmails").add({
+        orderId, userEmail, type: "confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Order email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
+// Real estate email
+// ============================
+const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
+  try {
+    console.log("🏠 Real estate receipt →", userEmail);
+    if (!BREVO_API_KEY) return false;
+
+    const mpesaRef = data.mpesaReference || data.mpesaCode || "—";
+    const displayId = mpesaRef;
+    const amount = Number(data.totalAmount || data.amount || 0);
+
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${data.buyerName || userEmail.split("@")[0]}</strong>, your payment has been received and confirmed.`)}
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:18px;padding:20px;text-align:center;margin-bottom:16px;">
+        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#047857;font-weight:700;">Amount paid</div>
+        <div style="font-size:28px;font-weight:700;color:#065f46;padding-top:6px;">KES ${amount.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</div>
+      </div>
+      ${emailSectionLabel("Property")}
+      ${emailInfoCard([
+        ["Property", data.propertyTitle || "—"],
+        ["Location", data.propertyLocation || "—"],
+        ["Type", data.propertyType || "—"],
+        ["M-Pesa code", displayId],
+        ["Paid on", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
+      ])}
+      ${emailSectionLabel("Landlord / Agent")}
+      ${emailInfoCard([
+        ["Name", data.landlordName || "—"],
+        ["Phone", data.landlordPhone || "—"],
+      ])}
+      ${emailBodyText("The landlord or agent will contact you shortly to arrange viewing, keys handover, or any outstanding paperwork.")}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Payment confirmed for ${data.propertyTitle || "your property"} · ${displayId}`,
+      eyebrow: "MarketMix Real Estates",
+      title: "Payment Confirmed",
+      subtitle: "Keep this email as your official receipt.",
+      bodyHtml,
+      ctaLabel: "View receipt online",
+      ctaUrl: `${REAL_ESTATE_RECEIPT_URL}/${displayId}`,
+      footerNote: "Questions? Reply to this email and our team will help.",
+    });
+
+    const ok = await sendEmail(
+      userEmail,
+      `Payment Confirmed - ${data.propertyTitle || "Property"} (${displayId})`,
+      html,
+      "bookings",
+      null
+    );
+
+    if (ok) {
+      await db.collection("realEstateEmails").add({
+        orderId, userEmail,
+        displayId,
+        propertyTitle: data.propertyTitle || null,
+        amount,
+        mpesaReference: mpesaRef,
+        type: "real_estate_confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Real estate email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
+// Moving confirmation email
+// ============================
+const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
+  try {
+    console.log("🚚 Moving confirmation →", userEmail);
+    if (!BREVO_API_KEY) return false;
+
+    const status = data.status || "REQUESTED";
+    const statusLabel = String(status).replace(/_/g, " ").toLowerCase();
+    const amount = Number(data.quotedPrice || data.totalAmount || 0);
+
+    const itemsLine = Object.entries(data.items || {})
+      .map(([id, qty]) => `${id} × ${qty}`)
+      .join(" · ") || "No items listed";
+
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${data.userName || userEmail.split("@")[0]}</strong>, here is a snapshot of your move.`)}
+      ${emailSectionLabel("Trip")}
+      ${emailInfoCard([
+        ["Request ID", String(requestId)],
+        ["Status", statusLabel.toUpperCase(), true],
+        ["Vehicle", data.vehicleLabel || "—"],
+        ["Items", String(data.itemCount || 0)],
+      ])}
+      ${emailSectionLabel("Pickup")}
+      ${emailInfoCard([
+        ["Label", data.pickupLabel || "—"],
+        ["Coordinates", data.pickupCoordinates ? `${data.pickupCoordinates.lat.toFixed(5)}, ${data.pickupCoordinates.lng.toFixed(5)}` : "—"],
+      ])}
+      ${emailSectionLabel("Destination")}
+      ${emailInfoCard([
+        ["Label", data.destinationTitle || data.destinationLabel || "—"],
+        ["Coordinates", data.destinationCoordinates ? `${data.destinationCoordinates.lat.toFixed(5)}, ${data.destinationCoordinates.lng.toFixed(5)}` : "—"],
+      ])}
+      ${emailSectionLabel("What is moving")}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+        <tr><td style="padding:18px;font-size:13px;line-height:1.7;color:#334155;">
+          ${itemsLine}
+        </td></tr>
+      </table>
+      ${amount ? emailInfoCard([["Provider quote", `KSh ${amount.toLocaleString("en-KE")}`, true]]) : ""}
+      ${emailBodyText("Trip pins are private and visible only to you, the assigned driver, and MarketMix admins.")}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Your move is ${statusLabel}`,
+      eyebrow: "MarketMix Moving",
+      title: "Your move request is on the road",
+      subtitle: "A local transport provider will confirm vehicle fit and quote shortly.",
+      bodyHtml,
+      ctaLabel: "Open tracking page",
+      ctaUrl: MOVING_URL,
+      footerNote: "Live driver updates appear on your tracking page when sharing is enabled.",
+    });
+
+    const ok = await sendEmail(
+      userEmail,
+      `Your move is ${statusLabel} · MarketMix Moving #${String(requestId).slice(0, 8)}`,
+      html,
+      "moving",
+      null
+    );
+
+    if (ok) {
+      await db.collection("movingEmails").add({
+        requestId, userEmail, status, amount,
+        type: "moving_confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Moving email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
+// PIN recovery helpers
+// ============================
+const generateReplacementCode = () =>
+  Math.floor(100000 + Math.random() * 900000).toString();
+
+const storeReplacementCode = async (userId, email, code) => {
+  try {
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    await db.collection("pinRecoveryCodes").doc(userId).set({
+      code, email, userId, expiresAt,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      attempts: 0, maxAttempts: 3, used: false, status: "pending",
+    });
+    return true;
+  } catch (e) {
+    console.error("Failed to store code:", e);
+    return false;
+  }
+};
+
+const verifyReplacementCode = async (userId, code) => {
+  try {
+    const doc = await db.collection("pinRecoveryCodes").doc(userId).get();
+    if (!doc.exists) return { valid: false, message: "No recovery request found" };
+    const d = doc.data();
+    if (d.expiresAt.toDate() < new Date()) {
+      await db.collection("pinRecoveryCodes").doc(userId).delete();
+      return { valid: false, message: "Recovery code has expired" };
+    }
+    if (d.used) return { valid: false, message: "Code already used" };
+    if (d.attempts >= d.maxAttempts) return { valid: false, message: "Too many attempts" };
+    if (d.code !== code) {
+      await db.collection("pinRecoveryCodes").doc(userId).update({
+        attempts: admin.firestore.FieldValue.increment(1),
+      });
+      return { valid: false, message: `Invalid code. ${d.maxAttempts - (d.attempts + 1)} left` };
+    }
+    await db.collection("pinRecoveryCodes").doc(userId).update({
+      status: "verified",
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return { valid: true, data: d };
+  } catch (e) {
+    console.error("Verify code failed:", e);
+    return { valid: false, message: "Verification failed" };
+  }
+};
+
+const markCodeAsUsed = async (userId) => {
+  try {
+    await db.collection("pinRecoveryCodes").doc(userId).update({
+      used: true,
+      usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "completed",
+    });
+    return true;
+  } catch (e) { return false; }
+};
+
+// ============================
+// Subscription helpers
+// ============================
+const validateSubscriptionPayment = (data) => {
+  const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data || {};
+  if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
+    return { valid: false, message: "Missing required fields" };
+  }
+  const amt = parsePositiveNumber(amount);
+  if (!amt) return { valid: false, message: "Invalid amount" };
+  if (!isValidPhone(phoneNumber)) return { valid: false, message: "Invalid phone" };
+  if (!email.includes("@")) return { valid: false, message: "Invalid email" };
+  return { valid: true, data: { ...data, amount: amt } };
+};
+
+const createSubscriptionRecord = async (s, invoiceId) => {
+  const ref = db.collection("subscriptions").doc(s.orderId);
+  await ref.set({
+    sellerId: s.sellerId, planId: s.planId, planName: s.planName,
+    amount: s.amount, invoiceId, status: "pending",
+    paymentMethod: "mpesa", phoneNumber: s.phoneNumber,
+    email: s.email, fullName: s.fullName, orderId: s.orderId,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: null, paymentStatus: "pending", mpesaReference: null,
+  });
+  return ref.id;
+};
+
+const getSubscriptionPaymentStatus = async (invoiceId) => {
+  const snap = await db.collection("subscriptions")
+    .where("invoiceId", "==", invoiceId).limit(1).get();
+  if (snap.empty) return { success: false, message: "Subscription not found" };
+  const s = snap.docs[0].data();
+  return { success: true, data: {
+    paymentStatus: s.paymentStatus || "pending",
+    mpesaReference: s.mpesaReference,
+    status: s.status,
+  }};
+};
+
+const activateSellerSubscription = async (s, mpesaReference) => {
+  const { orderId, planId, sellerId, sellerEmail } = s;
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 30);
+
+  await db.collection("subscriptions").doc(orderId).update({
+    status: "active", paymentStatus: "paid",
+    mpesaReference,
+    activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("users").doc(sellerId).update({
+    subscriptionPlan: planId,
+    subscriptionStatus: "active",
+    subscriptionActive: true,
+    subscriptionExpiresAt: expiresAt,
+    subscriptionStartedAt: admin.firestore.FieldValue.serverTimestamp(),
+    lastSubscriptionPayment: {
+      amount: s.amount,
+      date: admin.firestore.FieldValue.serverTimestamp(),
+      reference: mpesaReference,
+      orderId,
+    },
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("subscriptionPayments").add({
+    sellerId, planId, amount: s.amount, mpesaReference, orderId,
+    status: "completed", sellerEmail,
+    paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt,
+  });
+
+  await db.collection("subscriptionLogs").add({
+    sellerId, action: "subscription_activated", planId,
+    amount: s.amount, orderId,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return true;
+};
+
+// ============================
+// ROUTES
+// ============================
+
+app.post("/api/send-proposal-status", async (req, res) => {
+  try {
+    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body || {};
+    if (!to || !proposalId || !status) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+    const emailHtml = html || marketMixEmailShell({
+      preheader: `Proposal ${status}`,
+      eyebrow: "MarketMix Kenya · Lipa Mdogo Mdogo",
+      title: `Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}`,
+      subtitle: `Hello ${studentName || "Student"}, your installment proposal has been reviewed.`,
+      bodyHtml: `
+        ${emailInfoCard([
+          ["Proposal ID", String(proposalId)],
+          ["Status", status.toUpperCase(), status === "approved"],
+          ["Amount", `KSH ${Number(amount || 0).toLocaleString()}`],
+          ["Institution", institution || "N/A"],
+        ])}
+        ${notes ? emailBodyText(notes) : ""}
+      `,
+      ctaLabel: "Open MarketMix",
+      ctaUrl: MARKETPLACE_URL,
+    });
+
+    const ok = await sendEmail(to, subject || `Proposal ${status}`, emailHtml, "sales");
+    return res.json({ success: ok, message: ok ? "Sent" : "Failed" });
+  } catch (e) {
+    return sendServerError(res, e, "Proposal email failed");
+  }
+});
+
+app.post("/api/stk-push", async (req, res) => {
+  try {
+    const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
+    const amt = parsePositiveNumber(amount);
+    if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
+    if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
+    if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
+    if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
+
+    const [firstName, ...rest] = fullName.trim().split(" ");
+    const lastName = rest.join(" ") || "N/A";
+
+    let response;
+    try {
+      response = await intasend.collection().mpesaStkPush({
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        phone_number: phoneNumber,
+        amount: amt,
+        host: BACKEND_HOST,
+        api_ref: orderId,
+      });
+    } catch (intasendErr) {
+      console.error("❌ IntaSend STK failed:", intasendErr?.response || intasendErr);
+      return res.status(502).json({ success: false, message: "Payment provider error" });
+    }
+
+    await db.collection("orders").doc(orderId).set({
+      invoiceId: response?.invoice?.invoice_id || null,
+      status: "STK_PUSH_SENT",
+      totalAmount: amt,
+      userEmail: email,
+      buyerEmail: email,
+      phoneNumber,
+      shippingDetails: { fullName, phoneNumber, email },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, data: response });
+  } catch (e) {
+    return sendServerError(res, e, "STK push failed");
+  }
+});
+
+app.post("/api/store/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, cart } = req.body || {};
+    if (!ref || !email) return res.status(400).json({ success: false, message: "ref and email required" });
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "store",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      phoneNumber,
+      shippingDetails: { fullName, phoneNumber, email, deliveryPlace: "TBD" },
+      items: Array.isArray(cart?.items) ? cart.items : [],
+      sellerGroups: Array.isArray(cart?.sellerGroups) ? cart.sellerGroups : [],
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, ref });
+  } catch (e) {
+    return sendServerError(res, e, "Store seed failed");
+  }
+});
+
+app.post("/api/real-estate/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, paymentKind, property, landlord } = req.body || {};
+    if (!ref || !ref.startsWith("PROP_")) {
+      return res.status(400).json({ success: false, message: "ref must start with PROP_" });
+    }
+    if (!property?.id || !landlord?.phone || !email) {
+      return res.status(400).json({ success: false, message: "Missing property/landlord/email" });
+    }
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "real_estate",
+      isRealEstate: true,
+      paymentKind: paymentKind || "rent",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      buyerName: fullName || "Buyer",
+      phoneNumber,
+      shippingDetails: { fullName, phoneNumber, email },
+      propertyId: property.id,
+      propertyTitle: property.title,
+      propertyLocation: property.location,
+      propertyType: property.type,
+      landlordName: landlord.name,
+      landlordPhone: landlord.phone,
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, message: "Real estate order seeded", ref });
+  } catch (e) {
+    return sendServerError(res, e, "Real estate seed failed");
+  }
+});
+
+// ============================
+// ADMIN → USER NOTIFICATION
+// ============================
+app.post("/api/admin/notify-user", async (req, res) => {
+  try {
+    const {
+      userId,
+      phone,
+      email,
+      title = "MarketMix update",
+      message,
+      kind = "admin-notify",
+    } = req.body || {};
+
+    if (!userId || !message) {
+      return res.status(400).json({ success: false, message: "userId and message required" });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try {
+      decoded = await verifyAnyToken(idToken);
+    } catch {
+      return res.status(401).json({ success: false, message: "Invalid auth token" });
+    }
+
+    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
+    if (!callerDoc.exists) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+    const caller = callerDoc.data() || {};
+    const isAdmin =
+      caller.role === "admin" ||
+      caller.userType === "admin" ||
+      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+
+    // Resolve target — prefer Real Estate Firestore, fall back to Shop Firestore
+    let target = null;
+    let targetDb = "realestate";
+
+    const reTarget = await reDb.collection("users").doc(userId).get();
+    if (reTarget.exists) {
+      target = reTarget.data();
+    } else {
+      const shopTarget = await db.collection("users").doc(userId).get();
+      if (shopTarget.exists) {
+        target = shopTarget.data();
+        targetDb = "shop";
+      }
+    }
+
+    if (!target) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const resolvedPhone =
+      phone ||
+      target.phoneNumber ||
+      target.phone ||
+      target.driverProfile?.phone ||
+      null;
+
+    const resolvedEmail = email || target.email || null;
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (resolvedPhone) {
+      whatsappQueued = enqueueWhatsApp(
+        resolvedPhone,
+        `🛍️ MarketMix Kenya\n${title}\n\n${message}`,
+        { kind, userId, sourceDb: targetDb }
+      );
+    }
+
+    if (resolvedEmail) {
+      const html = marketMixEmailShell({
+        preheader: title,
+        eyebrow: "MarketMix Kenya",
+        title,
+        subtitle: "Update from MarketMix",
+        bodyHtml: emailBodyText(message),
+        footerNote: "If this wasn't expected, reply to this email and we'll help.",
+      });
+      emailSent = await sendEmail(resolvedEmail, title, html, "sales");
+    }
+
+    try {
+      await reDb.collection("adminNotifications").add({
+        userId,
+        phone: resolvedPhone || null,
+        email: resolvedEmail || null,
+        title,
+        message,
+        kind,
+        whatsappQueued,
+        emailSent,
+        sentBy: decoded.uid,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    return res.json({
+      success: true,
+      whatsappQueued,
+      emailSent,
+      hasPhone: !!resolvedPhone,
+      hasEmail: !!resolvedEmail,
+    });
+  } catch (e) {
+    console.error("❌ Admin notify-user failed:", e);
+    return sendServerError(res, e, "Admin notify failed");
+  }
+});
+
+// ============================
+// DRIVER APPROVAL
+// ============================
+app.post("/api/driver/decision", async (req, res) => {
+  try {
+    const { userId, decision, reason = "" } = req.body || {};
+    if (!userId || !["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ success: false, message: "userId and decision (approve|reject) required" });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try {
+      decoded = await verifyAnyToken(idToken);
+    } catch (e) {
+      return res.status(401).json({ success: false, message: "Invalid auth token" });
+    }
+
+    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
+    if (!callerDoc.exists) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+    const caller = callerDoc.data() || {};
+    const isAdmin =
+      caller.role === "admin" ||
+      caller.userType === "admin" ||
+      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+
+    const userRef = reDb.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return res.status(404).json({ success: false, message: "Driver not found" });
+    const driver = userSnap.data() || {};
+    const profile = driver.driverProfile || {};
+    const approved = decision === "approve";
+
+    await userRef.update({
+      driverApproved: approved,
+      driverStatus: approved ? "approved" : "rejected",
+      driverRejectionReason: approved ? "" : (reason || "Not specified"),
+      driverReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+      driverReviewedBy: decoded.uid,
+      roles: approved
+        ? Array.from(new Set([...(Array.isArray(driver.roles) ? driver.roles : []), "driver"]))
+        : (Array.isArray(driver.roles) ? driver.roles : []).filter(r => r !== "driver"),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const driverEmail = driver.email || "";
+    const driverPhone = profile.phone || driver.phone || driver.phoneNumber || "";
+    const driverName = driver.name || (driverEmail ? driverEmail.split("@")[0] : "Driver");
+
+    if (approved) {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Your driver account is approved",
+          eyebrow: "MarketMix Moving",
+          title: "You're approved to drive",
+          subtitle: `Welcome aboard, ${driverName}. Your driver account is active.`,
+          bodyHtml: `
+            ${emailBodyText("You can now accept move requests on MarketMix and start earning.")}
+            ${emailSectionLabel("Your driver details")}
+            ${emailInfoCard([
+              ["Vehicle", profile.vehicleId || "—"],
+              ["Plate", profile.plate || "—"],
+              ["License", profile.licenseNumber || "—"],
+              ["Phone", driverPhone || "—"],
+            ])}
+            ${emailBodyText("Open the driver dashboard to see live offers and manage trips.")}
+          `,
+          ctaLabel: "Open driver dashboard",
+          ctaUrl: DRIVER_DASHBOARD_URL,
+          footerNote: "Questions? Reply to this email and we'll help.",
+        });
+        sendEmail(driverEmail, "You're approved · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver approve email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: ${DRIVER_DASHBOARD_URL}`,
+          { kind: "driver-approved", userId }
+        );
+      }
+    } else {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Driver application update",
+          eyebrow: "MarketMix Moving",
+          title: "Driver application not approved",
+          subtitle: `Hello ${driverName}, we couldn't approve your driver account at this time.`,
+          bodyHtml: `
+            ${emailBodyText("You can update your details and resubmit at any time.")}
+            ${emailSectionLabel("Reason")}
+            ${emailInfoCard([["Reason", reason || "Not specified"]])}
+            ${emailBodyText("If you believe this is a mistake, reply to this email and we'll review again.")}
+          `,
+          ctaLabel: "Update my details",
+          ctaUrl: DRIVER_ONBOARD_URL,
+          footerNote: "MarketMix Kenya · support@marketmix.site",
+        });
+        sendEmail(driverEmail, "Update on your driver application · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver reject email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at ${DRIVER_ONBOARD_URL}`,
+          { kind: "driver-rejected", userId }
+        );
+      }
+    }
+
+    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"} (by admin ${decoded.uid})`);
+    return res.json({ success: true, decision, userId });
+  } catch (e) {
+    console.error("❌ Driver decision failed:", e);
+    return sendServerError(res, e, "Driver decision failed");
+  }
+});
+
+// ============================
+// IntaSend callback
+// ============================
+app.post("/api/intasend-callback", async (req, res) => {
+  try {
+    const { api_ref, state, mpesa_reference } = req.body || {};
+    if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
+
+    console.log("📞 Callback:", { api_ref, state, mpesa_reference, value: req.body.value });
+
+    let paymentStatus = "pending";
+    if (state === "COMPLETE") paymentStatus = "paid";
+    if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
+
+    if (isSubscriptionRef(api_ref)) {
+      const ref = db.collection("subscriptions").doc(api_ref);
+      const snap = await ref.get();
+      if (snap.exists) {
+        await ref.update({
+          paymentStatus,
+          mpesaReference: mpesa_reference || null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        if (state === "COMPLETE") {
+          const s = snap.data();
+          try {
+            await activateSellerSubscription({
+              orderId: api_ref, planId: s.planId, sellerId: s.sellerId,
+              sellerEmail: s.email, amount: s.amount,
+            }, mpesa_reference);
+          } catch (err) { console.error("Activation error:", err); }
+        }
+      }
+      return res.send("OK");
+    }
+
+    const orderRef = db.collection("orders").doc(api_ref);
+    let orderSnap = await orderRef.get();
+    const callbackAmount = parseFloat(req.body.value);
+
+    if (!orderSnap.exists && isWalletRef(api_ref)) {
+      const sellerId = api_ref.split("_")[1];
+      const amount = (callbackAmount > 0 && callbackAmount <= 500000) ? callbackAmount : 1;
+      await orderRef.set({
+        orderId: api_ref,
+        paymentStatus,
+        mpesaReference: mpesa_reference || null,
+        totalAmount: amount,
+        state,
+        isWalletDeposit: true,
+        sellerId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      orderSnap = await orderRef.get();
+    }
+
+    if (!orderSnap.exists) {
+      console.error(`❌ Order not found: ${api_ref}`);
+      return res.status(404).send("Order not found");
+    }
+
+    const orderData = orderSnap.data();
+
+    await orderRef.update({
+      paymentStatus,
+      mpesaReference: mpesa_reference || null,
+      state,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`✅ Order ${api_ref} → ${paymentStatus}`);
+
+    if (isWalletRef(api_ref) && state === "COMPLETE") {
+      const sellerId = api_ref.split("_")[1];
+      let amount = callbackAmount;
+      if (!amount || amount <= 0 || amount > 500000) amount = orderData.totalAmount;
+      if (!amount || amount <= 0 || amount > 500000) {
+        await orderRef.update({ paymentStatus: "failed", errorMessage: "Invalid amount" });
+        return res.send("OK");
+      }
+
+      await db.collection("adTransactions").doc(api_ref).set({
+        paymentRef: api_ref, sellerId,
+        type: "deposit", amount, status: "completed",
+        paymentMethod: "mpesa",
+        mpesaCode: mpesa_reference || `MPESA_${Date.now()}`,
+        description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      const walletRef = db.collection("sellerAdCredits").doc(sellerId);
+      const walletSnap = await walletRef.get();
+      if (walletSnap.exists) {
+        await walletRef.update({
+          balance: admin.firestore.FieldValue.increment(amount),
+          totalDeposited: admin.firestore.FieldValue.increment(amount),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        await walletRef.set({
+          sellerId, balance: amount, totalDeposited: amount,
+          totalSpent: 0, reservedBalance: 0,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+      console.log(`💰 Wallet ${sellerId} +KSH ${amount}`);
+    }
+
+    if (state === "COMPLETE" && !isWalletRef(api_ref)) {
+      let userEmail =
+        orderData.userEmail ||
+        orderData.shippingDetails?.email ||
+        orderData.buyerEmail ||
+        orderData.email;
+
+      if (!userEmail && orderData.userId) {
+        try {
+          const u = await db.collection("users").doc(orderData.userId).get();
+          if (u.exists) userEmail = u.data().email;
+        } catch (_) {}
+      }
+      if (!userEmail && isTestRef(api_ref)) {
+        userEmail = orderData.testEmail || process.env.TEST_RECEIPT_EMAIL || null;
+      }
+
+      const payerPhone =
+        orderData.phoneNumber ||
+        orderData.shippingDetails?.phoneNumber ||
+        orderData.buyerPhone ||
+        null;
+
+      const realEstate = isRealEstateOrder(api_ref, orderData);
+      const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
+
+      if (!userEmail) {
+        console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
+      } else if (realEstate) {
+        if (mpesa_reference) {
+          await orderRef.update({
+            displayId: mpesa_reference,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        const payload = {
+          ...orderData,
+          totalAmount: orderData.totalAmount || callbackAmount || 0,
+          mpesaReference: mpesa_reference || orderData.mpesaReference || "—",
+        };
+        sendRealEstatePaymentEmail(payload, userEmail, api_ref)
+          .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
+          .catch((e) => console.error("RE email error:", e));
+      } else if (moving) {
+        sendMovingConfirmationEmail({
+          ...orderData,
+          status: "PAID",
+          mpesaReference: mpesa_reference,
+          totalAmount: orderData.totalAmount || callbackAmount || 0,
+        }, userEmail, api_ref)
+          .then((ok) => console.log(ok ? `🚚 Moving receipt sent for ${api_ref}` : `❌ Moving receipt failed for ${api_ref}`))
+          .catch((e) => console.error("Moving email error:", e));
+      } else {
+        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+          .then((ok) => console.log(ok ? `✅ Confirmation sent for ${api_ref}` : `❌ Confirmation failed for ${api_ref}`))
+          .catch((e) => console.error("Email error:", e));
+      }
+
+      const shortRef = String(mpesa_reference || api_ref).slice(0, 16);
+      const amountNum = Number(orderData.totalAmount || callbackAmount || 0);
+
+      if (realEstate) {
+        if (payerPhone) {
+          enqueueWhatsApp(payerPhone,
+            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}`,
+            { kind: "re-buyer", api_ref }
+          );
+        }
+        if (orderData.landlordPhone) {
+          enqueueWhatsApp(orderData.landlordPhone,
+            `🏠 MarketMix Real Estates\nNew payment received for ${orderData.propertyTitle || "your property"}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nRef: ${mpesa_reference || "—"}`,
+            { kind: "re-landlord", api_ref }
+          );
+        }
+      } else if (moving) {
+        if (payerPhone) {
+          enqueueWhatsApp(payerPhone,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}`,
+            { kind: "moving-paid", api_ref }
+          );
+        }
+      } else {
+        if (payerPhone) {
+          enqueueWhatsApp(payerPhone,
+            `🛍️ MarketMix Kenya\nPayment confirmed\nOrder: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nThanks for shopping with us.`,
+            { kind: "store-paid", api_ref }
+          );
+        }
+      }
+    }
+
+    return res.send("OK");
+  } catch (e) {
+    console.error("❌ Callback error:", e);
+    return res.status(500).send("Callback processing failed");
+  }
+});
+
+// ============================
+// Universal transaction lookup
+// ============================
+app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
+  const paymentRef = req.params.paymentRef;
+  try {
+    if (!paymentRef) return res.status(400).json({ success: false, message: "Missing paymentRef" });
+    console.log(`🔍 Lookup: ${paymentRef}`);
+
+    let orderDoc = await db.collection("orders").doc(paymentRef).get();
+
+    if (!orderDoc.exists) {
+      const byMpesa = await db.collection("orders")
+        .where("mpesaReference", "==", paymentRef)
+        .where("isRealEstate", "==", true)
+        .limit(1)
+        .get();
+      if (!byMpesa.empty) {
+        orderDoc = byMpesa.docs[0];
+        console.log(`✅ Resolved ${paymentRef} → real-estate order via M-Pesa ref`);
+      }
+    }
+
+    if (orderDoc.exists) {
+      const orderData = orderDoc.data();
+      console.log(`✅ Order found: paymentStatus=${orderData.paymentStatus}, isWalletDeposit=${!!orderData.isWalletDeposit}, isRealEstate=${!!orderData.isRealEstate}`);
+
+      if (orderData.paymentStatus === "paid" && orderData.isWalletDeposit && orderData.sellerId) {
+        const adRef = db.collection("adTransactions").doc(orderDoc.id);
+        const adSnap = await adRef.get();
+        if (!adSnap.exists) {
+          const amount = orderData.totalAmount || 1;
+          await adRef.set({
+            paymentRef: orderDoc.id, sellerId: orderData.sellerId,
+            sellerEmail: orderData.sellerEmail || null,
+            type: "deposit", amount, status: "completed",
+            paymentMethod: "mpesa",
+            mpesaCode: orderData.mpesaReference || "SYNCED",
+            description: `Ad wallet deposit - KSH ${amount.toFixed(2)}`,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`🔄 Auto-healed adTransaction ${orderDoc.id}`);
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          ...orderData,
+          status: orderData.paymentStatus === "paid" ? "completed" : orderData.paymentStatus,
+          paymentStatus: orderData.paymentStatus,
+        },
+      });
+    }
+
+    const adTxDoc = await db.collection("adTransactions").doc(paymentRef).get();
+    if (adTxDoc.exists) {
+      const tx = adTxDoc.data();
+      console.log(`✅ adTransaction found: status=${tx.status}`);
+      return res.json({ success: true, data: tx });
+    }
+
+    console.log(`❌ Not found: ${paymentRef}`);
+    return res.status(404).json({ success: false, message: "Transaction not found" });
+  } catch (error) {
+    console.error(`❌ Lookup failed for ${paymentRef}:`, error?.message || error);
+    return res.status(500).json({ success: false, message: "Lookup failed", error: error?.message });
+  }
+});
+
+app.get("/api/transaction/:invoiceId", async (req, res) => {
+  try {
+    const invoiceId = req.params.invoiceId;
+    if (!invoiceId) return res.status(400).json({ success: false, message: "Missing invoiceId" });
+    const docs = await db.collection("orders").where("invoiceId", "==", invoiceId).get();
+    if (docs.empty) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true, data: docs.docs[0].data() });
+  } catch (e) {
+    return sendServerError(res, e, "Transaction lookup failed");
+  }
+});
+
+// ============================
+// Seller withdrawal
+// ============================
+app.post("/api/seller/withdraw", async (req, res) => {
+  try {
+    const { sellerId, amount: requestedAmount, phoneNumber } = req.body || {};
+    if (!sellerId) return res.status(400).json({ success: false, message: "Missing sellerId" });
+    const amount = parsePositiveNumber(requestedAmount);
+    if (!amount) return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
+
+    const minFeeCheck = calculateTotalFee(amount);
+    if (amount <= minFeeCheck) {
+      return res.status(400).json({ success: false, message: `Amount must exceed fee KSH ${minFeeCheck.toFixed(2)}` });
+    }
+
+    const ordersSnap = await db.collection("orders")
+      .where("involvedSellerIds", "array-contains", sellerId)
+      .where("paymentStatus", "==", "paid")
+      .get();
+
+    let totalRevenue = 0;
+    ordersSnap.forEach((doc) => {
+      const items = doc.data().items;
+      if (!items) return;
+      const list = Array.isArray(items) ? items : Object.values(items);
+      list.forEach((item) => {
+        if (item?.sellerId === sellerId) {
+          totalRevenue += (Number(item.price) || 0) * (Number(item.quantity) || 0);
+        }
+      });
+    });
+
+    const ledgerRef = db.collection("sellerLedgers").doc(sellerId);
+    const ledgerSnap = await ledgerRef.get();
+    const withdrawn = ledgerSnap.exists ? (ledgerSnap.data().totalWithdrawn || 0) : 0;
+    const available = totalRevenue - withdrawn;
+
+    if (available < amount) return res.status(400).json({ success: false, message: "Insufficient balance" });
+
+    const feeAmount = calculateTotalFee(amount);
+    const netPayout = +(amount - feeAmount).toFixed(2);
+    if (netPayout <= 0) return res.status(400).json({ success: false, message: "Net payout is zero" });
+
+    const wRef = db.collection("withdrawals").doc();
+    await wRef.set({
+      sellerId, amount, feeAmount, netPayout, phoneNumber,
+      status: "PENDING_PAYOUT",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    let payout;
+    try {
+      payout = await intasend.payouts().mpesa({
+        currency: "KES", requires_approval: "NO",
+        transactions: [{
+          name: "Seller Withdrawal", account: phoneNumber,
+          amount: netPayout, narrative: "Seller Payout",
+        }],
+      });
+    } catch (e) {
+      await wRef.update({
+        status: "PAYOUT_FAILED",
+        intasendError: e?.response || e?.message || String(e),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.status(502).json({ success: false, message: "Payout provider error" });
+    }
+
+    await wRef.update({
+      trackingId: payout?.tracking_id || null,
+      status: "PAYOUT_INITIATED",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      intasendResponse: payout,
+    });
+
+    await ledgerRef.set({
+      totalWithdrawn: admin.firestore.FieldValue.increment(amount),
+      lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    enqueueWhatsApp(phoneNumber,
+      `💸 MarketMix Kenya\nWithdrawal initiated\nAmount: KES ${amount.toLocaleString("en-KE")}\nFee: KES ${feeAmount.toLocaleString("en-KE")}\nNet payout: KES ${netPayout.toLocaleString("en-KE")}\nRef: ${String(payout?.tracking_id || wRef.id).slice(0, 16)}`,
+      { kind: "withdrawal", sellerId }
+    );
+
+    return res.json({
+      success: true, message: "Withdrawal initiated",
+      data: { requestedAmount: amount, fee: feeAmount, netPayout,
+              trackingId: payout?.tracking_id || null, withdrawalId: wRef.id },
+    });
+  } catch (e) {
+    console.error("Withdrawal error:", e);
+    return sendServerError(res, e, "Withdrawal failed");
+  }
+});
+
+// ============================
+// PIN recovery
+// ============================
+app.post("/api/seller/recover-pin", async (req, res) => {
+  try {
+    const { email, userId } = req.body || {};
+    if (!email || !userId) return res.status(400).json({ success: false, message: "Email and userId required" });
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) return res.status(404).json({ success: false, message: "User not found" });
+
+    const u = userDoc.data();
+    if (u.email && u.email !== email) return res.status(403).json({ success: false, message: "Email mismatch" });
+    if (!u.withdrawalPin) return res.status(400).json({ success: false, message: "No PIN set" });
+
+    const code = generateReplacementCode();
+    if (!(await storeReplacementCode(userId, email, code))) {
+      return res.status(500).json({ success: false, message: "Failed to generate code" });
+    }
+
+    await db.collection("securityLogs").add({
+      userId, email, action: "PIN_RECOVERY_REQUESTED",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      ipAddress: req.ip, userAgent: req.get("User-Agent"),
+    });
+
+    const html = marketMixEmailShell({
+      preheader: "Your PIN reset code",
+      eyebrow: "MarketMix Kenya · Security",
+      title: "Withdrawal PIN Recovery",
+      subtitle: "Use the code below to reset your withdrawal PIN.",
+      bodyHtml: `
+        <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:18px;padding:22px;text-align:center;margin-bottom:16px;">
+          <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#065f46;">${code}</div>
+        </div>
+        ${emailInfoCard([
+          ["Valid for", "15 minutes"],
+          ["Attempts", "3"],
+        ])}
+        ${emailBodyText("If you didn't request this, you can safely ignore this email — but consider changing your password.")}
+      `,
+      footerNote: "MarketMix staff will never ask you for this code.",
+    });
+
+    const ok = await sendEmail(email, "Your PIN Reset Code - MarketMix Kenya", html, "security");
+    if (!ok) return res.json({ success: false, message: "Failed to send recovery code", emailSent: false });
+
+    if (u.phoneNumber || u.phone) {
+      enqueueWhatsApp(u.phoneNumber || u.phone,
+        `🔐 MarketMix Kenya\nYour PIN reset code: ${code}\nValid for 15 minutes.\nDo not share this code with anyone.`,
+        { kind: "pin-otp", userId }
+      );
+    }
+
+    return res.json({ success: true, message: "Code sent", emailSent: true });
+  } catch (e) {
+    console.error("PIN recovery error:", e);
+    return res.status(500).json({ success: false, message: "PIN recovery failed" });
+  }
+});
+
+app.post("/api/seller/verify-recovery-code", async (req, res) => {
+  try {
+    const { userId, code } = req.body || {};
+    if (!userId || !code) return res.status(400).json({ success: false, message: "userId and code required" });
+    const v = await verifyReplacementCode(userId, code);
+    if (!v.valid) return res.status(400).json({ success: false, message: v.message });
+    await db.collection("securityLogs").add({
+      userId, email: v.data.email, action: "PIN_RECOVERY_VERIFIED",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), ipAddress: req.ip,
+    });
+    return res.json({ success: true, verified: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "Verification failed" });
+  }
+});
+
+app.post("/api/seller/reset-pin", async (req, res) => {
+  try {
+    const { userId, code, newPin, confirmPin } = req.body || {};
+    if (!userId || !code || !newPin || !confirmPin) return res.status(400).json({ success: false, message: "All fields required" });
+    if (newPin !== confirmPin) return res.status(400).json({ success: false, message: "PINs do not match" });
+    if (newPin.length < 4 || !/^\d+$/.test(newPin)) return res.status(400).json({ success: false, message: "PIN must be 4+ digits" });
+
+    const v = await verifyReplacementCode(userId, code);
+    if (!v.valid) return res.status(400).json({ success: false, message: v.message });
+
+    await db.collection("users").doc(userId).update({
+      withdrawalPin: newPin,
+      pinSetAt: admin.firestore.FieldValue.serverTimestamp(),
+      pinSetMethod: "recovery",
+      pinLastChanged: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await markCodeAsUsed(userId);
+    await db.collection("securityLogs").add({
+      userId, email: v.data.email, action: "PIN_RESET_SUCCESS",
+      method: "recovery",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), ipAddress: req.ip,
+    });
+    return res.json({ success: true, reset: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "Reset failed" });
+  }
+});
+
+// ============================
+// Stock update
+// ============================
+app.post("/api/update-stock", async (req, res) => {
+  try {
+    const { productId, quantity } = req.body || {};
+    if (!productId || typeof quantity !== "number" || quantity <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid product or quantity" });
+    }
+    const pRef = db.collection("products").doc(productId);
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(pRef);
+      if (!doc.exists) throw new Error("Product not found");
+      const q = doc.data().quantity || 0;
+      if (q < quantity) throw new Error("Not enough stock");
+      t.update(pRef, { quantity: q - quantity });
+    });
+    return res.json({ success: true, message: "Stock updated" });
+  } catch (e) {
+    return sendServerError(res, e, "Stock update failed");
+  }
+});
+
+// ============================
+// Hugging Face image gen
+// ============================
+app.post("/api/generate-ai-image", async (req, res) => {
+  try {
+    const prompt = (req.body && req.body.prompt) || "";
+    if (!prompt || prompt.trim().length < 3) {
+      return res.status(400).json({ success: false, message: "Invalid prompt" });
+    }
+    if (!process.env.HF_API_KEY) {
+      return res.status(500).json({ success: false, message: "HF_API_KEY missing" });
+    }
+    const r = await fetch(
+      "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.HF_API_KEY}`,
+          "Content-Type": "application/json",
+          Accept: "image/png",
+        },
+        body: JSON.stringify({ inputs: prompt, options: { wait_for_model: true } }),
+      }
+    );
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return res.status(502).json({ success: false, message: "HF provider error", providerStatus: r.status, providerBody: t.slice(0, 200) });
+    }
+    const ct = r.headers.get("content-type") || "image/png";
+    const buf = Buffer.from(await r.arrayBuffer());
+    return res.json({ success: true, imageUrl: `data:${ct};base64,${buf.toString("base64")}` });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: "AI generation failed", detail: e.message });
+  }
+});
+
+// ============================
+// Test endpoints
+// ============================
+app.get("/api/test-email-auth", async (req, res) => {
+  res.json({
+    success: !!BREVO_API_KEY,
+    message: BREVO_API_KEY ? "Email authentication configured" : "BREVO_API_KEY not configured",
+    senders: SENDERS,
+  });
+});
+
+app.post("/api/test-proposal-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const html = marketMixEmailShell({
+    preheader: "Test proposal email",
+    eyebrow: "MarketMix Kenya",
+    title: "Test Proposal Email",
+    subtitle: "This is a test from the proposal status system.",
+    bodyHtml: emailBodyText("If you received this, the pipeline is working."),
+  });
+  const ok = await sendEmail(testEmail, "Test Proposal Email", html, "sales");
+  res.json({ success: ok, to: testEmail });
+});
+
+app.post("/api/test-real-estate-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "PROP_TEST_" + Date.now();
+  const ok = await sendRealEstatePaymentEmail({
+    propertyTitle: "Spacious Bedsitter - Kilimani",
+    propertyLocation: "Kilimani, Nairobi",
+    propertyType: "For Rent",
+    totalAmount: 4000,
+    mpesaReference: "UJ8NN93LWY",
+    buyerName: "Test Buyer",
+    landlordName: "Test Landlord",
+    landlordPhone: "254712345678",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
+});
+
+app.post("/api/test-moving-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "MOVE_TEST_" + Date.now();
+  const ok = await sendMovingConfirmationEmail({
+    userName: "Test User",
+    pickupLabel: "Kilimani, Nairobi",
+    pickupCoordinates: { lat: -1.2921, lng: 36.8219 },
+    destinationLabel: "Westlands, Nairobi",
+    destinationTitle: "2 Bedroom Apartment",
+    destinationCoordinates: { lat: -1.2674, lng: 36.8109 },
+    vehicleLabel: "Pickup",
+    itemCount: 12,
+    items: { bed: 1, sofa: 1, box: 10 },
+    quotedPrice: 4500,
+    status: "REQUESTED",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
+});
+
+// ============================
+// Health
+// ============================
+app.get("/_health", (req, res) => {
+  res.json({
+    ok: true,
+    timestamp: Date.now(),
+    services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
+    firestore: { shop: !!db, realestate: !!reDb },
+    urls: {
+      marketplace: MARKETPLACE_URL,
+      realEstateApp: REAL_ESTATE_APP_URL,
+      realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
+      moving: MOVING_URL,
+      driverDashboard: DRIVER_DASHBOARD_URL,
+      driverOnboard: DRIVER_ONBOARD_URL,
+    },
+    senders: SENDERS,
+    whatsappQueue: waQueue.length,
+    endpoints: [
+      "/api/stk-push",
+      "/api/store/seed",
+      "/api/real-estate/seed",
+      "/api/admin/notify-user",
+      "/api/driver/decision",
+      "/api/subscription-payment",
+      "/api/seller/withdraw",
+      "/api/seller/recover-pin",
+      "/api/ad-transaction/:paymentRef",
+      "/_health",
+    ],
+    uptime: process.uptime(),
+  });
+});
+
+app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
+
+process.on("uncaughtException", (err) => console.error("Uncaught:", err));
+process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
+
+// ============================
+// Keep-alive (11pm–5am EAT pause)
+// ============================
+(function keepAlive() {
+  const disable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
+  const enable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
+  const isProd = process.env.NODE_ENV === "production";
+  if (!(enable || (isProd && !disable))) {
+    console.log("🛑 Keep-alive disabled");
+    return;
+  }
+  const INTERVAL = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
+  const JITTER = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
+  const TIMEOUT = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
+  let timer = null, paused = false;
+  const inPause = () => { const h = (new Date().getUTCHours() + 3) % 24; return h >= 23 || h < 5; };
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    if (inPause()) {
+      if (!paused) { paused = true; console.log("🌙 Keep-alive paused until 5am EAT"); }
+      timer = setTimeout(schedule, 5 * 60 * 1000);
+      timer.unref?.();
+      return;
+    }
+    if (paused) { paused = false; console.log("☀️ Keep-alive resumed"); }
+    const j = Math.floor(Math.random() * (JITTER * 2 + 1)) - JITTER;
+    timer = setTimeout(() => {
+      if (!inPause()) {
+        const req = http.request({ host: "127.0.0.1", port: PORT, path: "/_health", method: "GET", timeout: TIMEOUT });
+        req.on("timeout", () => req.destroy());
+        req.on("error", () => {});
+        req.end();
+      }
+      schedule();
+    }, Math.max(1000, INTERVAL + j));
+    timer.unref?.();
+  };
+  schedule();
+  console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
+})();
+
+// ============================
+// Start
+// ============================
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
+  console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
+  console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
+  console.log(`🛍️ Shop frontend: ${MARKETPLACE_URL}`);
+  console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
+  console.log(`🚚 Moving URL: ${MOVING_URL}`);
+  console.log(`🧑‍✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
+  console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
+});
+
+const shutdown = () => {
+  console.log("Shutting down…");
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
