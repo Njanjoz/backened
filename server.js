@@ -1,5 +1,6 @@
-// server.js — single-file backend for MarketMix (store + wallet + subscriptions + real estate)
-// Real-estate flow is isolated by the "PROP_" ref prefix; it does NOT touch store/wallet/subscription logic.
+// server.js — MarketMix backend (store + wallet + subscriptions + real estate + moving)
+// Real-estate and moving flows are isolated by ref prefix (PROP_, MOVE_) so they
+// can't affect store / wallet / subscription logic.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -83,7 +84,6 @@ try {
   console.error("❌ Firebase Admin init failed:", e);
   process.exit(1);
 }
-
 const db = admin.firestore();
 
 // ============================
@@ -101,23 +101,26 @@ const REAL_ESTATE_RECEIPT_URL =
   "https://marketmix-realestates.vercel.app/receipt";
 
 // ============================
-// Brevo
+// Brevo sender config (env-driven)
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
+
+const SENDERS = {
+  sales:    { name: "MarketMix Kenya",          email: process.env.SENDER_SALES    || "sales@marketmix.site" },
+  security: { name: "MarketMix Kenya",          email: process.env.SENDER_SECURITY || "security@marketmix.site" },
+  bookings: { name: "MarketMix Real Estates",   email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
+  moving:   { name: "MarketMix Moving",         email: process.env.SENDER_MOVING   || "support@marketmix.site" },
+};
 
 const sendEmail = async (to, subject, html, type = "security") => {
   try {
     console.log("📧 Sending email:", { to, subject, type });
-
     if (!BREVO_API_KEY) {
       console.log("❌ BREVO_API_KEY not configured");
       return false;
     }
 
-    const sender = type === "sales"
-      ? { name: "MarketMixKenya", email: "sales@marketmix.site" }
-      : { name: "MarketMixKenya", email: "security@marketmix.site" };
-
+    const sender = SENDERS[type] || SENDERS.security;
     const response = await fetch("https://api.brevo.com/v3/smtp/email", {
       method: "POST",
       headers: {
@@ -130,7 +133,7 @@ const sendEmail = async (to, subject, html, type = "security") => {
         to: [{ email: to, name: to.split("@")[0] || "User" }],
         subject,
         htmlContent: html,
-        tags: [type === "sales" ? "order-confirmation" : "pin-recovery"],
+        tags: [type],
       }),
     });
 
@@ -139,8 +142,7 @@ const sendEmail = async (to, subject, html, type = "security") => {
       console.error("❌ Brevo API error:", JSON.stringify(data, null, 2));
       throw new Error(data.message || `Brevo API error: ${response.status}`);
     }
-
-    console.log(`✅ Email sent (id=${data.messageId})`);
+    console.log(`✅ Email sent (id=${data.messageId}) from ${sender.email}`);
     return true;
   } catch (error) {
     console.error("❌ Email sending failed:", error.message);
@@ -180,77 +182,149 @@ const AGENCY_FEE_RATE = 0.035;
 function getTieredFixedFee(amount) {
   return amount < WITHDRAWAL_THRESHOLD ? FIXED_FEE_BELOW_THRESHOLD : FIXED_FEE_ABOVE_THRESHOLD;
 }
-
 function calculateTotalFee(amount) {
   const percentageFee = amount * AGENCY_FEE_RATE;
   const fixedFee = getTieredFixedFee(amount);
   return +(percentageFee + fixedFee).toFixed(2);
 }
-
 function isValidPhone(phone) {
   return typeof phone === "string" && /^(2547|2541)\d{8}$/.test(phone);
 }
-
 function parsePositiveNumber(value) {
   const n = parseFloat(value);
   return !isNaN(n) && n > 0 ? n : null;
 }
-
 function sendServerError(res, err, msg = "Internal server error") {
   console.error(msg, err);
   return res.status(500).json({ success: false, message: msg });
 }
 
-// Ref-prefix routing (this is the isolation mechanism)
+// Ref-prefix routing
 const isWalletRef       = (r) => typeof r === "string" && r.startsWith("WALLET_");
 const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
 const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
+const isMovingRef       = (r) => typeof r === "string" && r.startsWith("MOVE_");
 const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY_");
 
 function isRealEstateOrder(apiRef, orderData) {
-  return isRealEstateRef(apiRef)
-      || orderData?.orderType === "real_estate"
-      || orderData?.isRealEstate === true;
+  return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
 }
 
 // ============================
-// Email templates
+// EMAIL SHELL — MarketMix liquid-glass theme
+// ============================
+const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", title, subtitle, bodyHtml, ctaLabel, ctaUrl, footerNote = "" }) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${title}</title>
+</head>
+<body style="margin:0;padding:0;background:#eef2f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <div style="display:none;font-size:1px;color:#eef2f0;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">${preheader}</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#eef2f0;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;width:100%;">
+        <tr><td style="background:linear-gradient(135deg,#0b231c 0%,#123528 55%,#0e2b22 100%);border-radius:28px 28px 0 0;padding:32px 28px 28px 28px;color:#ffffff;">
+          <div style="font-size:11px;letter-spacing:.19em;text-transform:uppercase;color:#a7f3d0;font-weight:700;">${eyebrow}</div>
+          <div style="padding-top:12px;font-size:26px;line-height:1.25;font-weight:600;">${title}</div>
+          ${subtitle ? `<div style="padding-top:10px;font-size:14px;line-height:1.6;color:rgba(255,255,255,0.72);">${subtitle}</div>` : ""}
+        </td></tr>
+        <tr><td style="background:#ffffff;border:1px solid #e2e8e6;border-top:none;border-radius:0 0 28px 28px;padding:28px;">
+          ${bodyHtml}
+          ${ctaLabel && ctaUrl ? `
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:22px;">
+              <tr><td align="center">
+                <a href="${ctaUrl}" style="display:inline-block;background:#123528;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:12px;padding:14px 26px;">${ctaLabel}</a>
+              </td></tr>
+            </table>` : ""}
+          ${footerNote ? `<p style="margin:22px 0 0 0;font-size:12px;line-height:1.6;color:#94a3b8;text-align:center;">${footerNote}</p>` : ""}
+        </td></tr>
+        <tr><td style="padding:20px 12px 0 12px;text-align:center;font-size:11px;line-height:1.6;color:#64748b;">
+          MarketMix Kenya © ${new Date().getFullYear()}<br/>
+          <a href="mailto:support@marketmix.site" style="color:#047857;text-decoration:none;">support@marketmix.site</a>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+// Reusable inner blocks
+const emailInfoCard = (rows) => `
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+    <tr><td style="padding:18px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        ${rows.map(([label, value, highlight]) => `
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:#64748b;width:50%;">${label}</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:700;color:${highlight ? "#047857" : "#0f172a"};text-align:right;">${value}</td>
+          </tr>
+        `).join("")}
+      </table>
+    </td></tr>
+  </table>`;
+
+const emailBodyText = (text) => `
+  <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:#475569;">${text}</p>`;
+
+const emailSectionLabel = (label) => `
+  <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
+
+// ============================
+// Order confirmation email (store)
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
     console.log("📧 Order confirmation →", userEmail);
     if (!BREVO_API_KEY) return false;
 
-    const itemsTotal = orderData.items?.reduce(
-      (s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0) || 0;
-    const deliveryTotal = orderData.sellerGroups?.reduce(
-      (s, g) => s + (g.deliveryCost || 0), 0) || 0;
+    const items = orderData.items || [];
+    const itemsTotal = items.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0);
+    const deliveryTotal = (orderData.sellerGroups || []).reduce((s, g) => s + (g.deliveryCost || 0), 0);
+    const total = orderData.totalAmount || (itemsTotal + deliveryTotal);
 
-    const html = `
-<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f9fafb;padding:20px">
-  <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;border:1px solid #e5e7eb">
-    <h2 style="margin:0 0 6px 0;color:#111827">Thank you for shopping with us</h2>
-    <p style="color:#6b7280;margin:0 0 16px 0">Order #${String(orderId).substring(0, 8)}</p>
-    <p><strong>Date:</strong> ${new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })}</p>
-    <p><strong>Buyer:</strong> ${orderData.shippingDetails?.fullName || userEmail}</p>
-    <ul>
-      ${(orderData.items || []).map(i =>
-        `<li>${i.name} × ${i.quantity} — Ksh ${((i.price || 0) * (i.quantity || 1)).toFixed(2)}</li>`
-      ).join("") || "<li>No items</li>"}
-    </ul>
-    <p><strong>Items Total:</strong> Ksh ${itemsTotal.toFixed(2)}</p>
-    <p><strong>Delivery:</strong> Ksh ${deliveryTotal.toFixed(2)}</p>
-    <p style="font-size:18px"><strong>Total Paid:</strong> Ksh ${(orderData.totalAmount || 0).toFixed(2)}</p>
-    <p style="color:#6b7280;font-size:12px;margin-top:24px">MarketMix Kenya © ${new Date().getFullYear()}</p>
-  </div>
-</body></html>`;
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${orderData.shippingDetails?.fullName || userEmail.split("@")[0]}</strong>, your payment is confirmed.`)}
+      ${emailSectionLabel("Order")}
+      ${emailInfoCard([
+        ["Order ID", String(orderId)],
+        ["Date", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
+        ["Buyer", orderData.shippingDetails?.fullName || "—"],
+      ])}
+      ${emailSectionLabel("Items")}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+        <tr><td style="padding:18px;font-size:13px;line-height:1.9;color:#334155;">
+          ${items.length ? items.map(i => `${i.name} × ${i.quantity} — Ksh ${((i.price||0)*(i.quantity||1)).toFixed(2)}`).join("<br/>") : "No items"}
+        </td></tr>
+      </table>
+      ${emailSectionLabel("Totals")}
+      ${emailInfoCard([
+        ["Items Total", `Ksh ${itemsTotal.toFixed(2)}`],
+        ["Delivery", `Ksh ${deliveryTotal.toFixed(2)}`],
+        ["Total Paid", `Ksh ${total.toFixed(2)}`, true],
+      ])}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Order #${String(orderId).slice(0,8)} confirmed`,
+      eyebrow: "MarketMix Kenya",
+      title: "Thank you for shopping with us",
+      subtitle: "Your payment is confirmed and your order is being prepared.",
+      bodyHtml,
+      ctaLabel: "View order receipt",
+      ctaUrl: `https://marketmix.site/order-receipt/${orderId}`,
+      footerNote: "Need help? Reply to this email and we'll get back to you.",
+    });
 
     const ok = await sendEmail(
       userEmail,
-      `Order Confirmation #${String(orderId).substring(0, 8)} - MarketMix Kenya`,
+      `Order Confirmation #${String(orderId).slice(0, 8)} - MarketMix Kenya`,
       html,
       "sales"
     );
+
     if (ok) {
       await db.collection("orderEmails").add({
         orderId, userEmail, type: "confirmation",
@@ -264,59 +338,58 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   }
 };
 
+// ============================
+// Real estate confirmation email
+// ============================
 const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   try {
     console.log("🏠 Real estate receipt →", userEmail);
     if (!BREVO_API_KEY) return false;
 
-    const paidAt = new Date().toLocaleString("en-KE", {
-      timeZone: "Africa/Nairobi", dateStyle: "medium", timeStyle: "short",
-    });
-
     const amount = Number(data.totalAmount || data.amount || 0);
     const mpesaRef = data.mpesaReference || data.mpesaCode || "N/A";
 
-    const html = `
-<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f3f4f6;padding:20px">
-  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb">
-    <div style="background:linear-gradient(135deg,#0f766e,#14b8a6);padding:28px 24px;color:#fff;text-align:center">
-      <h1 style="margin:0;font-size:22px">MarketMix Real Estates</h1>
-      <p style="margin:6px 0 0 0;font-size:14px;opacity:.9">Payment Confirmation Receipt</p>
-      <p style="display:inline-block;margin-top:12px;padding:6px 14px;border-radius:999px;background:rgba(255,255,255,.2);font-size:12px;font-weight:600">✅ PAYMENT CONFIRMED</p>
-    </div>
-    <div style="padding:24px">
-      <p>Hello ${data.buyerName || userEmail},</p>
-      <p>Your payment has been received and confirmed.</p>
-      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;padding:16px;text-align:center;margin:16px 0">
-        <p style="margin:0;font-size:12px;color:#047857;letter-spacing:1px">AMOUNT PAID</p>
-        <p style="margin:6px 0 0 0;font-size:26px;font-weight:700;color:#065f46">KES ${amount.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</p>
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${data.buyerName || userEmail.split("@")[0]}</strong>, your payment has been received and confirmed.`)}
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:18px;padding:20px;text-align:center;margin-bottom:16px;">
+        <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#047857;font-weight:700;">Amount paid</div>
+        <div style="font-size:28px;font-weight:700;color:#065f46;padding-top:6px;">KES ${amount.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</div>
       </div>
-      <table style="width:100%;font-size:13px;border-collapse:collapse">
-        <tr><td style="padding:6px 0;color:#6b7280">Property</td><td style="text-align:right;font-weight:600">${data.propertyTitle || "—"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">Location</td><td style="text-align:right;font-weight:600">${data.propertyLocation || "—"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">Type</td><td style="text-align:right;font-weight:600">${data.propertyType || "—"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">Reference</td><td style="text-align:right;font-weight:600">${orderId}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">M-Pesa Code</td><td style="text-align:right;font-weight:600">${mpesaRef}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">Paid On</td><td style="text-align:right;font-weight:600">${paidAt}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280">Landlord</td><td style="text-align:right;font-weight:600">${data.landlordName || "—"} (${data.landlordPhone || "—"})</td></tr>
-      </table>
-      <p style="margin-top:18px;text-align:center">
-        <a href="${REAL_ESTATE_RECEIPT_URL}/${orderId}" style="display:inline-block;background:#0f766e;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600">View Receipt Online</a>
-      </p>
-    </div>
-    <div style="background:#f9fafb;padding:16px;text-align:center;font-size:12px;color:#6b7280">
-      MarketMix Real Estates · MarketMix Kenya © ${new Date().getFullYear()}<br>
-      <a href="mailto:sales@marketmix.site" style="color:#0f766e">sales@marketmix.site</a>
-    </div>
-  </div>
-</body></html>`;
+      ${emailSectionLabel("Property")}
+      ${emailInfoCard([
+        ["Property", data.propertyTitle || "—"],
+        ["Location", data.propertyLocation || "—"],
+        ["Type", data.propertyType || "—"],
+        ["Reference", String(orderId)],
+        ["M-Pesa code", mpesaRef],
+        ["Paid on", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
+      ])}
+      ${emailSectionLabel("Landlord / Agent")}
+      ${emailInfoCard([
+        ["Name", data.landlordName || "—"],
+        ["Phone", data.landlordPhone || "—"],
+      ])}
+      ${emailBodyText("The landlord or agent will contact you shortly to arrange viewing, keys handover, or any outstanding paperwork.")}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Payment confirmed for ${data.propertyTitle || "your property"}`,
+      eyebrow: "MarketMix Real Estates",
+      title: "Payment Confirmed",
+      subtitle: "Keep this email as your official receipt.",
+      bodyHtml,
+      ctaLabel: "View receipt online",
+      ctaUrl: `${REAL_ESTATE_RECEIPT_URL}/${orderId}`,
+      footerNote: "Questions? Reply to this email and our team will help.",
+    });
 
     const ok = await sendEmail(
       userEmail,
-      `Payment Confirmed - ${data.propertyTitle || "Property"} (${String(orderId).substring(0, 8)})`,
+      `Payment Confirmed - ${data.propertyTitle || "Property"} (${String(orderId).slice(0, 8)})`,
       html,
-      "sales"
+      "bookings"
     );
+
     if (ok) {
       await db.collection("realEstateEmails").add({
         orderId, userEmail,
@@ -334,7 +407,84 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
 };
 
 // ============================
-// PIN recovery (seller withdrawals)
+// Moving / Transport confirmation email
+// ============================
+const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
+  try {
+    console.log("🚚 Moving confirmation →", userEmail);
+    if (!BREVO_API_KEY) return false;
+
+    const status = data.status || "REQUESTED";
+    const statusLabel = String(status).replace(/_/g, " ").toLowerCase();
+    const amount = Number(data.quotedPrice || data.totalAmount || 0);
+
+    const itemsLine = Object.entries(data.items || {})
+      .map(([id, qty]) => `${id} × ${qty}`)
+      .join(" · ") || "No items listed";
+
+    const bodyHtml = `
+      ${emailBodyText(`Hello <strong>${data.userName || userEmail.split("@")[0]}</strong>, here is a snapshot of your move.`)}
+      ${emailSectionLabel("Trip")}
+      ${emailInfoCard([
+        ["Request ID", String(requestId)],
+        ["Status", statusLabel.toUpperCase(), true],
+        ["Vehicle", data.vehicleLabel || "—"],
+        ["Items", String(data.itemCount || 0)],
+      ])}
+      ${emailSectionLabel("Pickup")}
+      ${emailInfoCard([
+        ["Label", data.pickupLabel || "—"],
+        ["Coordinates", data.pickupCoordinates ? `${data.pickupCoordinates.lat.toFixed(5)}, ${data.pickupCoordinates.lng.toFixed(5)}` : "—"],
+      ])}
+      ${emailSectionLabel("Destination")}
+      ${emailInfoCard([
+        ["Label", data.destinationTitle || data.destinationLabel || "—"],
+        ["Coordinates", data.destinationCoordinates ? `${data.destinationCoordinates.lat.toFixed(5)}, ${data.destinationCoordinates.lng.toFixed(5)}` : "—"],
+      ])}
+      ${emailSectionLabel("What is moving")}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
+        <tr><td style="padding:18px;font-size:13px;line-height:1.7;color:#334155;">
+          ${itemsLine}
+        </td></tr>
+      </table>
+      ${amount ? emailInfoCard([["Provider quote", `KSh ${amount.toLocaleString("en-KE")}`, true]]) : ""}
+      ${emailBodyText("Trip pins are private and visible only to you, the assigned driver, and MarketMix admins. Route estimates use road distance and do not include live traffic.")}
+    `;
+
+    const html = marketMixEmailShell({
+      preheader: `Your move is ${statusLabel}`,
+      eyebrow: "MarketMix Moving",
+      title: "Your move request is on the road",
+      subtitle: "A local transport provider will confirm vehicle fit and quote shortly.",
+      bodyHtml,
+      ctaLabel: "Open tracking page",
+      ctaUrl: `https://marketmix.site/transport`,
+      footerNote: "Live driver updates appear on your tracking page when sharing is enabled.",
+    });
+
+    const ok = await sendEmail(
+      userEmail,
+      `Your move is ${statusLabel} · MarketMix Moving #${String(requestId).slice(0, 8)}`,
+      html,
+      "moving"
+    );
+
+    if (ok) {
+      await db.collection("movingEmails").add({
+        requestId, userEmail, status, amount,
+        type: "moving_confirmation",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error("❌ Moving email failed:", e.message);
+    return false;
+  }
+};
+
+// ============================
+// PIN recovery helpers
 // ============================
 const generateReplacementCode = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
@@ -390,9 +540,7 @@ const markCodeAsUsed = async (userId) => {
       status: "completed",
     });
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 };
 
 // ============================
@@ -490,15 +638,24 @@ app.post("/api/send-proposal-status", async (req, res) => {
     if (!to || !proposalId || !status) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
-    const emailHtml = html || `
-      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
-        <h2>Installment Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}</h2>
-        <p>Hello ${studentName || "Student"},</p>
-        <p>Proposal <strong>${proposalId}</strong> has been <strong>${status}</strong>.</p>
-        ${notes ? `<p><em>${notes}</em></p>` : ""}
-        <p>Amount: KSH ${Number(amount || 0).toLocaleString()}</p>
-        <p>Institution: ${institution || "N/A"}</p>
-      </div>`;
+    const emailHtml = html || marketMixEmailShell({
+      preheader: `Proposal ${status}`,
+      eyebrow: "MarketMix Kenya · Lipa Mdogo Mdogo",
+      title: `Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}`,
+      subtitle: `Hello ${studentName || "Student"}, your installment proposal has been reviewed.`,
+      bodyHtml: `
+        ${emailInfoCard([
+          ["Proposal ID", String(proposalId)],
+          ["Status", status.toUpperCase(), status === "approved"],
+          ["Amount", `KSH ${Number(amount || 0).toLocaleString()}`],
+          ["Institution", institution || "N/A"],
+        ])}
+        ${notes ? emailBodyText(notes) : ""}
+      `,
+      ctaLabel: "Open MarketMix",
+      ctaUrl: "https://marketmix.site",
+    });
+
     const ok = await sendEmail(to, subject || `Proposal ${status}`, emailHtml, "sales");
     return res.json({ success: ok, message: ok ? "Sent" : "Failed" });
   } catch (e) {
@@ -506,7 +663,7 @@ app.post("/api/send-proposal-status", async (req, res) => {
   }
 });
 
-// --- STK push (store, wallet, real estate seed orders — all use this) ---
+// --- STK push (used by store, wallet, real estate, moving) ---
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
@@ -540,6 +697,9 @@ app.post("/api/stk-push", async (req, res) => {
       invoiceId: response?.invoice?.invoice_id || null,
       status: "STK_PUSH_SENT",
       totalAmount: amt,
+      userEmail: email,
+      buyerEmail: email,
+      shippingDetails: { fullName, phoneNumber, email },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
@@ -549,7 +709,7 @@ app.post("/api/stk-push", async (req, res) => {
   }
 });
 
-// --- Store order seed (items + shipping so store receipt renders) ---
+// --- Store order seed ---
 app.post("/api/store/seed", async (req, res) => {
   try {
     const { ref, amount, email, fullName, phoneNumber, cart } = req.body || {};
@@ -576,9 +736,7 @@ app.post("/api/store/seed", async (req, res) => {
   }
 });
 
-// --- REAL ESTATE SECTION (isolated) -------------------------------------
-
-// Seed a real-estate order before STK push. Ref must start with PROP_.
+// --- Real estate seed ---
 app.post("/api/real-estate/seed", async (req, res) => {
   try {
     const { ref, amount, email, fullName, phoneNumber, paymentKind, property, landlord } = req.body || {};
@@ -614,6 +772,106 @@ app.post("/api/real-estate/seed", async (req, res) => {
     return res.json({ success: true, message: "Real estate order seeded", ref });
   } catch (e) {
     return sendServerError(res, e, "Real estate seed failed");
+  }
+});
+
+// ============================
+// MOVING / TRANSPORT endpoints (isolated)
+// ============================
+
+// Notify by email when a transport request is created or updated
+app.post("/api/moving/notify", async (req, res) => {
+  try {
+    const { requestId, email } = req.body || {};
+    if (!requestId || !email) {
+      return res.status(400).json({ success: false, message: "requestId and email required" });
+    }
+
+    const snap = await db.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+
+    const data = snap.data();
+    const ok = await sendMovingConfirmationEmail(
+      {
+        userName: data.userName,
+        pickupLabel: data.pickupLabel,
+        pickupCoordinates: data.pickupCoordinates,
+        destinationLabel: data.destinationLabel,
+        destinationTitle: data.destinationTitle,
+        destinationCoordinates: data.destinationCoordinates,
+        vehicleLabel: data.vehicleLabel,
+        itemCount: data.itemCount,
+        items: data.items,
+        quotedPrice: data.quotedPrice,
+        status: data.status,
+      },
+      email,
+      requestId
+    );
+
+    return res.json({ success: ok });
+  } catch (e) {
+    return sendServerError(res, e, "Moving notify failed");
+  }
+});
+
+// Create a transport request entirely server-side (optional, use if you prefer not to write from client)
+app.post("/api/moving/request", async (req, res) => {
+  try {
+    const {
+      userId, userName, userEmail,
+      pickupLabel, pickupCoordinates, pickupArea,
+      destinationLabel, destinationTitle, destinationCoordinates, destinationArea,
+      items, itemCount, vehicleId, vehicleLabel,
+      propertyId, packageId, packageTitle, destinationPrecision,
+    } = req.body || {};
+
+    if (!userId || !pickupLabel || !destinationLabel || !vehicleId) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+
+    const ref = await db.collection("transportRequests").add({
+      userId, userName, userEmail,
+      pickupLabel, pickupCoordinates, ...pickupArea,
+      destinationLabel, destinationTitle, destinationCoordinates, ...destinationArea,
+      items: items || {}, itemCount: itemCount || 0,
+      vehicleId, vehicleLabel,
+      propertyId: propertyId || "",
+      packageId: packageId || "",
+      packageTitle: packageTitle || "",
+      destinationPrecision: destinationPrecision || "customer-pin",
+      status: "REQUESTED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Fire-and-forget email
+    if (userEmail) {
+      sendMovingConfirmationEmail({
+        userName, pickupLabel, pickupCoordinates,
+        destinationLabel, destinationTitle, destinationCoordinates,
+        vehicleLabel, itemCount, items, status: "REQUESTED",
+      }, userEmail, ref.id).catch(() => {});
+    }
+
+    return res.json({ success: true, requestId: ref.id });
+  } catch (e) {
+    return sendServerError(res, e, "Moving request failed");
+  }
+});
+
+// Lookup a transport request (for polling the tracking page)
+app.get("/api/moving/request/:requestId", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    if (!requestId) return res.status(400).json({ success: false, message: "Missing requestId" });
+    const snap = await db.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true, data: { id: snap.id, ...snap.data() } });
+  } catch (e) {
+    return sendServerError(res, e, "Moving lookup failed");
   }
 });
 
@@ -667,7 +925,7 @@ app.post("/api/confirm-subscription", async (req, res) => {
   }
 });
 
-// --- IntaSend callback (shared by ALL flows, routes by ref prefix) ---
+// --- IntaSend callback ---
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -679,7 +937,6 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (state === "COMPLETE") paymentStatus = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
 
-    // -- Subscription branch --
     if (isSubscriptionRef(api_ref)) {
       const ref = db.collection("subscriptions").doc(api_ref);
       const snap = await ref.get();
@@ -696,20 +953,16 @@ app.post("/api/intasend-callback", async (req, res) => {
               orderId: api_ref, planId: s.planId, sellerId: s.sellerId,
               sellerEmail: s.email, amount: s.amount,
             }, mpesa_reference);
-          } catch (err) {
-            console.error("Activation error:", err);
-          }
+          } catch (err) { console.error("Activation error:", err); }
         }
       }
       return res.send("OK");
     }
 
-    // -- Wallet / Store / Real estate: all live in `orders` keyed by api_ref --
     const orderRef = db.collection("orders").doc(api_ref);
     let orderSnap = await orderRef.get();
     const callbackAmount = parseFloat(req.body.value);
 
-    // Wallet auto-create
     if (!orderSnap.exists && isWalletRef(api_ref)) {
       const sellerId = api_ref.split("_")[1];
       const amount = (callbackAmount > 0 && callbackAmount <= 500000) ? callbackAmount : 1;
@@ -742,7 +995,6 @@ app.post("/api/intasend-callback", async (req, res) => {
     });
     console.log(`✅ Order ${api_ref} → ${paymentStatus}`);
 
-    // Wallet deposit: update wallet balance + ad transaction
     if (isWalletRef(api_ref) && state === "COMPLETE") {
       const sellerId = api_ref.split("_")[1];
       let amount = callbackAmount;
@@ -781,7 +1033,6 @@ app.post("/api/intasend-callback", async (req, res) => {
       console.log(`💰 Wallet ${sellerId} +KSH ${amount}`);
     }
 
-    // Email branch on COMPLETE for non-wallet orders
     if (state === "COMPLETE" && !isWalletRef(api_ref)) {
       let userEmail =
         orderData.userEmail ||
@@ -809,12 +1060,6 @@ app.post("/api/intasend-callback", async (req, res) => {
             ...orderData,
             totalAmount: orderData.totalAmount || callbackAmount || 0,
             mpesaReference: mpesa_reference || orderData.mpesaReference || "N/A",
-            propertyTitle: orderData.propertyTitle,
-            propertyLocation: orderData.propertyLocation,
-            propertyType: orderData.propertyType,
-            buyerName: orderData.buyerName || orderData.shippingDetails?.fullName,
-            landlordName: orderData.landlordName,
-            landlordPhone: orderData.landlordPhone,
           };
           sendRealEstatePaymentEmail(payload, userEmail, api_ref)
             .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
@@ -834,20 +1079,18 @@ app.post("/api/intasend-callback", async (req, res) => {
   }
 });
 
-// --- Universal transaction lookup (used by all frontends for polling) ---
+// --- Universal transaction lookup ---
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
   try {
     if (!paymentRef) return res.status(400).json({ success: false, message: "Missing paymentRef" });
     console.log(`🔍 Lookup: ${paymentRef}`);
 
-    // 1. Orders by doc ID (store, wallet, real estate, test)
     const orderDoc = await db.collection("orders").doc(paymentRef).get();
     if (orderDoc.exists) {
       const orderData = orderDoc.data();
       console.log(`✅ Order found: paymentStatus=${orderData.paymentStatus}, isWalletDeposit=${!!orderData.isWalletDeposit}, isRealEstate=${!!orderData.isRealEstate}`);
 
-      // Auto-heal wallet adTransaction
       if (orderData.paymentStatus === "paid" && orderData.isWalletDeposit && orderData.sellerId) {
         const adRef = db.collection("adTransactions").doc(paymentRef);
         const adSnap = await adRef.get();
@@ -877,7 +1120,6 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       });
     }
 
-    // 2. adTransactions by doc ID
     const adTxDoc = await db.collection("adTransactions").doc(paymentRef).get();
     if (adTxDoc.exists) {
       const tx = adTxDoc.data();
@@ -1020,14 +1262,23 @@ app.post("/api/seller/recover-pin", async (req, res) => {
       ipAddress: req.ip, userAgent: req.get("User-Agent"),
     });
 
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
-        <h2>Withdrawal PIN Recovery</h2>
-        <p>You requested a PIN reset. Use this code:</p>
-        <div style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;padding:20px;background:#667eea;color:#fff;border-radius:12px">${code}</div>
-        <p><strong>This code expires in 15 minutes.</strong></p>
-        <p style="color:#856404">If you didn't request this, ignore this email.</p>
-      </div>`;
+    const html = marketMixEmailShell({
+      preheader: "Your PIN reset code",
+      eyebrow: "MarketMix Kenya · Security",
+      title: "Withdrawal PIN Recovery",
+      subtitle: "Use the code below to reset your withdrawal PIN.",
+      bodyHtml: `
+        <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:18px;padding:22px;text-align:center;margin-bottom:16px;">
+          <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#065f46;">${code}</div>
+        </div>
+        ${emailInfoCard([
+          ["Valid for", "15 minutes"],
+          ["Attempts", "3"],
+        ])}
+        ${emailBodyText("If you didn't request this, you can safely ignore this email — but consider changing your password.")}
+      `,
+      footerNote: "MarketMix staff will never ask you for this code.",
+    });
 
     const ok = await sendEmail(email, "Your PIN Reset Code - MarketMix Kenya", html, "security");
     if (!ok) return res.json({ success: false, message: "Failed to send recovery code", emailSent: false });
@@ -1043,10 +1294,8 @@ app.post("/api/seller/verify-recovery-code", async (req, res) => {
   try {
     const { userId, code } = req.body || {};
     if (!userId || !code) return res.status(400).json({ success: false, message: "userId and code required" });
-
     const v = await verifyReplacementCode(userId, code);
     if (!v.valid) return res.status(400).json({ success: false, message: v.message });
-
     await db.collection("securityLogs").add({
       userId, email: v.data.email, action: "PIN_RECOVERY_VERIFIED",
       timestamp: admin.firestore.FieldValue.serverTimestamp(), ipAddress: req.ip,
@@ -1146,16 +1395,19 @@ app.get("/api/test-email-auth", async (req, res) => {
   res.json({
     success: !!BREVO_API_KEY,
     message: BREVO_API_KEY ? "Email authentication configured" : "BREVO_API_KEY not configured",
-    senders: {
-      security: "MarketMixKenya <security@marketmix.site>",
-      sales: "MarketMixKenya <sales@marketmix.site>",
-    },
+    senders: SENDERS,
   });
 });
 
 app.post("/api/test-proposal-email", async (req, res) => {
   const testEmail = req.body?.email || "test@example.com";
-  const html = `<p>Test proposal email</p>`;
+  const html = marketMixEmailShell({
+    preheader: "Test proposal email",
+    eyebrow: "MarketMix Kenya",
+    title: "Test Proposal Email",
+    subtitle: "This is a test from the proposal status system.",
+    bodyHtml: emailBodyText("If you received this, the pipeline is working."),
+  });
   const ok = await sendEmail(testEmail, "Test Proposal Email", html, "sales");
   res.json({ success: ok, to: testEmail });
 });
@@ -1176,21 +1428,39 @@ app.post("/api/test-real-estate-email", async (req, res) => {
   res.json({ success: ok, to: testEmail });
 });
 
+app.post("/api/test-moving-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "MOVE_TEST_" + Date.now();
+  const ok = await sendMovingConfirmationEmail({
+    userName: "Test User",
+    pickupLabel: "Kilimani, Nairobi",
+    pickupCoordinates: { lat: -1.2921, lng: 36.8219 },
+    destinationLabel: "Westlands, Nairobi",
+    destinationTitle: "2 Bedroom Apartment",
+    destinationCoordinates: { lat: -1.2674, lng: 36.8109 },
+    vehicleLabel: "Pickup",
+    itemCount: 12,
+    items: { bed: 1, sofa: 1, box: 10 },
+    quotedPrice: 4500,
+    status: "REQUESTED",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
+});
+
 // --- Health ---
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
     timestamp: Date.now(),
-    services: {
-      firebase: true,
-      brevo: !!BREVO_API_KEY,
-      intasend: true,
-      realEstate: "ready",
-    },
+    services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true },
+    senders: SENDERS,
     endpoints: [
       "/api/stk-push",
       "/api/store/seed",
       "/api/real-estate/seed",
+      "/api/moving/notify",
+      "/api/moving/request",
+      "/api/moving/request/:id",
       "/api/subscription-payment",
       "/api/seller/withdraw",
       "/api/seller/recover-pin",
@@ -1219,18 +1489,11 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
     console.log("🛑 Keep-alive disabled");
     return;
   }
-
   const INTERVAL = Number(process.env.KEEP_ALIVE_INTERVAL_MS) || 4 * 60 * 1000;
   const JITTER = Number(process.env.KEEP_ALIVE_JITTER_MS) || 30 * 1000;
   const TIMEOUT = Number(process.env.KEEP_ALIVE_REQUEST_TIMEOUT_MS) || 1000;
-  let timer = null;
-  let paused = false;
-
-  const inPause = () => {
-    const h = (new Date().getUTCHours() + 3) % 24;
-    return h >= 23 || h < 5;
-  };
-
+  let timer = null, paused = false;
+  const inPause = () => { const h = (new Date().getUTCHours() + 3) % 24; return h >= 23 || h < 5; };
   const schedule = () => {
     if (timer) clearTimeout(timer);
     if (inPause()) {
@@ -1252,7 +1515,6 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
     }, Math.max(1000, INTERVAL + j));
     timer.unref?.();
   };
-
   schedule();
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
@@ -1264,9 +1526,11 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
-  console.log(`🏠 Real estate: enabled (PROP_ prefix)`);
-  console.log(`💰 Subscriptions: enabled (SUB_ prefix)`);
-  console.log(`🪙 Wallet: enabled (WALLET_ prefix)`);
+  console.log(`📦 Store: ✅ (ORD_ / TEST_PAY_)`);
+  console.log(`🏠 Real estate: ✅ (PROP_)`);
+  console.log(`🚚 Moving: ✅ (MOVE_)`);
+  console.log(`💰 Subscriptions: ✅ (SUB_)`);
+  console.log(`🪙 Wallet: ✅ (WALLET_)`);
 });
 
 const shutdown = () => {
