@@ -113,7 +113,7 @@ const SENDERS = {
   sales:    { name: "MarketMix Kenya",        email: process.env.SENDER_SALES    || "sales@marketmix.site" },
   security: { name: "MarketMix Kenya",        email: process.env.SENDER_SECURITY || "security@marketmix.site" },
   bookings: { name: "MarketMix Real Estates", email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
-  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "marketmixkenya@gmail.com" },
+  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "support@marketmix.site" },
 };
 
 const sendEmail = async (to, subject, html, type = "security") => {
