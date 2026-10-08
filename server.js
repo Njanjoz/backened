@@ -1,6 +1,6 @@
-// server.js — MarketMix backend (store + wallet + subscriptions + real estate + moving)
-// Real-estate and moving flows are isolated by ref prefix (PROP_, MOVE_) so they
-// can't affect store / wallet / subscription logic.
+// server.js — MarketMix backend
+// Real-estate site (marketmix-realestates.vercel.app) uses the M-Pesa ref as the customer-facing ID.
+// Nothing else (store, wallet, subscription, moving, PIN) is affected.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -101,15 +101,15 @@ const REAL_ESTATE_RECEIPT_URL =
   "https://marketmix-realestates.vercel.app/receipt";
 
 // ============================
-// Brevo sender config (env-driven)
+// Brevo senders (env-driven)
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 const SENDERS = {
-  sales:    { name: "MarketMix Kenya",          email: process.env.SENDER_SALES    || "sales@marketmix.site" },
-  security: { name: "MarketMix Kenya",          email: process.env.SENDER_SECURITY || "security@marketmix.site" },
-  bookings: { name: "MarketMix Real Estates",   email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
-  moving:   { name: "MarketMix Moving",         email: process.env.SENDER_MOVING   || "support@marketmix.site" },
+  sales:    { name: "MarketMix Kenya",        email: process.env.SENDER_SALES    || "sales@marketmix.site" },
+  security: { name: "MarketMix Kenya",        email: process.env.SENDER_SECURITY || "security@marketmix.site" },
+  bookings: { name: "MarketMix Real Estates", email: process.env.SENDER_BOOKINGS || "bookings@marketmix.site" },
+  moving:   { name: "MarketMix Moving",       email: process.env.SENDER_MOVING   || "support@marketmix.site" },
 };
 
 const sendEmail = async (to, subject, html, type = "security") => {
@@ -211,7 +211,7 @@ function isRealEstateOrder(apiRef, orderData) {
 }
 
 // ============================
-// EMAIL SHELL — MarketMix liquid-glass theme
+// EMAIL SHELL — MarketMix theme
 // ============================
 const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", title, subtitle, bodyHtml, ctaLabel, ctaUrl, footerNote = "" }) => `
 <!DOCTYPE html>
@@ -251,7 +251,6 @@ const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", titl
 </body>
 </html>`;
 
-// Reusable inner blocks
 const emailInfoCard = (rows) => `
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
     <tr><td style="padding:18px;">
@@ -273,7 +272,7 @@ const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
 // ============================
-// Order confirmation email (store)
+// Order confirmation email (store) — unchanged
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -339,15 +338,16 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
 };
 
 // ============================
-// Real estate confirmation email
+// Real estate email — uses M-Pesa ref as ID
 // ============================
 const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   try {
     console.log("🏠 Real estate receipt →", userEmail);
     if (!BREVO_API_KEY) return false;
 
+    const mpesaRef = data.mpesaReference || data.mpesaCode || "—";
+    const displayId = mpesaRef; // customer-facing ID = M-Pesa ref
     const amount = Number(data.totalAmount || data.amount || 0);
-    const mpesaRef = data.mpesaReference || data.mpesaCode || "N/A";
 
     const bodyHtml = `
       ${emailBodyText(`Hello <strong>${data.buyerName || userEmail.split("@")[0]}</strong>, your payment has been received and confirmed.`)}
@@ -360,8 +360,7 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
         ["Property", data.propertyTitle || "—"],
         ["Location", data.propertyLocation || "—"],
         ["Type", data.propertyType || "—"],
-        ["Reference", String(orderId)],
-        ["M-Pesa code", mpesaRef],
+        ["M-Pesa code", displayId],
         ["Paid on", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
       ])}
       ${emailSectionLabel("Landlord / Agent")}
@@ -373,19 +372,19 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
     `;
 
     const html = marketMixEmailShell({
-      preheader: `Payment confirmed for ${data.propertyTitle || "your property"}`,
+      preheader: `Payment confirmed for ${data.propertyTitle || "your property"} · ${displayId}`,
       eyebrow: "MarketMix Real Estates",
       title: "Payment Confirmed",
       subtitle: "Keep this email as your official receipt.",
       bodyHtml,
       ctaLabel: "View receipt online",
-      ctaUrl: `${REAL_ESTATE_RECEIPT_URL}/${orderId}`,
+      ctaUrl: `${REAL_ESTATE_RECEIPT_URL}/${displayId}`,
       footerNote: "Questions? Reply to this email and our team will help.",
     });
 
     const ok = await sendEmail(
       userEmail,
-      `Payment Confirmed - ${data.propertyTitle || "Property"} (${String(orderId).slice(0, 8)})`,
+      `Payment Confirmed - ${data.propertyTitle || "Property"} (${displayId})`,
       html,
       "bookings"
     );
@@ -393,8 +392,10 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
     if (ok) {
       await db.collection("realEstateEmails").add({
         orderId, userEmail,
+        displayId,
         propertyTitle: data.propertyTitle || null,
-        amount, mpesaReference: mpesaRef,
+        amount,
+        mpesaReference: mpesaRef,
         type: "real_estate_confirmation",
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
@@ -407,7 +408,7 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
 };
 
 // ============================
-// Moving / Transport confirmation email
+// Moving confirmation email — unchanged
 // ============================
 const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   try {
@@ -663,7 +664,7 @@ app.post("/api/send-proposal-status", async (req, res) => {
   }
 });
 
-// --- STK push (used by store, wallet, real estate, moving) ---
+// --- STK push (store, wallet, real estate, moving all use this) ---
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
@@ -776,48 +777,38 @@ app.post("/api/real-estate/seed", async (req, res) => {
 });
 
 // ============================
-// MOVING / TRANSPORT endpoints (isolated)
+// MOVING endpoints
 // ============================
-
-// Notify by email when a transport request is created or updated
 app.post("/api/moving/notify", async (req, res) => {
   try {
     const { requestId, email } = req.body || {};
     if (!requestId || !email) {
       return res.status(400).json({ success: false, message: "requestId and email required" });
     }
-
     const snap = await db.collection("transportRequests").doc(requestId).get();
     if (!snap.exists) {
       return res.status(404).json({ success: false, message: "Request not found" });
     }
-
     const data = snap.data();
-    const ok = await sendMovingConfirmationEmail(
-      {
-        userName: data.userName,
-        pickupLabel: data.pickupLabel,
-        pickupCoordinates: data.pickupCoordinates,
-        destinationLabel: data.destinationLabel,
-        destinationTitle: data.destinationTitle,
-        destinationCoordinates: data.destinationCoordinates,
-        vehicleLabel: data.vehicleLabel,
-        itemCount: data.itemCount,
-        items: data.items,
-        quotedPrice: data.quotedPrice,
-        status: data.status,
-      },
-      email,
-      requestId
-    );
-
+    const ok = await sendMovingConfirmationEmail({
+      userName: data.userName,
+      pickupLabel: data.pickupLabel,
+      pickupCoordinates: data.pickupCoordinates,
+      destinationLabel: data.destinationLabel,
+      destinationTitle: data.destinationTitle,
+      destinationCoordinates: data.destinationCoordinates,
+      vehicleLabel: data.vehicleLabel,
+      itemCount: data.itemCount,
+      items: data.items,
+      quotedPrice: data.quotedPrice,
+      status: data.status,
+    }, email, requestId);
     return res.json({ success: ok });
   } catch (e) {
     return sendServerError(res, e, "Moving notify failed");
   }
 });
 
-// Create a transport request entirely server-side (optional, use if you prefer not to write from client)
 app.post("/api/moving/request", async (req, res) => {
   try {
     const {
@@ -847,7 +838,6 @@ app.post("/api/moving/request", async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Fire-and-forget email
     if (userEmail) {
       sendMovingConfirmationEmail({
         userName, pickupLabel, pickupCoordinates,
@@ -862,7 +852,6 @@ app.post("/api/moving/request", async (req, res) => {
   }
 });
 
-// Lookup a transport request (for polling the tracking page)
 app.get("/api/moving/request/:requestId", async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -925,7 +914,9 @@ app.post("/api/confirm-subscription", async (req, res) => {
   }
 });
 
-// --- IntaSend callback ---
+// ============================
+// IntaSend callback
+// ============================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -937,6 +928,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     if (state === "COMPLETE") paymentStatus = "paid";
     if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
 
+    // Subscriptions branch
     if (isSubscriptionRef(api_ref)) {
       const ref = db.collection("subscriptions").doc(api_ref);
       const snap = await ref.get();
@@ -963,6 +955,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     let orderSnap = await orderRef.get();
     const callbackAmount = parseFloat(req.body.value);
 
+    // Wallet auto-create
     if (!orderSnap.exists && isWalletRef(api_ref)) {
       const sellerId = api_ref.split("_")[1];
       const amount = (callbackAmount > 0 && callbackAmount <= 500000) ? callbackAmount : 1;
@@ -995,6 +988,7 @@ app.post("/api/intasend-callback", async (req, res) => {
     });
     console.log(`✅ Order ${api_ref} → ${paymentStatus}`);
 
+    // Wallet deposit handling
     if (isWalletRef(api_ref) && state === "COMPLETE") {
       const sellerId = api_ref.split("_")[1];
       let amount = callbackAmount;
@@ -1033,6 +1027,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       console.log(`💰 Wallet ${sellerId} +KSH ${amount}`);
     }
 
+    // Email on COMPLETE
     if (state === "COMPLETE" && !isWalletRef(api_ref)) {
       let userEmail =
         orderData.userEmail ||
@@ -1056,10 +1051,18 @@ app.post("/api/intasend-callback", async (req, res) => {
         const realEstate = isRealEstateOrder(api_ref, orderData);
 
         if (realEstate) {
+          // Persist the M-Pesa ref as the customer-facing displayId (real-estate only)
+          if (mpesa_reference) {
+            await orderRef.update({
+              displayId: mpesa_reference,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+
           const payload = {
             ...orderData,
             totalAmount: orderData.totalAmount || callbackAmount || 0,
-            mpesaReference: mpesa_reference || orderData.mpesaReference || "N/A",
+            mpesaReference: mpesa_reference || orderData.mpesaReference || "—",
           };
           sendRealEstatePaymentEmail(payload, userEmail, api_ref)
             .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
@@ -1079,25 +1082,43 @@ app.post("/api/intasend-callback", async (req, res) => {
   }
 });
 
-// --- Universal transaction lookup ---
+// ============================
+// Universal transaction lookup
+// — includes real-estate fallback by M-Pesa ref
+// ============================
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
   try {
     if (!paymentRef) return res.status(400).json({ success: false, message: "Missing paymentRef" });
     console.log(`🔍 Lookup: ${paymentRef}`);
 
-    const orderDoc = await db.collection("orders").doc(paymentRef).get();
+    // 1. Orders by doc ID
+    let orderDoc = await db.collection("orders").doc(paymentRef).get();
+
+    // Real-estate fallback: resolve by M-Pesa ref if the URL used the display ID
+    if (!orderDoc.exists) {
+      const byMpesa = await db.collection("orders")
+        .where("mpesaReference", "==", paymentRef)
+        .where("isRealEstate", "==", true)
+        .limit(1)
+        .get();
+      if (!byMpesa.empty) {
+        orderDoc = byMpesa.docs[0];
+        console.log(`✅ Resolved ${paymentRef} → real-estate order via M-Pesa ref`);
+      }
+    }
+
     if (orderDoc.exists) {
       const orderData = orderDoc.data();
       console.log(`✅ Order found: paymentStatus=${orderData.paymentStatus}, isWalletDeposit=${!!orderData.isWalletDeposit}, isRealEstate=${!!orderData.isRealEstate}`);
 
       if (orderData.paymentStatus === "paid" && orderData.isWalletDeposit && orderData.sellerId) {
-        const adRef = db.collection("adTransactions").doc(paymentRef);
+        const adRef = db.collection("adTransactions").doc(orderDoc.id);
         const adSnap = await adRef.get();
         if (!adSnap.exists) {
           const amount = orderData.totalAmount || 1;
           await adRef.set({
-            paymentRef, sellerId: orderData.sellerId,
+            paymentRef: orderDoc.id, sellerId: orderData.sellerId,
             sellerEmail: orderData.sellerEmail || null,
             type: "deposit", amount, status: "completed",
             paymentMethod: "mpesa",
@@ -1106,7 +1127,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
             completedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`🔄 Auto-healed adTransaction ${paymentRef}`);
+          console.log(`🔄 Auto-healed adTransaction ${orderDoc.id}`);
         }
       }
 
@@ -1120,6 +1141,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
       });
     }
 
+    // 2. adTransactions by doc ID
     const adTxDoc = await db.collection("adTransactions").doc(paymentRef).get();
     if (adTxDoc.exists) {
       const tx = adTxDoc.data();
@@ -1148,7 +1170,9 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// --- Seller withdrawal ---
+// ============================
+// Seller withdrawal
+// ============================
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body || {};
@@ -1238,7 +1262,9 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
-// --- PIN recovery ---
+// ============================
+// PIN recovery
+// ============================
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body || {};
@@ -1335,7 +1361,9 @@ app.post("/api/seller/reset-pin", async (req, res) => {
   }
 });
 
-// --- Stock update ---
+// ============================
+// Stock update
+// ============================
 app.post("/api/update-stock", async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
@@ -1356,7 +1384,9 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// --- Hugging Face image gen ---
+// ============================
+// Hugging Face image gen
+// ============================
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
@@ -1390,7 +1420,9 @@ app.post("/api/generate-ai-image", async (req, res) => {
   }
 });
 
-// --- Test endpoints ---
+// ============================
+// Test endpoints
+// ============================
 app.get("/api/test-email-auth", async (req, res) => {
   res.json({
     success: !!BREVO_API_KEY,
@@ -1420,7 +1452,7 @@ app.post("/api/test-real-estate-email", async (req, res) => {
     propertyLocation: "Kilimani, Nairobi",
     propertyType: "For Rent",
     totalAmount: 4000,
-    mpesaReference: "TESTREF" + Math.floor(Math.random() * 1e6),
+    mpesaReference: "UJ8NN93LWY",
     buyerName: "Test Buyer",
     landlordName: "Test Landlord",
     landlordPhone: "254712345678",
@@ -1447,7 +1479,9 @@ app.post("/api/test-moving-email", async (req, res) => {
   res.json({ success: ok, to: testEmail });
 });
 
-// --- Health ---
+// ============================
+// Health
+// ============================
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
@@ -1527,7 +1561,7 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
   console.log(`📦 Store: ✅ (ORD_ / TEST_PAY_)`);
-  console.log(`🏠 Real estate: ✅ (PROP_)`);
+  console.log(`🏠 Real estate: ✅ (PROP_, M-Pesa ref as ID)`);
   console.log(`🚚 Moving: ✅ (MOVE_)`);
   console.log(`💰 Subscriptions: ✅ (SUB_)`);
   console.log(`🪙 Wallet: ✅ (WALLET_)`);
