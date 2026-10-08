@@ -4,7 +4,8 @@
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
 // Uses only existing env vars.
 // Emails can optionally mirror to WhatsApp by passing a phone number.
-// Dual Firebase Admin: shop (default) owns all data; realestate (named) only verifies tokens.
+// Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
+// Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -80,12 +81,13 @@ if (missing.length) {
 
 // ============================
 // Firebase — two Admin apps
-// - shop app (default)     → all Firestore reads/writes still go here
-// - realestate app (named) → only used to verify tokens from the real-estate frontend
+// - shop app (default)     → Shop Firestore (all existing shop routes)
+// - realestate app (named) → Real Estate Auth + Real Estate Firestore
 // ============================
 let shopApp;
 let reApp;
 let db;
+let reDb;
 
 try {
   const shopSA = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
@@ -103,7 +105,8 @@ try {
   process.exit(1);
 }
 
-db = shopApp.firestore(); // every existing route keeps using this
+db = shopApp.firestore();   // Shop Firestore — existing shop routes keep using this
+reDb = reApp.firestore();   // Real Estate Firestore — driver/admin/transport data
 
 // Try both projects' verifiers so a token from either frontend works.
 async function verifyAnyToken(idToken) {
@@ -1266,6 +1269,8 @@ app.post("/api/confirm-subscription", async (req, res) => {
 
 // ============================
 // DRIVER APPROVAL — admin approves or rejects a driver application
+// Real Estate users (admins + drivers) live in the Real Estate Firebase project.
+// This endpoint therefore uses reDb, not db.
 // ============================
 app.post("/api/driver/decision", async (req, res) => {
   try {
@@ -1285,13 +1290,22 @@ app.post("/api/driver/decision", async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid auth token" });
     }
 
-    const callerDoc = await db.collection("users").doc(decoded.uid).get();
+    // Admin check against the Real Estate Firestore
+    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
+    if (!callerDoc.exists) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
     const caller = callerDoc.data() || {};
-    if (caller.role !== "admin" && caller.userType !== "admin") {
+    const isAdmin =
+      caller.role === "admin" ||
+      caller.userType === "admin" ||
+      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) {
       return res.status(403).json({ success: false, message: "Admin access required" });
     }
 
-    const userRef = db.collection("users").doc(userId);
+    // Driver lookup in Real Estate Firestore
+    const userRef = reDb.collection("users").doc(userId);
     const userSnap = await userRef.get();
     if (!userSnap.exists) return res.status(404).json({ success: false, message: "Driver not found" });
     const driver = userSnap.data() || {};
@@ -1305,8 +1319,8 @@ app.post("/api/driver/decision", async (req, res) => {
       driverReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
       driverReviewedBy: decoded.uid,
       roles: approved
-        ? Array.from(new Set([...(driver.roles || []), "driver"]))
-        : (driver.roles || []).filter(r => r !== "driver"),
+        ? Array.from(new Set([...(Array.isArray(driver.roles) ? driver.roles : []), "driver"]))
+        : (Array.isArray(driver.roles) ? driver.roles : []).filter(r => r !== "driver"),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -1373,7 +1387,7 @@ app.post("/api/driver/decision", async (req, res) => {
       }
     }
 
-    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"}`);
+    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"} (by admin ${decoded.uid})`);
     return res.json({ success: true, decision, userId });
   } catch (e) {
     console.error("❌ Driver decision failed:", e);
@@ -2001,6 +2015,7 @@ app.get("/_health", (req, res) => {
     ok: true,
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
+    firestore: { shop: !!db, realestate: !!reDb },
     senders: SENDERS,
     whatsappQueue: waQueue.length,
     endpoints: [
@@ -2087,7 +2102,7 @@ const server = app.listen(PORT, () => {
   console.log(`📦 Store: ✅ email + WhatsApp`);
   console.log(`🏠 Real estate: ✅ email + WhatsApp (buyer + landlord)`);
   console.log(`🚚 Moving: ✅ email + WhatsApp`);
-  console.log(`🧑‍✈️ Driver approvals: ✅ (admin only)`);
+  console.log(`🧑✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
   console.log(`💰 Subscriptions: ✅`);
   console.log(`🪙 Wallet: ✅`);
 });
