@@ -1104,6 +1104,10 @@ app.post("/api/stk-push", async (req, res) => {
       return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
+    // ✅ FIX: Use dot-path keys so we MERGE into existing shippingDetails
+    // instead of replacing the whole map. This preserves deliveryPlace
+    // (which contains coordinates), deliveryType, and deliveryOption
+    // that CheckoutPage wrote when the order was created.
     await db.collection("orders").doc(orderId).set({
       invoiceId: response?.invoice?.invoice_id || null,
       status: "STK_PUSH_SENT",
@@ -1111,7 +1115,9 @@ app.post("/api/stk-push", async (req, res) => {
       userEmail: email,
       buyerEmail: email,
       phoneNumber,
-      shippingDetails: { fullName, phoneNumber, email },
+      "shippingDetails.fullName": fullName,
+      "shippingDetails.phoneNumber": phoneNumber,
+      "shippingDetails.email": email,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
