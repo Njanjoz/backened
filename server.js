@@ -547,7 +547,6 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
   ].join("\n");
 }
 
-// ⭐ NEW — Seller gets notified of a new paid order (per-seller slice)
 function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -573,7 +572,6 @@ function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue,
   ].join("\n");
 }
 
-// ⭐ NEW — Buyer gets notified whenever the seller changes order status
 function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -604,7 +602,6 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   ].join("\n");
 }
 
-// ⭐ NEW — 6h reminder nudge for sellers who haven't acted
 function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nudgeNumber, maxNudges }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -627,6 +624,60 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
     `👉 ${SELLER_DASHBOARD_URL}`,
     ``,
     `*MarketMix Kenya*`,
+  ].join("\n");
+}
+
+// ⭐ QUICKSALE — buyer confirmation (single message; replaces the store pair)
+function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const ref = paymentReference || "—";
+  const shop = sellerShop || "the seller";
+  const summary = itemSummary || "Your purchase";
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Good news — your payment has landed safely. 🎉`,
+    ``,
+    `🛍️ *Item:* ${summary}`,
+    `💰 *Amount paid:* KES ${amt}`,
+    `🧾 *Payment ref:* ${ref}`,
+    `🏪 *Seller:* ${shop}`,
+    ``,
+    `Thanks for shopping with MarketMix Kenya! ❤️`,
+    `The seller has been notified and your purchase is confirmed.`,
+    ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].join("\n");
+}
+
+// ⭐ QUICKSALE — seller confirmation of a recorded in-store sale
+function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentReference, customerName, customerPhone }) {
+  const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const ref = paymentReference || "—";
+  const customer = customerName || "Walk-in customer";
+  const phone = customerPhone || "—";
+  const summary = itemSummary || "—";
+  return [
+    `💰 *MarketMix Kenya — Quicksale Recorded*`,
+    ``,
+    `Hi ${name},`,
+    ``,
+    `A quicksale payment was just confirmed. ✅`,
+    ``,
+    `🛍️ *Item(s):* ${summary}`,
+    `💵 *Amount:* KES ${amt}`,
+    `🧾 *M-Pesa ref:* ${ref}`,
+    `👤 *Customer:* ${customer}`,
+    `📱 *Phone:* ${phone}`,
+    ``,
+    `Funds are in your seller ledger.`,
+    `👉 ${SELLER_DASHBOARD_URL}`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
@@ -663,12 +714,18 @@ const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
 const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
 const isMovingRef       = (r) => typeof r === "string" && r.startsWith("MOVE_");
 const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY_");
+// ⭐ QUICKSALE detectors
+const isQuicksaleRef    = (r) => typeof r === "string" && r.startsWith("QS_");
 
 function isRealEstateOrder(apiRef, orderData) {
   return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
 }
 
-// ⭐ NEW — helpers for seller slices
+// ⭐ QUICKSALE — detected by field on the order doc (frontend writes type: 'QUICK_SALE')
+function isQuicksaleOrder(orderData) {
+  return orderData?.type === "QUICK_SALE" || orderData?.isQuicksale === true;
+}
+
 function getSellerItems(orderData, sellerId) {
   const items = orderData?.items;
   if (!Array.isArray(items)) return [];
@@ -687,6 +744,17 @@ function getSellerItemSummary(orderData, sellerId) {
 function getSellerRevenue(orderData, sellerId) {
   const items = getSellerItems(orderData, sellerId);
   return items.reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.quantity) || 0), 0);
+}
+
+// ⭐ QUICKSALE — compact single-line item summary (no seller filtering needed,
+// quicksale orders only ever have one seller)
+function quicksaleItemSummary(orderData) {
+  const items = Array.isArray(orderData?.items) ? orderData.items : [];
+  if (!items.length) return "Your purchase";
+  return items
+    .slice(0, 3)
+    .map((it) => `${it.name} x${it.quantity}`)
+    .join(", ") + (items.length > 3 ? ` +${items.length - 3} more` : "");
 }
 
 // ============================
@@ -1201,7 +1269,7 @@ const activateSellerSubscription = async (s, mpesaReference) => {
 };
 
 // ============================
-// ⭐ NEW — Notify all sellers of a new paid order
+// Notify all sellers of a new paid order
 // ============================
 async function notifySellersOfNewOrder(orderId, orderData) {
   const sellerIds = Array.isArray(orderData?.involvedSellerIds) ? orderData.involvedSellerIds : [];
@@ -1256,7 +1324,12 @@ async function notifySellersOfNewOrder(orderId, orderData) {
     }
   }
 
-  // ⭐ NEW — seed the nudge timer (starts 6h from now)
+  // ⭐ QUICKSALE GUARD — quicksales are settled instantly, no nudge timer
+  if (isQuicksaleOrder(orderData)) {
+    console.log(`⚡ Skipping nudge timer seed for quicksale order ${orderId}`);
+    return;
+  }
+
   try {
     const now = Date.now();
     await db.collection("orders").doc(orderId).set({
@@ -1272,11 +1345,11 @@ async function notifySellersOfNewOrder(orderId, orderData) {
 }
 
 // ============================
-// ⭐ NEW — 6h seller nudge scheduler
+// 6h seller nudge scheduler
 // ============================
 const NUDGE_MAX = 4;
-const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6 hours
-const NUDGE_SCAN_MS = 15 * 60 * 1000;           // scan every 15 minutes
+const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const NUDGE_SCAN_MS = 15 * 60 * 1000;
 const NUDGE_TERMINAL_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
 
 async function runSellerNudgeScan() {
@@ -1297,7 +1370,15 @@ async function runSellerNudgeScan() {
       const orderId = docSnap.id;
       const order = docSnap.data() || {};
 
-      // Skip if seller already acted
+      // ⭐ QUICKSALE — never nudge quicksales even if a stray timer exists
+      if (isQuicksaleOrder(order)) {
+        await docSnap.ref.update({
+          sellerNudgeActive: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+        continue;
+      }
+
       const currentStatus = order.status || "";
       if (NUDGE_TERMINAL_STATUSES.includes(currentStatus)) {
         await docSnap.ref.update({
@@ -1309,8 +1390,8 @@ async function runSellerNudgeScan() {
 
       const nudgeCount = Number(order.sellerNudgeCount || 0);
       const sellerIds = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
+      const hiddenFrom = Array.isArray(order.deletedForSellers) ? order.deletedForSellers : [];
 
-      // Cap reached → stop + flag for admin
       if (nudgeCount >= NUDGE_MAX) {
         await docSnap.ref.update({
           sellerNudgeActive: false,
@@ -1329,11 +1410,14 @@ async function runSellerNudgeScan() {
         continue;
       }
 
-      // Fire reminders to each seller
       const buyerName = order.shippingDetails?.fullName || order.buyerName || "a customer";
       const hoursSince = 6 * (nudgeCount + 1);
+      let anySent = false;
 
       for (const sellerId of sellerIds) {
+        // ⭐ Skip sellers who hid this order from their dashboard
+        if (hiddenFrom.includes(sellerId)) continue;
+
         try {
           const sellerSnap = await db.collection("users").doc(sellerId).get();
           if (!sellerSnap.exists) continue;
@@ -1355,6 +1439,7 @@ async function runSellerNudgeScan() {
             }),
             { kind: `seller-nudge-${nudgeCount + 1}`, orderId, sellerId }
           );
+          anySent = true;
         } catch (err) {
           console.error(`❌ Nudge send failed → ${sellerId}:`, err.message);
         }
@@ -1367,7 +1452,7 @@ async function runSellerNudgeScan() {
         nextSellerNudgeAt: nextAt,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
-      console.log(`⏰ Nudge ${nextCount}/${NUDGE_MAX} sent for ${orderId} → next at ${nextAt.toISOString()}`);
+      console.log(`⏰ Nudge ${nextCount}/${NUDGE_MAX} ${anySent ? "sent" : "skipped (all sellers hidden)"} for ${orderId}`);
     }
   } catch (err) {
     console.error("❌ runSellerNudgeScan error:", err.message);
@@ -1379,7 +1464,6 @@ async function runSellerNudgeScan() {
     runSellerNudgeScan().catch((e) => console.error("Nudge scan crash:", e.message));
     setTimeout(run, NUDGE_SCAN_MS).unref?.();
   };
-  // First scan 60s after boot so we don't interfere with cold start
   setTimeout(run, 60 * 1000).unref?.();
   console.log(`🌀 Seller nudge scheduler active (scan every ${NUDGE_SCAN_MS / 60000} min)`);
 })();
@@ -1534,7 +1618,7 @@ app.post("/api/real-estate/seed", async (req, res) => {
 });
 
 // ============================
-// ⭐ NEW — Seller updates order status → buyer gets WhatsApp
+// Seller updates order status → buyer gets WhatsApp
 // ============================
 const ALLOWED_SELLER_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
 
@@ -1548,7 +1632,6 @@ app.post("/api/seller/update-status", async (req, res) => {
       return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${ALLOWED_SELLER_STATUSES.join(", ")}` });
     }
 
-    // --- auth ---
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
@@ -1562,7 +1645,6 @@ app.post("/api/seller/update-status", async (req, res) => {
 
     const sellerId = decoded.uid;
 
-    // --- load order ---
     const orderRef = db.collection("orders").doc(orderId);
     const orderSnap = await orderRef.get();
     if (!orderSnap.exists) {
@@ -1570,23 +1652,18 @@ app.post("/api/seller/update-status", async (req, res) => {
     }
     const order = orderSnap.data() || {};
 
-    // --- ownership check ---
     const involved = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
-    const isAdminCaller = false; // (kept simple — extend if admins need this endpoint)
-    if (!involved.includes(sellerId) && !isAdminCaller) {
+    if (!involved.includes(sellerId)) {
       return res.status(403).json({ success: false, message: "You are not a seller on this order" });
     }
 
-    // --- enforce payment ---
     if (order.paymentStatus !== "paid") {
       return res.status(400).json({ success: false, message: "Order is not paid — cannot update status" });
     }
 
-    // --- apply update ---
     await orderRef.update({
       status: newStatus,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      // Any seller action stops the nudge loop
       sellerNudgeActive: false,
       lastStatusUpdateBy: sellerId,
       lastStatusUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1594,7 +1671,6 @@ app.post("/api/seller/update-status", async (req, res) => {
 
     console.log(`✅ Order ${orderId} status → ${newStatus} by seller ${sellerId}`);
 
-    // --- notify buyer ---
     const buyerPhone =
       order.phoneNumber ||
       order.shippingDetails?.phoneNumber ||
@@ -1619,7 +1695,6 @@ app.post("/api/seller/update-status", async (req, res) => {
       console.log(`⚠️ Order ${orderId} has no buyer phone — buyer WhatsApp skipped`);
     }
 
-    // --- if seller cancelled, also notify the other sellers + refund hint goes to admin ---
     if (newStatus === "Cancelled") {
       try {
         await db.collection("adminAlerts").add({
@@ -2268,42 +2343,48 @@ app.post("/api/intasend-callback", async (req, res) => {
 
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
+      // ⭐ QUICKSALE detection
+      const quicksale = isQuicksaleOrder(orderData) || isQuicksaleRef(api_ref);
 
       const customerName =
         orderData.shippingDetails?.fullName ||
         orderData.buyerName ||
         (userEmail ? userEmail.split("@")[0] : "Customer");
 
-      if (!userEmail) {
-        console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
-      } else if (realEstate) {
-        if (mpesa_reference) {
-          await orderRef.update({
-            displayId: mpesa_reference,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
+      // ⭐ Skip the standard buyer email + store templates for quicksales
+      // (quicksale buyers get a dedicated WhatsApp; no email needed)
+      if (!quicksale) {
+        if (!userEmail) {
+          console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
+        } else if (realEstate) {
+          if (mpesa_reference) {
+            await orderRef.update({
+              displayId: mpesa_reference,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+          const payload = {
+            ...orderData,
+            totalAmount: orderData.totalAmount || callbackAmount || 0,
+            mpesaReference: mpesa_reference || orderData.mpesaReference || "—",
+          };
+          sendRealEstatePaymentEmail(payload, userEmail, api_ref)
+            .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
+            .catch((e) => console.error("RE email error:", e));
+        } else if (moving) {
+          sendMovingConfirmationEmail({
+            ...orderData,
+            status: "PAID",
+            mpesaReference: mpesa_reference,
+            totalAmount: orderData.totalAmount || callbackAmount || 0,
+          }, userEmail, api_ref)
+            .then((ok) => console.log(ok ? `🚚 Moving receipt sent for ${api_ref}` : `❌ Moving receipt failed for ${api_ref}`))
+            .catch((e) => console.error("Moving email error:", e));
+        } else {
+          sendOrderConfirmationEmail(orderData, userEmail, api_ref)
+            .then((ok) => console.log(ok ? `✅ Confirmation sent for ${api_ref}` : `❌ Confirmation failed for ${api_ref}`))
+            .catch((e) => console.error("Email error:", e));
         }
-        const payload = {
-          ...orderData,
-          totalAmount: orderData.totalAmount || callbackAmount || 0,
-          mpesaReference: mpesa_reference || orderData.mpesaReference || "—",
-        };
-        sendRealEstatePaymentEmail(payload, userEmail, api_ref)
-          .then((ok) => console.log(ok ? `🏠 RE receipt sent for ${api_ref}` : `❌ RE receipt failed for ${api_ref}`))
-          .catch((e) => console.error("RE email error:", e));
-      } else if (moving) {
-        sendMovingConfirmationEmail({
-          ...orderData,
-          status: "PAID",
-          mpesaReference: mpesa_reference,
-          totalAmount: orderData.totalAmount || callbackAmount || 0,
-        }, userEmail, api_ref)
-          .then((ok) => console.log(ok ? `🚚 Moving receipt sent for ${api_ref}` : `❌ Moving receipt failed for ${api_ref}`))
-          .catch((e) => console.error("Moving email error:", e));
-      } else {
-        sendOrderConfirmationEmail(orderData, userEmail, api_ref)
-          .then((ok) => console.log(ok ? `✅ Confirmation sent for ${api_ref}` : `❌ Confirmation failed for ${api_ref}`))
-          .catch((e) => console.error("Email error:", e));
       }
 
       const shortRef = String(mpesa_reference || api_ref).slice(0, 16);
@@ -2329,8 +2410,67 @@ app.post("/api/intasend-callback", async (req, res) => {
             { kind: "moving-paid", api_ref }
           );
         }
+      } else if (quicksale) {
+        // ⭐ QUICKSALE — buyer gets ONE dedicated WhatsApp (no store pair)
+        if (payerPhone) {
+          enqueueWhatsApp(
+            payerPhone,
+            quicksaleBuyerWhatsApp({
+              customerName,
+              itemSummary: quicksaleItemSummary(orderData),
+              amount: amountNum,
+              paymentReference: mpesa_reference || api_ref,
+              sellerShop: null, // filled by seller notification below for reference; buyer sees generic
+            }),
+            { kind: "quicksale-buyer", api_ref }
+          );
+        } else {
+          console.log(`⚠️ Quicksale ${api_ref} has no buyer phone — buyer WhatsApp skipped`);
+        }
+
+        // ⭐ QUICKSALE — notify seller(s) with a dedicated "recorded" template
+        const sellerIds = Array.isArray(orderData.involvedSellerIds) ? orderData.involvedSellerIds : [];
+        for (const sellerId of sellerIds) {
+          try {
+            const sellerSnap = await db.collection("users").doc(sellerId).get();
+            if (!sellerSnap.exists) continue;
+            const seller = sellerSnap.data() || {};
+            const sellerPhone = seller.phoneNumber || seller.phone || null;
+            if (!sellerPhone) {
+              console.log(`⚠️ Quicksale seller ${sellerId} has no phone — skipping WhatsApp`);
+              continue;
+            }
+            const sellerName = seller.fullName || seller.shopName || seller.email?.split("@")[0] || "Seller";
+
+            // Build item summary scoped to this seller (quicksale = 1 seller, but be safe)
+            const sellerItems = getSellerItems(orderData, sellerId);
+            const itemSummary = sellerItems.length
+              ? sellerItems.slice(0, 3).map((it) => `${it.name} x${it.quantity}`).join(", ") +
+                (sellerItems.length > 3 ? ` +${sellerItems.length - 3} more` : "")
+              : quicksaleItemSummary(orderData);
+
+            enqueueWhatsApp(
+              sellerPhone,
+              quicksaleSellerWhatsApp({
+                sellerName,
+                itemSummary,
+                amount: amountNum,
+                paymentReference: mpesa_reference || api_ref,
+                customerName,
+                customerPhone: payerPhone || "—",
+              }),
+              { kind: "quicksale-seller", api_ref, sellerId }
+            );
+            console.log(`📤 Quicksale seller WA queued → ${sellerId} for ${api_ref}`);
+          } catch (err) {
+            console.error(`❌ Quicksale seller notify failed → ${sellerId}:`, err.message);
+          }
+        }
+
+        // ⭐ Do NOT seed a nudge timer for quicksales
+        console.log(`⚡ Quicksale ${api_ref} — no nudge timer seeded`);
       } else {
-        // ------- STORE ORDER: 2 templated WhatsApps to buyer -------
+        // Regular store order: buyer gets the two standard templates
         if (payerPhone) {
           enqueueWhatsApp(
             payerPhone,
@@ -2356,7 +2496,6 @@ app.post("/api/intasend-callback", async (req, res) => {
           console.log(`⚠️ Store order ${api_ref} has no phone — buyer WhatsApp templates skipped`);
         }
 
-        // ⭐ NEW — notify every seller + seed nudge timer
         await notifySellersOfNewOrder(api_ref, orderData);
       }
     }
@@ -2794,7 +2933,6 @@ app.post("/api/test-store-whatsapp", async (req, res) => {
   }
 });
 
-// ⭐ NEW — test all three seller/buyer templates
 app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
   try {
     const {
@@ -2833,6 +2971,51 @@ app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
     return res.json({ success: true, results });
   } catch (e) {
     return sendServerError(res, e, "Test seller flow WhatsApp failed");
+  }
+});
+
+// ⭐ QUICKSALE — preview both templates
+app.post("/api/test-quicksale-whatsapp", async (req, res) => {
+  try {
+    const {
+      sellerPhone,
+      buyerPhone,
+      sellerName = "Test Seller",
+      customerName = "Walk-in Customer",
+      itemSummary = "Nike Air x1",
+      amount = 3500,
+      paymentReference = "TEST_QS_123",
+      sellerShop = "Test Shop",
+    } = req.body || {};
+
+    const results = {};
+
+    if (buyerPhone) {
+      results.buyerQueued = enqueueWhatsApp(
+        buyerPhone,
+        quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }),
+        { kind: "test-quicksale-buyer" }
+      );
+    }
+
+    if (sellerPhone) {
+      results.sellerQueued = enqueueWhatsApp(
+        sellerPhone,
+        quicksaleSellerWhatsApp({
+          sellerName,
+          itemSummary,
+          amount,
+          paymentReference,
+          customerName,
+          customerPhone: buyerPhone || "—",
+        }),
+        { kind: "test-quicksale-seller" }
+      );
+    }
+
+    return res.json({ success: true, results });
+  } catch (e) {
+    return sendServerError(res, e, "Test quicksale WhatsApp failed");
   }
 });
 
@@ -2875,6 +3058,7 @@ app.get("/_health", (req, res) => {
       "/api/ad-transaction/:paymentRef",
       "/api/test-store-whatsapp",
       "/api/test-seller-flow-whatsapp",
+      "/api/test-quicksale-whatsapp",
       "/_health",
     ],
     uptime: process.uptime(),
@@ -2944,6 +3128,7 @@ const server = app.listen(PORT, () => {
   console.log(`👋 Real Estates welcome: ✅ (/api/re/welcome)`);
   console.log(`📦 Seller order notifications: ✅ (/api/seller/update-status + callback hook)`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
+  console.log(`⚡ Quicksale WhatsApp: ✅ (buyer + seller templates, no nudge)`);
 });
 
 const shutdown = () => {
