@@ -139,6 +139,8 @@ const MOVING_URL = `${REAL_ESTATE_APP_URL}/`;
 const DRIVER_DASHBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 
+const SELLER_DASHBOARD_URL = `${MARKETPLACE_URL}/seller/dashboard/orders`;
+
 // ============================
 // Brevo senders
 // ============================
@@ -308,7 +310,6 @@ function enqueueWhatsApp(phoneNumber, message, meta = {}) {
   return true;
 }
 
-// Image jobs go through the same queue so retries/cold-WAHA grace apply.
 function enqueueWhatsAppImage(phoneNumber, imageUrl, caption = "", meta = {}) {
   const normalized = normalizePhoneForWa(phoneNumber);
   if (!normalized) {
@@ -359,7 +360,6 @@ async function attemptWaSend(job) {
     console.log("⚠️ WAHA not configured, dropping queued message");
     return true;
   }
-  // Image uploads need longer than plain text
   const timeoutMs = job.kind === "image"
     ? Math.max(timeoutForAttempt(job.attempts), 20000)
     : timeoutForAttempt(job.attempts);
@@ -413,8 +413,6 @@ async function attemptWaSend(job) {
 
 const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
 
-// Direct (non-queued) helpers used by the paced bulk sender so we can
-// accurately report per-recipient results.
 async function wahaSendImage({ phone, imageUrl, caption, filename }) {
   const normalized = normalizePhoneForWa(phone);
   if (!normalized) throw new Error(`Invalid phone: ${phone}`);
@@ -549,6 +547,89 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
   ].join("\n");
 }
 
+// ⭐ NEW — Seller gets notified of a new paid order (per-seller slice)
+function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount }) {
+  const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
+  const id = orderId ? String(orderId) : "—";
+  const buyer = buyerName || "A customer";
+  const rev = Number(sellerRevenue || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const summary = itemSummary || `${itemCount || 0} item(s)`;
+  return [
+    `🛍️ *MarketMix Kenya — New Order*`,
+    ``,
+    `Hi ${name}! You have a new paid order. 🎉`,
+    ``,
+    `📦 *Order ID:* #${id}`,
+    `👤 *Buyer:* ${buyer}`,
+    `💰 *Your revenue:* KES ${rev}`,
+    `📋 *Your items:* ${summary}`,
+    ``,
+    `⏱️ Please process it promptly — we'll remind you every 6 hours until you do.`,
+    ``,
+    `👉 Open your dashboard:`,
+    `${SELLER_DASHBOARD_URL}`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].join("\n");
+}
+
+// ⭐ NEW — Buyer gets notified whenever the seller changes order status
+function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const id = orderId ? String(orderId) : "—";
+  const status = statusLabel || "Updated";
+
+  const statusMessages = {
+    Processing: "We're getting your items ready!",
+    Shipped: "Your order is on the way. 🚚",
+    Delivered: "Delivered! Hope you love it. ❤️",
+    Cancelled: "This order was cancelled. Any payment will be refunded.",
+  };
+  const message = statusMessages[status] || `Your order is now ${status}.`;
+
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Your MarketMix order has an update.`,
+    ``,
+    `📦 *Order ID:* #${id}`,
+    `🚚 *New status:* ${status}`,
+    ``,
+    `${message}`,
+    ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    `*MarketMix Kenya*`,
+    `Your marketplace. Your choice.`,
+  ].join("\n");
+}
+
+// ⭐ NEW — 6h reminder nudge for sellers who haven't acted
+function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nudgeNumber, maxNudges }) {
+  const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
+  const id = orderId ? String(orderId) : "—";
+  const buyer = buyerName || "a customer";
+  const hours = Number(hoursSince || 0).toFixed(0);
+  const num = Number(nudgeNumber || 1);
+  const max = Number(maxNudges || 4);
+  const isFinal = num >= max;
+  return [
+    `⏰ *MarketMix Kenya — Order Reminder*`,
+    ``,
+    `Hi ${name},`,
+    ``,
+    `Order #${id} from ${buyer} was paid about *${hours}h ago* and is still waiting to be processed.`,
+    ``,
+    `${isFinal
+      ? `⚠️ This is your *final reminder* (${num}/${max}). Our team has been notified.`
+      : `Please update its status on your dashboard. *(Reminder ${num}/${max})*`}`,
+    ``,
+    `👉 ${SELLER_DASHBOARD_URL}`,
+    ``,
+    `*MarketMix Kenya*`,
+  ].join("\n");
+}
+
 // ============================
 // Helpers
 // ============================
@@ -585,6 +666,27 @@ const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY
 
 function isRealEstateOrder(apiRef, orderData) {
   return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
+}
+
+// ⭐ NEW — helpers for seller slices
+function getSellerItems(orderData, sellerId) {
+  const items = orderData?.items;
+  if (!Array.isArray(items)) return [];
+  return items.filter((it) => it?.sellerId === sellerId);
+}
+
+function getSellerItemSummary(orderData, sellerId) {
+  const items = getSellerItems(orderData, sellerId);
+  if (!items.length) return "—";
+  return items
+    .slice(0, 3)
+    .map((it) => `${it.name} x${it.quantity}`)
+    .join(", ") + (items.length > 3 ? ` +${items.length - 3} more` : "");
+}
+
+function getSellerRevenue(orderData, sellerId) {
+  const items = getSellerItems(orderData, sellerId);
+  return items.reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.quantity) || 0), 0);
 }
 
 // ============================
@@ -649,8 +751,7 @@ const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
 // ============================
-// Order confirmation email
-// (WhatsApp is now sent via a dedicated template — no companion mirror)
+// Order confirmation email (buyer)
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -696,8 +797,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       footerNote: "Need help? Reply to this email and we'll get back to you.",
     });
 
-    // Note: no phone argument → no companion WhatsApp mirror.
-    // The dedicated order-confirmation WhatsApp is sent from the callback.
     const ok = await sendEmail(
       userEmail,
       `Order Confirmation #${String(orderId).slice(0, 8)} - MarketMix Kenya`,
@@ -1102,6 +1201,190 @@ const activateSellerSubscription = async (s, mpesaReference) => {
 };
 
 // ============================
+// ⭐ NEW — Notify all sellers of a new paid order
+// ============================
+async function notifySellersOfNewOrder(orderId, orderData) {
+  const sellerIds = Array.isArray(orderData?.involvedSellerIds) ? orderData.involvedSellerIds : [];
+  if (!sellerIds.length) {
+    console.log(`⚠️ Order ${orderId} has no involvedSellerIds — skipping seller notifications`);
+    return;
+  }
+
+  const buyerName =
+    orderData?.shippingDetails?.fullName ||
+    orderData?.buyerName ||
+    "A customer";
+
+  for (const sellerId of sellerIds) {
+    try {
+      const sellerSnap = await db.collection("users").doc(sellerId).get();
+      if (!sellerSnap.exists) {
+        console.log(`⚠️ Seller ${sellerId} doc not found — skipping`);
+        continue;
+      }
+      const seller = sellerSnap.data() || {};
+      const sellerPhone =
+        seller.phoneNumber ||
+        seller.phone ||
+        seller.sellerProfile?.phone ||
+        null;
+      if (!sellerPhone) {
+        console.log(`⚠️ Seller ${sellerId} has no phone — skipping WhatsApp`);
+        continue;
+      }
+
+      const sellerName = seller.fullName || seller.shopName || seller.email?.split("@")[0] || "Seller";
+      const sellerRevenue = getSellerRevenue(orderData, sellerId);
+      const itemSummary = getSellerItemSummary(orderData, sellerId);
+
+      enqueueWhatsApp(
+        sellerPhone,
+        sellerNewOrderWhatsApp({
+          sellerName,
+          orderId,
+          buyerName,
+          sellerRevenue,
+          itemSummary,
+          itemCount: getSellerItems(orderData, sellerId).length,
+        }),
+        { kind: "seller-new-order", orderId, sellerId }
+      );
+
+      console.log(`📤 Seller new-order WA queued → ${sellerId} for order ${orderId}`);
+    } catch (err) {
+      console.error(`❌ notifySellersOfNewOrder failed for seller ${sellerId}:`, err.message);
+    }
+  }
+
+  // ⭐ NEW — seed the nudge timer (starts 6h from now)
+  try {
+    const now = Date.now();
+    await db.collection("orders").doc(orderId).set({
+      sellerNudgeCount: 0,
+      sellerNudgeMax: 4,
+      nextSellerNudgeAt: new Date(now + 6 * 60 * 60 * 1000),
+      sellerNudgeActive: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (err) {
+    console.error(`❌ Failed to seed nudge timer for ${orderId}:`, err.message);
+  }
+}
+
+// ============================
+// ⭐ NEW — 6h seller nudge scheduler
+// ============================
+const NUDGE_MAX = 4;
+const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6 hours
+const NUDGE_SCAN_MS = 15 * 60 * 1000;           // scan every 15 minutes
+const NUDGE_TERMINAL_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
+
+async function runSellerNudgeScan() {
+  try {
+    const now = new Date();
+    const snap = await db.collection("orders")
+      .where("sellerNudgeActive", "==", true)
+      .where("paymentStatus", "==", "paid")
+      .where("nextSellerNudgeAt", "<=", now)
+      .limit(50)
+      .get();
+
+    if (snap.empty) return;
+
+    console.log(`⏰ Nudge scan: ${snap.size} order(s) due`);
+
+    for (const docSnap of snap.docs) {
+      const orderId = docSnap.id;
+      const order = docSnap.data() || {};
+
+      // Skip if seller already acted
+      const currentStatus = order.status || "";
+      if (NUDGE_TERMINAL_STATUSES.includes(currentStatus)) {
+        await docSnap.ref.update({
+          sellerNudgeActive: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+        continue;
+      }
+
+      const nudgeCount = Number(order.sellerNudgeCount || 0);
+      const sellerIds = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
+
+      // Cap reached → stop + flag for admin
+      if (nudgeCount >= NUDGE_MAX) {
+        await docSnap.ref.update({
+          sellerNudgeActive: false,
+          sellerNudgeExhausted: true,
+          sellerNudgeExhaustedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+        await db.collection("adminAlerts").add({
+          type: "seller_nudge_exhausted",
+          orderId,
+          sellerIds,
+          nudgeCount,
+          flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+        console.log(`⚠️ Nudges exhausted for ${orderId} — flagged admin`);
+        continue;
+      }
+
+      // Fire reminders to each seller
+      const buyerName = order.shippingDetails?.fullName || order.buyerName || "a customer";
+      const hoursSince = 6 * (nudgeCount + 1);
+
+      for (const sellerId of sellerIds) {
+        try {
+          const sellerSnap = await db.collection("users").doc(sellerId).get();
+          if (!sellerSnap.exists) continue;
+          const seller = sellerSnap.data() || {};
+          const sellerPhone = seller.phoneNumber || seller.phone || null;
+          if (!sellerPhone) continue;
+
+          const sellerName = seller.fullName || seller.shopName || seller.email?.split("@")[0] || "Seller";
+
+          enqueueWhatsApp(
+            sellerPhone,
+            sellerReminderWhatsApp({
+              sellerName,
+              orderId,
+              buyerName,
+              hoursSince,
+              nudgeNumber: nudgeCount + 1,
+              maxNudges: NUDGE_MAX,
+            }),
+            { kind: `seller-nudge-${nudgeCount + 1}`, orderId, sellerId }
+          );
+        } catch (err) {
+          console.error(`❌ Nudge send failed → ${sellerId}:`, err.message);
+        }
+      }
+
+      const nextCount = nudgeCount + 1;
+      const nextAt = new Date(Date.now() + NUDGE_INTERVAL_MS);
+      await docSnap.ref.update({
+        sellerNudgeCount: nextCount,
+        nextSellerNudgeAt: nextAt,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+      console.log(`⏰ Nudge ${nextCount}/${NUDGE_MAX} sent for ${orderId} → next at ${nextAt.toISOString()}`);
+    }
+  } catch (err) {
+    console.error("❌ runSellerNudgeScan error:", err.message);
+  }
+}
+
+(function startNudgeScheduler() {
+  const run = () => {
+    runSellerNudgeScan().catch((e) => console.error("Nudge scan crash:", e.message));
+    setTimeout(run, NUDGE_SCAN_MS).unref?.();
+  };
+  // First scan 60s after boot so we don't interfere with cold start
+  setTimeout(run, 60 * 1000).unref?.();
+  console.log(`🌀 Seller nudge scheduler active (scan every ${NUDGE_SCAN_MS / 60000} min)`);
+})();
+
+// ============================
 // ROUTES
 // ============================
 
@@ -1251,21 +1534,119 @@ app.post("/api/real-estate/seed", async (req, res) => {
 });
 
 // ============================
+// ⭐ NEW — Seller updates order status → buyer gets WhatsApp
+// ============================
+const ALLOWED_SELLER_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
+
+app.post("/api/seller/update-status", async (req, res) => {
+  try {
+    const { orderId, newStatus } = req.body || {};
+    if (!orderId || !newStatus) {
+      return res.status(400).json({ success: false, message: "orderId and newStatus required" });
+    }
+    if (!ALLOWED_SELLER_STATUSES.includes(newStatus)) {
+      return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${ALLOWED_SELLER_STATUSES.join(", ")}` });
+    }
+
+    // --- auth ---
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try {
+      decoded = await verifyAnyToken(idToken);
+    } catch {
+      return res.status(401).json({ success: false, message: "Invalid auth token" });
+    }
+
+    const sellerId = decoded.uid;
+
+    // --- load order ---
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const order = orderSnap.data() || {};
+
+    // --- ownership check ---
+    const involved = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
+    const isAdminCaller = false; // (kept simple — extend if admins need this endpoint)
+    if (!involved.includes(sellerId) && !isAdminCaller) {
+      return res.status(403).json({ success: false, message: "You are not a seller on this order" });
+    }
+
+    // --- enforce payment ---
+    if (order.paymentStatus !== "paid") {
+      return res.status(400).json({ success: false, message: "Order is not paid — cannot update status" });
+    }
+
+    // --- apply update ---
+    await orderRef.update({
+      status: newStatus,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      // Any seller action stops the nudge loop
+      sellerNudgeActive: false,
+      lastStatusUpdateBy: sellerId,
+      lastStatusUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`✅ Order ${orderId} status → ${newStatus} by seller ${sellerId}`);
+
+    // --- notify buyer ---
+    const buyerPhone =
+      order.phoneNumber ||
+      order.shippingDetails?.phoneNumber ||
+      order.buyerPhone ||
+      null;
+
+    if (buyerPhone) {
+      const customerName =
+        order.shippingDetails?.fullName ||
+        order.buyerName ||
+        "Customer";
+      enqueueWhatsApp(
+        buyerPhone,
+        buyerStatusUpdateWhatsApp({
+          customerName,
+          orderId,
+          statusLabel: newStatus,
+        }),
+        { kind: "buyer-status-update", orderId, sellerId, status: newStatus }
+      );
+    } else {
+      console.log(`⚠️ Order ${orderId} has no buyer phone — buyer WhatsApp skipped`);
+    }
+
+    // --- if seller cancelled, also notify the other sellers + refund hint goes to admin ---
+    if (newStatus === "Cancelled") {
+      try {
+        await db.collection("adminAlerts").add({
+          type: "seller_cancelled_order",
+          orderId,
+          cancelledBy: sellerId,
+          involvedSellerIds: involved,
+          flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+    }
+
+    return res.json({ success: true, orderId, newStatus, buyerNotified: !!buyerPhone });
+  } catch (e) {
+    console.error("❌ /api/seller/update-status failed:", e);
+    return sendServerError(res, e, "Status update failed");
+  }
+});
+
+// ============================
 // Real Estates — welcome (signup + role switch)
 // ============================
 app.post("/api/re/welcome", async (req, res) => {
   try {
     const {
-      email,
-      name,
-      phone,
-      roleLabel,
-      roleDesc,
-      rolePerks,
-      isSwitch = false,
-      previousRoleLabel = null,
-      ctaLabel,
-      ctaUrl,
+      email, name, phone, roleLabel, roleDesc, rolePerks,
+      isSwitch = false, previousRoleLabel = null, ctaLabel, ctaUrl,
     } = req.body || {};
 
     if (!email || !email.includes("@")) {
@@ -1313,13 +1694,7 @@ app.post("/api/re/welcome", async (req, res) => {
       });
     }
 
-    return res.json({
-      success: true,
-      emailSent,
-      whatsappQueued,
-      isSwitch: !!isSwitch,
-      roleLabel,
-    });
+    return res.json({ success: true, emailSent, whatsappQueued, isSwitch: !!isSwitch, roleLabel });
   } catch (e) {
     console.error("❌ /api/re/welcome failed:", e);
     return sendServerError(res, e, "Welcome failed");
@@ -1332,13 +1707,8 @@ app.post("/api/re/welcome", async (req, res) => {
 app.post("/api/whatsapp/send-media", async (req, res) => {
   try {
     const {
-      recipients = [],
-      message = "",
-      mediaUrl = null,
-      mediaType = "image",
-      filename = null,
-      pace = "safe",
-      dryRun = false,
+      recipients = [], message = "", mediaUrl = null,
+      mediaType = "image", filename = null, pace = "safe", dryRun = false,
     } = req.body || {};
 
     if (!Array.isArray(recipients) || recipients.length === 0) {
@@ -1369,11 +1739,7 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
       const text = personalizeBulkMessage(message, { name });
 
       if (dryRun) {
-        results.push({
-          phone, name,
-          status: "validated",
-          message: text.slice(0, 120) + (text.length > 120 ? "…" : ""),
-        });
+        results.push({ phone, name, status: "validated", message: text.slice(0, 120) + (text.length > 120 ? "…" : "") });
         continue;
       }
 
@@ -1383,8 +1749,7 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
           await sender({
             phone,
             ...(mediaType === "file" ? { fileUrl: mediaUrl } : { imageUrl: mediaUrl }),
-            caption: text,
-            filename,
+            caption: text, filename,
           });
         } else {
           enqueueWhatsApp(phone, text, { kind: "bulk-text" });
@@ -1392,11 +1757,7 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
         results.push({ phone, name, status: "sent" });
         console.log(`📤 Bulk ${i + 1}/${recipients.length} → ${phone}`);
       } catch (e) {
-        results.push({
-          phone, name,
-          status: "failed",
-          error: e.message || "send failed",
-        });
+        results.push({ phone, name, status: "failed", error: e.message || "send failed" });
         console.error(`❌ Bulk fail → ${phone}:`, e.message);
       }
 
@@ -1409,10 +1770,7 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
     const failed = results.filter((x) => x.status === "failed").length;
 
     await reDb.collection("bulkWhatsAppLogs").add({
-      total: recipients.length,
-      sent,
-      failed,
-      pace,
+      total: recipients.length, sent, failed, pace,
       mediaType: mediaUrl ? mediaType : "text",
       mediaUrl: mediaUrl || null,
       messagePreview: String(message).slice(0, 300),
@@ -1422,13 +1780,8 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
     }).catch(() => {});
 
     return res.json({
-      success: true,
-      total: recipients.length,
-      sent,
-      failed,
-      dryRun: !!dryRun,
-      durationMs: Date.now() - startedAt,
-      results,
+      success: true, total: recipients.length, sent, failed,
+      dryRun: !!dryRun, durationMs: Date.now() - startedAt, results,
     });
   } catch (e) {
     console.error("❌ /api/whatsapp/send-media failed:", e);
@@ -1441,15 +1794,7 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
 // ============================
 app.post("/api/admin/notify-user", async (req, res) => {
   try {
-    const {
-      userId,
-      phone,
-      email,
-      title = "MarketMix update",
-      message,
-      kind = "admin-notify",
-    } = req.body || {};
-
+    const { userId, phone, email, title = "MarketMix update", message, kind = "admin-notify" } = req.body || {};
     if (!userId || !message) {
       return res.status(400).json({ success: false, message: "userId and message required" });
     }
@@ -1459,24 +1804,17 @@ app.post("/api/admin/notify-user", async (req, res) => {
     if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
 
     let decoded;
-    try {
-      decoded = await verifyAnyToken(idToken);
-    } catch {
-      return res.status(401).json({ success: false, message: "Invalid auth token" });
-    }
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
 
     const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
-    if (!callerDoc.exists) {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
+    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
     const caller = callerDoc.data() || {};
     const isAdmin =
       caller.role === "admin" ||
       caller.userType === "admin" ||
       (Array.isArray(caller.roles) && caller.roles.includes("admin"));
-    if (!isAdmin) {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
 
     let target = null;
     let targetDb = "realestate";
@@ -1486,23 +1824,12 @@ app.post("/api/admin/notify-user", async (req, res) => {
       target = reTarget.data();
     } else {
       const shopTarget = await db.collection("users").doc(userId).get();
-      if (shopTarget.exists) {
-        target = shopTarget.data();
-        targetDb = "shop";
-      }
+      if (shopTarget.exists) { target = shopTarget.data(); targetDb = "shop"; }
     }
 
-    if (!target) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
+    if (!target) return res.status(404).json({ success: false, message: "User not found" });
 
-    const resolvedPhone =
-      phone ||
-      target.phoneNumber ||
-      target.phone ||
-      target.driverProfile?.phone ||
-      null;
-
+    const resolvedPhone = phone || target.phoneNumber || target.phone || target.driverProfile?.phone || null;
     const resolvedEmail = email || target.email || null;
 
     let whatsappQueued = false;
@@ -1518,9 +1845,7 @@ app.post("/api/admin/notify-user", async (req, res) => {
 
     if (resolvedEmail) {
       const html = marketMixEmailShell({
-        preheader: title,
-        eyebrow: "MarketMix Kenya",
-        title,
+        preheader: title, eyebrow: "MarketMix Kenya", title,
         subtitle: "Update from MarketMix",
         bodyHtml: emailBodyText(message),
         footerNote: "If this wasn't expected, reply to this email and we'll help.",
@@ -1530,26 +1855,14 @@ app.post("/api/admin/notify-user", async (req, res) => {
 
     try {
       await reDb.collection("adminNotifications").add({
-        userId,
-        phone: resolvedPhone || null,
-        email: resolvedEmail || null,
-        title,
-        message,
-        kind,
-        whatsappQueued,
-        emailSent,
+        userId, phone: resolvedPhone || null, email: resolvedEmail || null,
+        title, message, kind, whatsappQueued, emailSent,
         sentBy: decoded.uid,
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (_) {}
 
-    return res.json({
-      success: true,
-      whatsappQueued,
-      emailSent,
-      hasPhone: !!resolvedPhone,
-      hasEmail: !!resolvedEmail,
-    });
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!resolvedPhone, hasEmail: !!resolvedEmail });
   } catch (e) {
     console.error("❌ Admin notify-user failed:", e);
     return sendServerError(res, e, "Admin notify failed");
@@ -1571,24 +1884,17 @@ app.post("/api/driver/decision", async (req, res) => {
     if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
 
     let decoded;
-    try {
-      decoded = await verifyAnyToken(idToken);
-    } catch (e) {
-      return res.status(401).json({ success: false, message: "Invalid auth token" });
-    }
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
 
     const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
-    if (!callerDoc.exists) {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
+    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
     const caller = callerDoc.data() || {};
     const isAdmin =
       caller.role === "admin" ||
       caller.userType === "admin" ||
       (Array.isArray(caller.roles) && caller.roles.includes("admin"));
-    if (!isAdmin) {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
 
     const userRef = reDb.collection("users").doc(userId);
     const userSnap = await userRef.get();
@@ -1681,7 +1987,7 @@ app.post("/api/driver/decision", async (req, res) => {
 });
 
 // ============================
-// WhatsApp notify — generic (used by admin pages)
+// WhatsApp notify — generic
 // ============================
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
@@ -1691,9 +1997,7 @@ app.post("/api/whatsapp/notify", async (req, res) => {
     }
     const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
     const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
-    if (!queued) {
-      return res.status(400).json({ success: false, message: "Invalid phone number" });
-    }
+    if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
     return res.json({ success: true, queued: true, phone: normalizePhoneForWa(phone) });
   } catch (e) {
     console.error("❌ /api/whatsapp/notify failed:", e);
@@ -1876,13 +2180,10 @@ app.post("/api/intasend-callback", async (req, res) => {
       const sellerId = api_ref.split("_")[1];
       const amount = (callbackAmount > 0 && callbackAmount <= 500000) ? callbackAmount : 1;
       await orderRef.set({
-        orderId: api_ref,
-        paymentStatus,
+        orderId: api_ref, paymentStatus,
         mpesaReference: mpesa_reference || null,
-        totalAmount: amount,
-        state,
-        isWalletDeposit: true,
-        sellerId,
+        totalAmount: amount, state,
+        isWalletDeposit: true, sellerId,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -1968,7 +2269,6 @@ app.post("/api/intasend-callback", async (req, res) => {
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
 
-      // Customer display name (used by store WhatsApp templates)
       const customerName =
         orderData.shippingDetails?.fullName ||
         orderData.buyerName ||
@@ -2030,9 +2330,8 @@ app.post("/api/intasend-callback", async (req, res) => {
           );
         }
       } else {
-        // ------- STORE ORDER: 2 templated WhatsApps -------
+        // ------- STORE ORDER: 2 templated WhatsApps to buyer -------
         if (payerPhone) {
-          // 1. Payment confirmation
           enqueueWhatsApp(
             payerPhone,
             storePaymentConfirmedWhatsApp({
@@ -2043,7 +2342,6 @@ app.post("/api/intasend-callback", async (req, res) => {
             { kind: "store-payment-confirmed", api_ref }
           );
 
-          // 2. Order confirmation
           enqueueWhatsApp(
             payerPhone,
             storeOrderConfirmedWhatsApp({
@@ -2055,8 +2353,11 @@ app.post("/api/intasend-callback", async (req, res) => {
             { kind: "store-order-confirmed", api_ref }
           );
         } else {
-          console.log(`⚠️ Store order ${api_ref} has no phone — WhatsApp templates skipped`);
+          console.log(`⚠️ Store order ${api_ref} has no phone — buyer WhatsApp templates skipped`);
         }
+
+        // ⭐ NEW — notify every seller + seed nudge timer
+        await notifySellersOfNewOrder(api_ref, orderData);
       }
     }
 
@@ -2471,9 +2772,6 @@ app.post("/api/test-moving-email", async (req, res) => {
   res.json({ success: ok, to: testEmail });
 });
 
-// ============================
-// Test — store WhatsApp templates
-// ============================
 app.post("/api/test-store-whatsapp", async (req, res) => {
   try {
     const { phone, customerName = "Test Customer", amount = 2500, paymentReference = "TEST_REF_123", orderId = "TEST_ORDER_456" } = req.body || {};
@@ -2496,6 +2794,48 @@ app.post("/api/test-store-whatsapp", async (req, res) => {
   }
 });
 
+// ⭐ NEW — test all three seller/buyer templates
+app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
+  try {
+    const {
+      sellerPhone,
+      buyerPhone,
+      sellerName = "Test Seller",
+      buyerName = "Test Buyer",
+      orderId = "TEST_ORDER_789",
+      sellerRevenue = 3500,
+      itemSummary = "Sneakers x1, Cap x2",
+    } = req.body || {};
+
+    const results = {};
+
+    if (sellerPhone) {
+      results.newOrderQueued = enqueueWhatsApp(
+        sellerPhone,
+        sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount: 2 }),
+        { kind: "test-seller-new-order" }
+      );
+      results.reminderQueued = enqueueWhatsApp(
+        sellerPhone,
+        sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince: 6, nudgeNumber: 1, maxNudges: 4 }),
+        { kind: "test-seller-reminder" }
+      );
+    }
+
+    if (buyerPhone) {
+      results.statusUpdateQueued = enqueueWhatsApp(
+        buyerPhone,
+        buyerStatusUpdateWhatsApp({ customerName: buyerName, orderId, statusLabel: "Shipped" }),
+        { kind: "test-buyer-status-update" }
+      );
+    }
+
+    return res.json({ success: true, results });
+  } catch (e) {
+    return sendServerError(res, e, "Test seller flow WhatsApp failed");
+  }
+});
+
 // ============================
 // Health
 // ============================
@@ -2512,9 +2852,11 @@ app.get("/_health", (req, res) => {
       moving: MOVING_URL,
       driverDashboard: DRIVER_DASHBOARD_URL,
       driverOnboard: DRIVER_ONBOARD_URL,
+      sellerDashboard: SELLER_DASHBOARD_URL,
     },
     senders: SENDERS,
     whatsappQueue: waQueue.length,
+    nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     endpoints: [
       "/api/whatsapp/notify",
       "/api/whatsapp/send-media",
@@ -2529,8 +2871,10 @@ app.get("/_health", (req, res) => {
       "/api/subscription-payment",
       "/api/seller/withdraw",
       "/api/seller/recover-pin",
+      "/api/seller/update-status",
       "/api/ad-transaction/:paymentRef",
       "/api/test-store-whatsapp",
+      "/api/test-seller-flow-whatsapp",
       "/_health",
     ],
     uptime: process.uptime(),
@@ -2594,10 +2938,12 @@ const server = app.listen(PORT, () => {
   console.log(`🛍️ Shop frontend: ${MARKETPLACE_URL}`);
   console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
   console.log(`🚚 Moving URL: ${MOVING_URL}`);
-  console.log(`🧑‍✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
+  console.log(`🧑✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
   console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
   console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/whatsapp/send-media, /api/service-request/notify, /api/moving/notify)`);
   console.log(`👋 Real Estates welcome: ✅ (/api/re/welcome)`);
+  console.log(`📦 Seller order notifications: ✅ (/api/seller/update-status + callback hook)`);
+  console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
 });
 
 const shutdown = () => {
