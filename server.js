@@ -494,6 +494,62 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 // ============================
+// WhatsApp templates — MarketMix store
+// ============================
+function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const ref = paymentReference || "—";
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Good news! Your payment has landed safely. 🎉`,
+    ``,
+    `💰 *Amount paid:* KES ${amt}`,
+    `🧾 *Payment reference:* ${ref}`,
+    ``,
+    `Thanks for choosing MarketMix Kenya! ❤️ Your order journey starts here.`,
+    ``,
+    `👇 *What would you like to do next?*`,
+    ``,
+    `📦 Track your order`,
+    `🛍️ Explore more products`,
+    ``,
+    `Happy shopping!`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].join("\n");
+}
+
+function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const id = orderId ? String(orderId) : "—";
+  const pay = paymentStatus || "Confirmed";
+  const status = orderStatus || "Processing";
+  return [
+    `Hey ${name}! 🛍️`,
+    ``,
+    `It's official — your MarketMix order is confirmed! 🎉`,
+    ``,
+    `📦 *Order ID:* #${id}`,
+    `💳 *Payment:* ${pay}`,
+    `🚚 *Order status:* ${status}`,
+    ``,
+    `We're getting things ready for you!`,
+    ``,
+    `📦 *Track your order* to stay updated.`,
+    `🛒 *Want more?* There's always something new to discover on MarketMix!`,
+    ``,
+    `💬 Need help? Just reply to this message.`,
+    ``,
+    `Thanks for shopping with us, ${name}. We appreciate you! ❤️`,
+    ``,
+    `*MarketMix Kenya*`,
+    `Your marketplace. Your choice.`,
+  ].join("\n");
+}
+
+// ============================
 // Helpers
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
@@ -594,6 +650,7 @@ const emailSectionLabel = (label) => `
 
 // ============================
 // Order confirmation email
+// (WhatsApp is now sent via a dedicated template — no companion mirror)
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -605,9 +662,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     const deliveryTotal = (orderData.sellerGroups || []).reduce((s, g) => s + (g.deliveryCost || 0), 0);
     const total = orderData.totalAmount || (itemsTotal + deliveryTotal);
 
-    // ✅ FIX: Added ["Delivery", ...] row so the buyer's deliveryPlace
-    // (which includes coordinates like "Kilimani (-1.2921000, 36.8219000)")
-    // appears in the order confirmation email.
     const bodyHtml = `
       ${emailBodyText(`Hello <strong>${orderData.shippingDetails?.fullName || userEmail.split("@")[0]}</strong>, your payment is confirmed.`)}
       ${emailSectionLabel("Order")}
@@ -642,12 +696,14 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       footerNote: "Need help? Reply to this email and we'll get back to you.",
     });
 
+    // Note: no phone argument → no companion WhatsApp mirror.
+    // The dedicated order-confirmation WhatsApp is sent from the callback.
     const ok = await sendEmail(
       userEmail,
       `Order Confirmation #${String(orderId).slice(0, 8)} - MarketMix Kenya`,
       html,
       "sales",
-      orderData.shippingDetails?.phoneNumber || orderData.phoneNumber || null
+      null
     );
 
     if (ok) {
@@ -1109,10 +1165,6 @@ app.post("/api/stk-push", async (req, res) => {
       return res.status(502).json({ success: false, message: "Payment provider error" });
     }
 
-    // ✅ FIX: Use dot-path keys so we MERGE into existing shippingDetails
-    // instead of replacing the whole map. This preserves deliveryPlace
-    // (which contains coordinates), deliveryType, and deliveryOption
-    // that CheckoutPage wrote when the order was created.
     await db.collection("orders").doc(orderId).set({
       invoiceId: response?.invoice?.invoice_id || null,
       status: "STK_PUSH_SENT",
@@ -1916,6 +1968,12 @@ app.post("/api/intasend-callback", async (req, res) => {
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
 
+      // Customer display name (used by store WhatsApp templates)
+      const customerName =
+        orderData.shippingDetails?.fullName ||
+        orderData.buyerName ||
+        (userEmail ? userEmail.split("@")[0] : "Customer");
+
       if (!userEmail) {
         console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
       } else if (realEstate) {
@@ -1972,11 +2030,32 @@ app.post("/api/intasend-callback", async (req, res) => {
           );
         }
       } else {
+        // ------- STORE ORDER: 2 templated WhatsApps -------
         if (payerPhone) {
-          enqueueWhatsApp(payerPhone,
-            `🛍️ MarketMix Kenya\nPayment confirmed\nOrder: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nThanks for shopping with us.`,
-            { kind: "store-paid", api_ref }
+          // 1. Payment confirmation
+          enqueueWhatsApp(
+            payerPhone,
+            storePaymentConfirmedWhatsApp({
+              customerName,
+              amount: amountNum,
+              paymentReference: mpesa_reference || api_ref,
+            }),
+            { kind: "store-payment-confirmed", api_ref }
           );
+
+          // 2. Order confirmation
+          enqueueWhatsApp(
+            payerPhone,
+            storeOrderConfirmedWhatsApp({
+              customerName,
+              orderId: api_ref,
+              paymentStatus: "Paid",
+              orderStatus: "Processing",
+            }),
+            { kind: "store-order-confirmed", api_ref }
+          );
+        } else {
+          console.log(`⚠️ Store order ${api_ref} has no phone — WhatsApp templates skipped`);
         }
       }
     }
@@ -2393,6 +2472,31 @@ app.post("/api/test-moving-email", async (req, res) => {
 });
 
 // ============================
+// Test — store WhatsApp templates
+// ============================
+app.post("/api/test-store-whatsapp", async (req, res) => {
+  try {
+    const { phone, customerName = "Test Customer", amount = 2500, paymentReference = "TEST_REF_123", orderId = "TEST_ORDER_456" } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+
+    const queued1 = enqueueWhatsApp(
+      phone,
+      storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }),
+      { kind: "test-store-payment" }
+    );
+    const queued2 = enqueueWhatsApp(
+      phone,
+      storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus: "Paid", orderStatus: "Processing" }),
+      { kind: "test-store-order" }
+    );
+
+    return res.json({ success: queued1 && queued2, queued1, queued2 });
+  } catch (e) {
+    return sendServerError(res, e, "Test store WhatsApp failed");
+  }
+});
+
+// ============================
 // Health
 // ============================
 app.get("/_health", (req, res) => {
@@ -2426,6 +2530,7 @@ app.get("/_health", (req, res) => {
       "/api/seller/withdraw",
       "/api/seller/recover-pin",
       "/api/ad-transaction/:paymentRef",
+      "/api/test-store-whatsapp",
       "/_health",
     ],
     uptime: process.uptime(),
