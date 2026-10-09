@@ -146,9 +146,7 @@ const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke
 const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
 
-// One-line footer appended to buyer/onboarding templates
 const PROMO_FOOTER = `🌐 *Shop online:* ${WEBSITE_URL}`;
-// Helper for cases where we want a blank line before the footer
 const PROMO_FOOTER_BLOCK = `\n${PROMO_FOOTER}`;
 
 const buildOrderReceiptUrl = (orderId) =>
@@ -508,7 +506,6 @@ function personalizeBulkMessage(template, { name } = {}) {
 // WhatsApp templates — MarketMix store
 // ============================
 
-// ⭐ PROMO: no dead CTAs — real "Explore more products" link + website footer
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -534,7 +531,6 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
   ].join("\n");
 }
 
-// ⭐ PROMO: real "Track your order" deep link (order-receipt/{orderId}) + website footer
 function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -566,7 +562,6 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
   ].join("\n");
 }
 
-// ⭐ PROMO: real "Track your order" deep link + website footer
 function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -603,7 +598,6 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   ].join("\n");
 }
 
-// ⭐ PROMO: real "Explore more products" link + website footer
 function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -634,7 +628,6 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
   ].join("\n");
 }
 
-// No promo — transactional seller message
 function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentReference, customerName, customerPhone }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -662,7 +655,6 @@ function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentRefer
   ].join("\n");
 }
 
-// No promo — seller already uses dashboard
 function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -688,7 +680,6 @@ function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue,
   ].join("\n");
 }
 
-// No promo — nudge/interrupt
 function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nudgeNumber, maxNudges }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -711,6 +702,28 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
     `👉 ${SELLER_DASHBOARD_URL}`,
     ``,
     `*MarketMix Kenya*`,
+  ].join("\n");
+}
+
+// ⭐ NEW — Welcome WhatsApp for new newsletter subscribers
+function welcomeSubscriberWhatsApp({ name }) {
+  const displayName = name && String(name).trim() ? String(name).trim() : "there";
+  return [
+    `Hey ${displayName}! 👋`,
+    ``,
+    `Welcome to *MarketMix Kenya* — you're officially on the list! 🎉`,
+    ``,
+    `You'll be the first to know when:`,
+    `🛍️ New arrivals drop`,
+    `🔥 Flash sales go live`,
+    `🎁 Exclusive deals come up`,
+    ``,
+    `🛍️ *Explore what's live now:*`,
+    WEBSITE_URL,
+    ``,
+    `Thanks for joining us! ❤️`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
@@ -2090,6 +2103,28 @@ app.post("/api/whatsapp/notify", async (req, res) => {
   }
 });
 
+// ⭐ NEW — Welcome WhatsApp for new newsletter subscribers
+app.post("/api/whatsapp/welcome", async (req, res) => {
+  try {
+    const { phone, name } = req.body || {};
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "phone required" });
+    }
+    const queued = enqueueWhatsApp(
+      phone,
+      welcomeSubscriberWhatsApp({ name }),
+      { kind: "welcome-subscriber", phone, hasName: !!name }
+    );
+    if (!queued) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+    return res.json({ success: true, queued: true });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/welcome failed:", e);
+    return sendServerError(res, e, "Welcome WhatsApp failed");
+  }
+});
+
 app.post("/api/service-request/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
@@ -2985,6 +3020,22 @@ app.post("/api/test-quicksale-whatsapp", async (req, res) => {
   }
 });
 
+// ⭐ NEW — test the welcome-subscriber template
+app.post("/api/test-welcome-whatsapp", async (req, res) => {
+  try {
+    const { phone, name = "Test Subscriber" } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    const queued = enqueueWhatsApp(
+      phone,
+      welcomeSubscriberWhatsApp({ name }),
+      { kind: "test-welcome-subscriber" }
+    );
+    return res.json({ success: queued, queued });
+  } catch (e) {
+    return sendServerError(res, e, "Test welcome WhatsApp failed");
+  }
+});
+
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
@@ -3008,6 +3059,7 @@ app.get("/_health", (req, res) => {
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     endpoints: [
       "/api/whatsapp/notify",
+      "/api/whatsapp/welcome",
       "/api/whatsapp/send-media",
       "/api/service-request/notify",
       "/api/moving/notify",
@@ -3025,6 +3077,7 @@ app.get("/_health", (req, res) => {
       "/api/test-store-whatsapp",
       "/api/test-seller-flow-whatsapp",
       "/api/test-quicksale-whatsapp",
+      "/api/test-welcome-whatsapp",
       "/_health",
     ],
     uptime: process.uptime(),
@@ -3092,6 +3145,7 @@ const server = app.listen(PORT, () => {
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
   console.log(`⚡ Quicksale WhatsApp: ✅`);
+  console.log(`🎉 Welcome subscriber WhatsApp: ✅ (/api/whatsapp/welcome)`);
   console.log(`🔗 Promo footer enabled on buyer/onboarding templates`);
 });
 
