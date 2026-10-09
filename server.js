@@ -141,6 +141,19 @@ const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 
 const SELLER_DASHBOARD_URL = `${MARKETPLACE_URL}/seller/dashboard/orders`;
 
+// ⭐ PROMO — customer-facing URLs used inside WhatsApp messages
+const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke";
+const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
+const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
+
+// One-line footer appended to buyer/onboarding templates
+const PROMO_FOOTER = `🌐 *Shop online:* ${WEBSITE_URL}`;
+// Helper for cases where we want a blank line before the footer
+const PROMO_FOOTER_BLOCK = `\n${PROMO_FOOTER}`;
+
+const buildOrderReceiptUrl = (orderId) =>
+  orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
+
 // ============================
 // Brevo senders
 // ============================
@@ -494,6 +507,8 @@ function personalizeBulkMessage(template, { name } = {}) {
 // ============================
 // WhatsApp templates — MarketMix store
 // ============================
+
+// ⭐ PROMO: no dead CTAs — real "Explore more products" link + website footer
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -508,22 +523,24 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
     ``,
     `Thanks for choosing MarketMix Kenya! ❤️ Your order journey starts here.`,
     ``,
-    `👇 *What would you like to do next?*`,
-    ``,
-    `📦 Track your order`,
-    `🛍️ Explore more products`,
+    `🛍️ *Explore more products:*`,
+    PRODUCTS_URL,
     ``,
     `Happy shopping!`,
+    ``,
+    PROMO_FOOTER,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
+// ⭐ PROMO: real "Track your order" deep link (order-receipt/{orderId}) + website footer
 function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
   const pay = paymentStatus || "Confirmed";
   const status = orderStatus || "Processing";
+  const receiptUrl = buildOrderReceiptUrl(orderId);
   return [
     `Hey ${name}! 🛍️`,
     ``,
@@ -535,18 +552,117 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
     ``,
     `We're getting things ready for you!`,
     ``,
-    `📦 *Track your order* to stay updated.`,
-    `🛒 *Want more?* There's always something new to discover on MarketMix!`,
+    `📦 *Track your order:*`,
+    receiptUrl,
     ``,
     `💬 Need help? Just reply to this message.`,
     ``,
     `Thanks for shopping with us, ${name}. We appreciate you! ❤️`,
+    ``,
+    PROMO_FOOTER,
     ``,
     `*MarketMix Kenya*`,
     `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
+// ⭐ PROMO: real "Track your order" deep link + website footer
+function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const id = orderId ? String(orderId) : "—";
+  const status = statusLabel || "Updated";
+  const receiptUrl = buildOrderReceiptUrl(orderId);
+
+  const statusMessages = {
+    Processing: "We're getting your items ready!",
+    Shipped: "Your order is on the way. 🚚",
+    Delivered: "Delivered! Hope you love it. ❤️",
+    Cancelled: "This order was cancelled. Any payment will be refunded.",
+  };
+  const message = statusMessages[status] || `Your order is now ${status}.`;
+
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Your MarketMix order has an update.`,
+    ``,
+    `📦 *Order ID:* #${id}`,
+    `🚚 *New status:* ${status}`,
+    ``,
+    `${message}`,
+    ``,
+    `📦 *Track your order:*`,
+    receiptUrl,
+    ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    PROMO_FOOTER,
+    ``,
+    `*MarketMix Kenya*`,
+    `Your marketplace. Your choice.`,
+  ].join("\n");
+}
+
+// ⭐ PROMO: real "Explore more products" link + website footer
+function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const ref = paymentReference || "—";
+  const shop = sellerShop || "the seller";
+  const summary = itemSummary || "Your purchase";
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Good news — your payment has landed safely. 🎉`,
+    ``,
+    `🛍️ *Item:* ${summary}`,
+    `💰 *Amount paid:* KES ${amt}`,
+    `🧾 *Payment ref:* ${ref}`,
+    `🏪 *Seller:* ${shop}`,
+    ``,
+    `Thanks for shopping with MarketMix Kenya! ❤️`,
+    `The seller has been notified and your purchase is confirmed.`,
+    ``,
+    `🛍️ *Explore more products:*`,
+    PRODUCTS_URL,
+    ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    PROMO_FOOTER,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].join("\n");
+}
+
+// No promo — transactional seller message
+function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentReference, customerName, customerPhone }) {
+  const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const ref = paymentReference || "—";
+  const customer = customerName || "Walk-in customer";
+  const phone = customerPhone || "—";
+  const summary = itemSummary || "—";
+  return [
+    `💰 *MarketMix Kenya — Quicksale Recorded*`,
+    ``,
+    `Hi ${name},`,
+    ``,
+    `A quicksale payment was just confirmed. ✅`,
+    ``,
+    `🛍️ *Item(s):* ${summary}`,
+    `💵 *Amount:* KES ${amt}`,
+    `🧾 *M-Pesa ref:* ${ref}`,
+    `👤 *Customer:* ${customer}`,
+    `📱 *Phone:* ${phone}`,
+    ``,
+    `Funds are in your seller ledger.`,
+    `👉 ${SELLER_DASHBOARD_URL}`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].join("\n");
+}
+
+// No promo — seller already uses dashboard
 function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -572,36 +688,7 @@ function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue,
   ].join("\n");
 }
 
-function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
-  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
-  const id = orderId ? String(orderId) : "—";
-  const status = statusLabel || "Updated";
-
-  const statusMessages = {
-    Processing: "We're getting your items ready!",
-    Shipped: "Your order is on the way. 🚚",
-    Delivered: "Delivered! Hope you love it. ❤️",
-    Cancelled: "This order was cancelled. Any payment will be refunded.",
-  };
-  const message = statusMessages[status] || `Your order is now ${status}.`;
-
-  return [
-    `Hey ${name}! 👋`,
-    ``,
-    `Your MarketMix order has an update.`,
-    ``,
-    `📦 *Order ID:* #${id}`,
-    `🚚 *New status:* ${status}`,
-    ``,
-    `${message}`,
-    ``,
-    `💬 Questions? Just reply to this message.`,
-    ``,
-    `*MarketMix Kenya*`,
-    `Your marketplace. Your choice.`,
-  ].join("\n");
-}
-
+// No promo — nudge/interrupt
 function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nudgeNumber, maxNudges }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -624,60 +711,6 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
     `👉 ${SELLER_DASHBOARD_URL}`,
     ``,
     `*MarketMix Kenya*`,
-  ].join("\n");
-}
-
-// ⭐ QUICKSALE — buyer confirmation (single message; replaces the store pair)
-function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
-  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
-  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
-  const ref = paymentReference || "—";
-  const shop = sellerShop || "the seller";
-  const summary = itemSummary || "Your purchase";
-  return [
-    `Hey ${name}! 👋`,
-    ``,
-    `Good news — your payment has landed safely. 🎉`,
-    ``,
-    `🛍️ *Item:* ${summary}`,
-    `💰 *Amount paid:* KES ${amt}`,
-    `🧾 *Payment ref:* ${ref}`,
-    `🏪 *Seller:* ${shop}`,
-    ``,
-    `Thanks for shopping with MarketMix Kenya! ❤️`,
-    `The seller has been notified and your purchase is confirmed.`,
-    ``,
-    `💬 Questions? Just reply to this message.`,
-    ``,
-    `*MarketMix Kenya — Shop smart. Shop easy.*`,
-  ].join("\n");
-}
-
-// ⭐ QUICKSALE — seller confirmation of a recorded in-store sale
-function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentReference, customerName, customerPhone }) {
-  const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
-  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
-  const ref = paymentReference || "—";
-  const customer = customerName || "Walk-in customer";
-  const phone = customerPhone || "—";
-  const summary = itemSummary || "—";
-  return [
-    `💰 *MarketMix Kenya — Quicksale Recorded*`,
-    ``,
-    `Hi ${name},`,
-    ``,
-    `A quicksale payment was just confirmed. ✅`,
-    ``,
-    `🛍️ *Item(s):* ${summary}`,
-    `💵 *Amount:* KES ${amt}`,
-    `🧾 *M-Pesa ref:* ${ref}`,
-    `👤 *Customer:* ${customer}`,
-    `📱 *Phone:* ${phone}`,
-    ``,
-    `Funds are in your seller ledger.`,
-    `👉 ${SELLER_DASHBOARD_URL}`,
-    ``,
-    `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
@@ -714,14 +747,12 @@ const isSubscriptionRef = (r) => typeof r === "string" && r.startsWith("SUB_");
 const isRealEstateRef   = (r) => typeof r === "string" && r.startsWith("PROP_");
 const isMovingRef       = (r) => typeof r === "string" && r.startsWith("MOVE_");
 const isTestRef         = (r) => typeof r === "string" && r.startsWith("TEST_PAY_");
-// ⭐ QUICKSALE detectors
 const isQuicksaleRef    = (r) => typeof r === "string" && r.startsWith("QS_");
 
 function isRealEstateOrder(apiRef, orderData) {
   return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
 }
 
-// ⭐ QUICKSALE — detected by field on the order doc (frontend writes type: 'QUICK_SALE')
 function isQuicksaleOrder(orderData) {
   return orderData?.type === "QUICK_SALE" || orderData?.isQuicksale === true;
 }
@@ -746,8 +777,6 @@ function getSellerRevenue(orderData, sellerId) {
   return items.reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.quantity) || 0), 0);
 }
 
-// ⭐ QUICKSALE — compact single-line item summary (no seller filtering needed,
-// quicksale orders only ever have one seller)
 function quicksaleItemSummary(orderData) {
   const items = Array.isArray(orderData?.items) ? orderData.items : [];
   if (!items.length) return "Your purchase";
@@ -861,7 +890,7 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
       subtitle: "Your payment is confirmed and your order is being prepared.",
       bodyHtml,
       ctaLabel: "View order receipt",
-      ctaUrl: `${MARKETPLACE_URL}/order-receipt/${orderId}`,
+      ctaUrl: buildOrderReceiptUrl(orderId),
       footerNote: "Need help? Reply to this email and we'll get back to you.",
     });
 
@@ -1324,7 +1353,6 @@ async function notifySellersOfNewOrder(orderId, orderData) {
     }
   }
 
-  // ⭐ QUICKSALE GUARD — quicksales are settled instantly, no nudge timer
   if (isQuicksaleOrder(orderData)) {
     console.log(`⚡ Skipping nudge timer seed for quicksale order ${orderId}`);
     return;
@@ -1370,7 +1398,6 @@ async function runSellerNudgeScan() {
       const orderId = docSnap.id;
       const order = docSnap.data() || {};
 
-      // ⭐ QUICKSALE — never nudge quicksales even if a stray timer exists
       if (isQuicksaleOrder(order)) {
         await docSnap.ref.update({
           sellerNudgeActive: false,
@@ -1415,7 +1442,6 @@ async function runSellerNudgeScan() {
       let anySent = false;
 
       for (const sellerId of sellerIds) {
-        // ⭐ Skip sellers who hid this order from their dashboard
         if (hiddenFrom.includes(sellerId)) continue;
 
         try {
@@ -1617,9 +1643,6 @@ app.post("/api/real-estate/seed", async (req, res) => {
   }
 });
 
-// ============================
-// Seller updates order status → buyer gets WhatsApp
-// ============================
 const ALLOWED_SELLER_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
 
 app.post("/api/seller/update-status", async (req, res) => {
@@ -1714,9 +1737,6 @@ app.post("/api/seller/update-status", async (req, res) => {
   }
 });
 
-// ============================
-// Real Estates — welcome (signup + role switch)
-// ============================
 app.post("/api/re/welcome", async (req, res) => {
   try {
     const {
@@ -1761,6 +1781,8 @@ app.post("/api/re/welcome", async (req, res) => {
           : `You can switch your account type anytime from your Profile page.`,
         ``,
         `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
+        ``,
+        PROMO_FOOTER,
       ].filter(Boolean);
 
       whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
@@ -1776,9 +1798,6 @@ app.post("/api/re/welcome", async (req, res) => {
   }
 });
 
-// ============================
-// WhatsApp bulk — paced text + optional image/file (WAHA)
-// ============================
 app.post("/api/whatsapp/send-media", async (req, res) => {
   try {
     const {
@@ -1864,9 +1883,6 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
   }
 });
 
-// ============================
-// ADMIN → USER NOTIFICATION
-// ============================
 app.post("/api/admin/notify-user", async (req, res) => {
   try {
     const { userId, phone, email, title = "MarketMix update", message, kind = "admin-notify" } = req.body || {};
@@ -1944,9 +1960,6 @@ app.post("/api/admin/notify-user", async (req, res) => {
   }
 });
 
-// ============================
-// DRIVER APPROVAL
-// ============================
 app.post("/api/driver/decision", async (req, res) => {
   try {
     const { userId, decision, reason = "" } = req.body || {};
@@ -2061,9 +2074,6 @@ app.post("/api/driver/decision", async (req, res) => {
   }
 });
 
-// ============================
-// WhatsApp notify — generic
-// ============================
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
     const { phone, title, message } = req.body || {};
@@ -2080,9 +2090,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
   }
 });
 
-// ============================
-// Service request update → notify customer
-// ============================
 app.post("/api/service-request/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
@@ -2149,9 +2156,6 @@ app.post("/api/service-request/notify", async (req, res) => {
   }
 });
 
-// ============================
-// Moving request update → notify customer
-// ============================
 app.post("/api/moving/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
@@ -2211,9 +2215,6 @@ app.post("/api/moving/notify", async (req, res) => {
   }
 });
 
-// ============================
-// IntaSend callback
-// ============================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -2343,7 +2344,6 @@ app.post("/api/intasend-callback", async (req, res) => {
 
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
-      // ⭐ QUICKSALE detection
       const quicksale = isQuicksaleOrder(orderData) || isQuicksaleRef(api_ref);
 
       const customerName =
@@ -2351,8 +2351,6 @@ app.post("/api/intasend-callback", async (req, res) => {
         orderData.buyerName ||
         (userEmail ? userEmail.split("@")[0] : "Customer");
 
-      // ⭐ Skip the standard buyer email + store templates for quicksales
-      // (quicksale buyers get a dedicated WhatsApp; no email needed)
       if (!quicksale) {
         if (!userEmail) {
           console.log(`⚠️ No email on order ${api_ref}, skipping email receipt`);
@@ -2393,7 +2391,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       if (realEstate) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}`,
+            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}\n\n${PROMO_FOOTER}`,
             { kind: "re-buyer", api_ref }
           );
         }
@@ -2406,12 +2404,11 @@ app.post("/api/intasend-callback", async (req, res) => {
       } else if (moving) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}`,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}\n\n${PROMO_FOOTER}`,
             { kind: "moving-paid", api_ref }
           );
         }
       } else if (quicksale) {
-        // ⭐ QUICKSALE — buyer gets ONE dedicated WhatsApp (no store pair)
         if (payerPhone) {
           enqueueWhatsApp(
             payerPhone,
@@ -2420,7 +2417,7 @@ app.post("/api/intasend-callback", async (req, res) => {
               itemSummary: quicksaleItemSummary(orderData),
               amount: amountNum,
               paymentReference: mpesa_reference || api_ref,
-              sellerShop: null, // filled by seller notification below for reference; buyer sees generic
+              sellerShop: null,
             }),
             { kind: "quicksale-buyer", api_ref }
           );
@@ -2428,7 +2425,6 @@ app.post("/api/intasend-callback", async (req, res) => {
           console.log(`⚠️ Quicksale ${api_ref} has no buyer phone — buyer WhatsApp skipped`);
         }
 
-        // ⭐ QUICKSALE — notify seller(s) with a dedicated "recorded" template
         const sellerIds = Array.isArray(orderData.involvedSellerIds) ? orderData.involvedSellerIds : [];
         for (const sellerId of sellerIds) {
           try {
@@ -2442,7 +2438,6 @@ app.post("/api/intasend-callback", async (req, res) => {
             }
             const sellerName = seller.fullName || seller.shopName || seller.email?.split("@")[0] || "Seller";
 
-            // Build item summary scoped to this seller (quicksale = 1 seller, but be safe)
             const sellerItems = getSellerItems(orderData, sellerId);
             const itemSummary = sellerItems.length
               ? sellerItems.slice(0, 3).map((it) => `${it.name} x${it.quantity}`).join(", ") +
@@ -2467,10 +2462,8 @@ app.post("/api/intasend-callback", async (req, res) => {
           }
         }
 
-        // ⭐ Do NOT seed a nudge timer for quicksales
         console.log(`⚡ Quicksale ${api_ref} — no nudge timer seeded`);
       } else {
-        // Regular store order: buyer gets the two standard templates
         if (payerPhone) {
           enqueueWhatsApp(
             payerPhone,
@@ -2507,9 +2500,6 @@ app.post("/api/intasend-callback", async (req, res) => {
   }
 });
 
-// ============================
-// Universal transaction lookup
-// ============================
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
   try {
@@ -2590,9 +2580,6 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
-// ============================
-// Seller withdrawal
-// ============================
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body || {};
@@ -2687,9 +2674,6 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
-// ============================
-// PIN recovery
-// ============================
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body || {};
@@ -2793,9 +2777,6 @@ app.post("/api/seller/reset-pin", async (req, res) => {
   }
 });
 
-// ============================
-// Stock update
-// ============================
 app.post("/api/update-stock", async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
@@ -2816,9 +2797,6 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
-// ============================
-// Hugging Face image gen
-// ============================
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
@@ -2852,14 +2830,12 @@ app.post("/api/generate-ai-image", async (req, res) => {
   }
 });
 
-// ============================
-// Test endpoints
-// ============================
 app.get("/api/test-email-auth", async (req, res) => {
   res.json({
     success: !!BREVO_API_KEY,
     message: BREVO_API_KEY ? "Email authentication configured" : "BREVO_API_KEY not configured",
     senders: SENDERS,
+    urls: { website: WEBSITE_URL, products: PRODUCTS_URL, orderReceiptBase: ORDER_RECEIPT_BASE },
   });
 });
 
@@ -2936,10 +2912,8 @@ app.post("/api/test-store-whatsapp", async (req, res) => {
 app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
   try {
     const {
-      sellerPhone,
-      buyerPhone,
-      sellerName = "Test Seller",
-      buyerName = "Test Buyer",
+      sellerPhone, buyerPhone,
+      sellerName = "Test Seller", buyerName = "Test Buyer",
       orderId = "TEST_ORDER_789",
       sellerRevenue = 3500,
       itemSummary = "Sneakers x1, Cap x2",
@@ -2974,16 +2948,12 @@ app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
   }
 });
 
-// ⭐ QUICKSALE — preview both templates
 app.post("/api/test-quicksale-whatsapp", async (req, res) => {
   try {
     const {
-      sellerPhone,
-      buyerPhone,
-      sellerName = "Test Seller",
-      customerName = "Walk-in Customer",
-      itemSummary = "Nike Air x1",
-      amount = 3500,
+      sellerPhone, buyerPhone,
+      sellerName = "Test Seller", customerName = "Walk-in Customer",
+      itemSummary = "Nike Air x1", amount = 3500,
       paymentReference = "TEST_QS_123",
       sellerShop = "Test Shop",
     } = req.body || {};
@@ -3002,11 +2972,7 @@ app.post("/api/test-quicksale-whatsapp", async (req, res) => {
       results.sellerQueued = enqueueWhatsApp(
         sellerPhone,
         quicksaleSellerWhatsApp({
-          sellerName,
-          itemSummary,
-          amount,
-          paymentReference,
-          customerName,
+          sellerName, itemSummary, amount, paymentReference, customerName,
           customerPhone: buyerPhone || "—",
         }),
         { kind: "test-quicksale-seller" }
@@ -3019,9 +2985,6 @@ app.post("/api/test-quicksale-whatsapp", async (req, res) => {
   }
 });
 
-// ============================
-// Health
-// ============================
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
@@ -3030,6 +2993,9 @@ app.get("/_health", (req, res) => {
     firestore: { shop: !!db, realestate: !!reDb },
     urls: {
       marketplace: MARKETPLACE_URL,
+      website: WEBSITE_URL,
+      products: PRODUCTS_URL,
+      orderReceiptBase: ORDER_RECEIPT_BASE,
       realEstateApp: REAL_ESTATE_APP_URL,
       realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
       moving: MOVING_URL,
@@ -3070,9 +3036,6 @@ app.use((req, res) => res.status(404).json({ success: false, message: "Not Found
 process.on("uncaughtException", (err) => console.error("Uncaught:", err));
 process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 
-// ============================
-// Keep-alive (11pm–5am EAT pause)
-// ============================
 (function keepAlive() {
   const disable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
   const enable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
@@ -3111,24 +3074,25 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
-// ============================
-// Start
-// ============================
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
   console.log(`🛍️ Shop frontend: ${MARKETPLACE_URL}`);
+  console.log(`🌐 Website: ${WEBSITE_URL}`);
+  console.log(`🛍️ Products: ${PRODUCTS_URL}`);
+  console.log(`🧾 Receipt base: ${ORDER_RECEIPT_BASE}`);
   console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
   console.log(`🚚 Moving URL: ${MOVING_URL}`);
-  console.log(`🧑✈️ Driver approvals: ✅ (Real Estate admin only, reDb)`);
-  console.log(`🔔 Admin → user notifications: ✅ (/api/admin/notify-user)`);
-  console.log(`💬 WhatsApp notify endpoints: ✅ (/api/whatsapp/notify, /api/whatsapp/send-media, /api/service-request/notify, /api/moving/notify)`);
-  console.log(`👋 Real Estates welcome: ✅ (/api/re/welcome)`);
-  console.log(`📦 Seller order notifications: ✅ (/api/seller/update-status + callback hook)`);
+  console.log(`🧑✈️ Driver approvals: ✅`);
+  console.log(`🔔 Admin → user notifications: ✅`);
+  console.log(`💬 WhatsApp notify endpoints: ✅`);
+  console.log(`👋 Real Estates welcome: ✅`);
+  console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
-  console.log(`⚡ Quicksale WhatsApp: ✅ (buyer + seller templates, no nudge)`);
+  console.log(`⚡ Quicksale WhatsApp: ✅`);
+  console.log(`🔗 Promo footer enabled on buyer/onboarding templates`);
 });
 
 const shutdown = () => {
