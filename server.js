@@ -604,6 +604,9 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
     const deliveryTotal = (orderData.sellerGroups || []).reduce((s, g) => s + (g.deliveryCost || 0), 0);
     const total = orderData.totalAmount || (itemsTotal + deliveryTotal);
 
+    // ✅ FIX: Added ["Delivery", ...] row so the buyer's deliveryPlace
+    // (which includes coordinates like "Kilimani (-1.2921000, 36.8219000)")
+    // appears in the order confirmation email.
     const bodyHtml = `
       ${emailBodyText(`Hello <strong>${orderData.shippingDetails?.fullName || userEmail.split("@")[0]}</strong>, your payment is confirmed.`)}
       ${emailSectionLabel("Order")}
@@ -611,6 +614,7 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
         ["Order ID", String(orderId)],
         ["Date", new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" })],
         ["Buyer", orderData.shippingDetails?.fullName || "—"],
+        ["Delivery", orderData.shippingDetails?.deliveryPlace || "—"],
       ])}
       ${emailSectionLabel("Items")}
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6faf8;border:1px solid #e2e8e6;border-radius:18px;margin-bottom:16px;">
