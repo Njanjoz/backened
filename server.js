@@ -33,6 +33,7 @@ const allowedOrigins = [
   "https://backened-lt67.onrender.com",
   "https://my-campus-store-frontend.vercel.app",
   "https://marketmix.site",
+  "https://www.marketmixkenya.co.ke",
   "https://marketmix-realestates.vercel.app",
   "https://localhost",
 ];
