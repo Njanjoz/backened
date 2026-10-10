@@ -141,13 +141,11 @@ const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 
 const SELLER_DASHBOARD_URL = `${MARKETPLACE_URL}/seller/dashboard/orders`;
 
-// ⭐ PROMO — customer-facing URLs used inside WhatsApp messages
+// ⭐ PROMO — customer-facing URLs + WhatsApp group invite
 const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke";
 const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
-
-const PROMO_FOOTER = `🌐 *Shop online:* ${WEBSITE_URL}`;
-const PROMO_FOOTER_BLOCK = `\n${PROMO_FOOTER}`;
+const WHATSAPP_GROUP_URL = process.env.WHATSAPP_GROUP_URL || "https://chat.whatsapp.com/GQWo3DXgRJa7hFDF6anpTH";
 
 const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
@@ -506,6 +504,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 // WhatsApp templates — MarketMix store
 // ============================
 
+// ⭐ BUYER — payment received (Explore + Group, no duplicate shop link)
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -523,14 +522,16 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
     `🛍️ *Explore more products:*`,
     PRODUCTS_URL,
     ``,
-    `Happy shopping!`,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
     ``,
-    PROMO_FOOTER,
+    `Happy shopping!`,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
+// ⭐ BUYER — order confirmed (Track + Group, no duplicate shop link)
 function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -555,13 +556,15 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
     ``,
     `Thanks for shopping with us, ${name}. We appreciate you! ❤️`,
     ``,
-    PROMO_FOOTER,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
     ``,
     `*MarketMix Kenya*`,
     `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
+// ⭐ BUYER — status update (Track + Group)
 function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -591,13 +594,15 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
     ``,
     `💬 Questions? Just reply to this message.`,
     ``,
-    PROMO_FOOTER,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
     ``,
     `*MarketMix Kenya*`,
     `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
+// ⭐ BUYER — quicksale (Explore + Group)
 function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -622,7 +627,8 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
     ``,
     `💬 Questions? Just reply to this message.`,
     ``,
-    PROMO_FOOTER,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
@@ -705,7 +711,7 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
   ].join("\n");
 }
 
-// ⭐ NEW — Welcome WhatsApp for new newsletter subscribers
+// ⭐ Welcome WhatsApp for new newsletter subscribers
 function welcomeSubscriberWhatsApp({ name }) {
   const displayName = name && String(name).trim() ? String(name).trim() : "there";
   return [
@@ -1795,7 +1801,8 @@ app.post("/api/re/welcome", async (req, res) => {
         ``,
         `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
         ``,
-        PROMO_FOOTER,
+        `👥 *Join our WhatsApp group:*`,
+        WHATSAPP_GROUP_URL,
       ].filter(Boolean);
 
       whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
@@ -2103,7 +2110,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
   }
 });
 
-// ⭐ NEW — Welcome WhatsApp for new newsletter subscribers
 app.post("/api/whatsapp/welcome", async (req, res) => {
   try {
     const { phone, name } = req.body || {};
@@ -2426,7 +2432,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       if (realEstate) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}\n\n${PROMO_FOOTER}`,
+            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
             { kind: "re-buyer", api_ref }
           );
         }
@@ -2439,7 +2445,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       } else if (moving) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}\n\n${PROMO_FOOTER}`,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
             { kind: "moving-paid", api_ref }
           );
         }
@@ -2870,7 +2876,7 @@ app.get("/api/test-email-auth", async (req, res) => {
     success: !!BREVO_API_KEY,
     message: BREVO_API_KEY ? "Email authentication configured" : "BREVO_API_KEY not configured",
     senders: SENDERS,
-    urls: { website: WEBSITE_URL, products: PRODUCTS_URL, orderReceiptBase: ORDER_RECEIPT_BASE },
+    urls: { website: WEBSITE_URL, products: PRODUCTS_URL, orderReceiptBase: ORDER_RECEIPT_BASE, whatsappGroup: WHATSAPP_GROUP_URL },
   });
 });
 
@@ -3020,7 +3026,6 @@ app.post("/api/test-quicksale-whatsapp", async (req, res) => {
   }
 });
 
-// ⭐ NEW — test the welcome-subscriber template
 app.post("/api/test-welcome-whatsapp", async (req, res) => {
   try {
     const { phone, name = "Test Subscriber" } = req.body || {};
@@ -3047,6 +3052,7 @@ app.get("/_health", (req, res) => {
       website: WEBSITE_URL,
       products: PRODUCTS_URL,
       orderReceiptBase: ORDER_RECEIPT_BASE,
+      whatsappGroup: WHATSAPP_GROUP_URL,
       realEstateApp: REAL_ESTATE_APP_URL,
       realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
       moving: MOVING_URL,
@@ -3136,6 +3142,7 @@ const server = app.listen(PORT, () => {
   console.log(`🌐 Website: ${WEBSITE_URL}`);
   console.log(`🛍️ Products: ${PRODUCTS_URL}`);
   console.log(`🧾 Receipt base: ${ORDER_RECEIPT_BASE}`);
+  console.log(`👥 WhatsApp group: ${WHATSAPP_GROUP_URL}`);
   console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
   console.log(`🚚 Moving URL: ${MOVING_URL}`);
   console.log(`🧑✈️ Driver approvals: ✅`);
@@ -3146,7 +3153,7 @@ const server = app.listen(PORT, () => {
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
   console.log(`⚡ Quicksale WhatsApp: ✅`);
   console.log(`🎉 Welcome subscriber WhatsApp: ✅ (/api/whatsapp/welcome)`);
-  console.log(`🔗 Promo footer enabled on buyer/onboarding templates`);
+  console.log(`🔗 Group invite on buyer/onboarding templates`);
 });
 
 const shutdown = () => {
