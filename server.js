@@ -734,6 +734,39 @@ function welcomeSubscriberWhatsApp({ name }) {
 }
 
 // ============================
+// Inventory movement logger
+// ============================
+async function logInventoryMovement({
+  productId,
+  sellerId,
+  delta,
+  reason,
+  channel = null,
+  orderId = null,
+  note = "",
+  createdBy = "system",
+}) {
+  if (!productId || !sellerId || typeof delta !== "number" || delta === 0) return null;
+  try {
+    const ref = await db.collection("inventoryMovements").add({
+      productId,
+      sellerId,
+      delta,
+      reason,
+      channel,
+      orderId,
+      note: note || "",
+      createdBy,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return ref.id;
+  } catch (err) {
+    console.error("❌ logInventoryMovement failed:", err.message, { productId, delta, reason });
+    return null;
+  }
+}
+
+// ============================
 // Helpers
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
@@ -2820,18 +2853,48 @@ app.post("/api/seller/reset-pin", async (req, res) => {
 
 app.post("/api/update-stock", async (req, res) => {
   try {
-    const { productId, quantity } = req.body || {};
+    const {
+      productId,
+      quantity,
+      channel = null,
+      orderId = null,
+      reason = "sale",
+      createdBy = "system",
+    } = req.body || {};
+
     if (!productId || typeof quantity !== "number" || quantity <= 0) {
       return res.status(400).json({ success: false, message: "Invalid product or quantity" });
     }
+
     const pRef = db.collection("products").doc(productId);
+    let sellerId = null;
+    let oldQty = 0;
+
     await db.runTransaction(async (t) => {
-      const doc = await t.get(pRef);
-      if (!doc.exists) throw new Error("Product not found");
-      const q = doc.data().quantity || 0;
+      const docSnap = await t.get(pRef);
+      if (!docSnap.exists) throw new Error("Product not found");
+      const data = docSnap.data();
+      const q = data.quantity || 0;
       if (q < quantity) throw new Error("Not enough stock");
+      sellerId = data.sellerId || null;
+      oldQty = q;
       t.update(pRef, { quantity: q - quantity });
     });
+
+    // Movement is informative, not authoritative — if it fails, stock is still correct.
+    if (sellerId) {
+      await logInventoryMovement({
+        productId,
+        sellerId,
+        delta: -Math.abs(quantity),
+        reason,
+        channel,
+        orderId,
+        note: `Stock ${oldQty} → ${oldQty - quantity}`,
+        createdBy,
+      });
+    }
+
     return res.json({ success: true, message: "Stock updated" });
   } catch (e) {
     return sendServerError(res, e, "Stock update failed");
@@ -3080,6 +3143,7 @@ app.get("/_health", (req, res) => {
       "/api/seller/recover-pin",
       "/api/seller/update-status",
       "/api/ad-transaction/:paymentRef",
+      "/api/update-stock",
       "/api/test-store-whatsapp",
       "/api/test-seller-flow-whatsapp",
       "/api/test-quicksale-whatsapp",
@@ -3154,6 +3218,7 @@ const server = app.listen(PORT, () => {
   console.log(`⚡ Quicksale WhatsApp: ✅`);
   console.log(`🎉 Welcome subscriber WhatsApp: ✅ (/api/whatsapp/welcome)`);
   console.log(`🔗 Group invite on buyer/onboarding templates`);
+  console.log(`📊 Inventory movements logged on /api/update-stock`);
 });
 
 const shutdown = () => {
