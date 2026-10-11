@@ -51,14 +51,26 @@ app.use(cors({
   credentials: true,
 }));
 
-// ============================
-// Middleware
-// ============================
-app.use(bodyParser.json({ limit: "15mb" }));
+/* ═══════════════════════════════════════════════════════════════
+   FIX #1 — INCREASED BODY LIMIT FOR INLINE IMAGES
+   WHAT: Bumps JSON body limit from 15mb → 25mb.
+   WHY:  Base64-encoded images sent to /api/whatsapp/notify can
+         easily exceed 15mb for large photos. 25mb gives headroom
+         while still rejecting truly abusive payloads.
+   ═══════════════════════════════════════════════════════════════ */
+app.use(bodyParser.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
   try {
-    console.log(`${new Date().toISOString()} → ${req.method} ${req.originalUrl}`, req.body || {});
+    // NEW-FIX: Skip logging giant base64 image payloads to keep logs readable
+    const logBody = { ...req.body };
+    if (logBody.imageUrl && typeof logBody.imageUrl === "string" && logBody.imageUrl.length > 200) {
+      logBody.imageUrl = `[base64 image: ${logBody.imageUrl.length} chars]`;
+    }
+    if (logBody.imageBase64 && typeof logBody.imageBase64 === "string") {
+      logBody.imageBase64 = `[base64 image: ${logBody.imageBase64.length} chars]`;
+    }
+    console.log(`${new Date().toISOString()} → ${req.method} ${req.originalUrl}`, logBody || {});
   } catch (e) {
     console.error("Logging error:", e);
   }
@@ -286,6 +298,58 @@ function normalizePhoneForWa(phoneNumber) {
   }
   if (!digits.startsWith("254")) digits = "254" + digits;
   return digits;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX #2 — BASE64 IMAGE NORMALIZER
+   WHAT: Converts any accepted image format into the object shape
+         WAHA's /api/sendImage expects.
+   WHY:  Your frontend may pass:
+           • a full data URL:  "data:image/jpeg;base64,XXXX"
+           • a raw base64:     "XXXX"
+           • an http(s) URL:   "https://..."
+         This helper normalizes all three so the send path stays
+         clean and predictable.
+   ═══════════════════════════════════════════════════════════════ */
+function buildWahaFilePayload(input, { filename, mimeOverride } = {}) {
+  if (!input || typeof input !== "string") return null;
+  const s = input.trim();
+  if (!s) return null;
+
+  // Case 1: data URL  → data:image/png;base64,XXXX
+  if (s.startsWith("data:")) {
+    const match = /^data:([^;]+);base64,(.+)$/i.exec(s);
+    if (!match) return null;
+    const mimetype = mimeOverride || match[1] || "image/jpeg";
+    return {
+      mode: "data",
+      file: {
+        mimetype,
+        filename: filename || (mimetype.includes("png") ? "image.png" : "image.jpg"),
+        data: match[2],
+      },
+    };
+  }
+
+  // Case 2: plain http(s) URL
+  if (/^https?:\/\//i.test(s)) {
+    return { mode: "url", file: { url: s, filename: filename || undefined } };
+  }
+
+  // Case 3: raw base64 (assume JPEG unless overridden)
+  if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 64) {
+    const mimetype = mimeOverride || "image/jpeg";
+    return {
+      mode: "data",
+      file: {
+        mimetype,
+        filename: filename || (mimetype.includes("png") ? "image.png" : "image.jpg"),
+        data: s.replace(/\s+/g, ""),
+      },
+    };
+  }
+
+  return null;
 }
 
 const waQueue = [];
@@ -2127,21 +2191,132 @@ app.post("/api/driver/decision", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   FIX #3 — /api/whatsapp/notify NOW SUPPORTS IMAGES
+   ═══════════════════════════════════════════════════════════════════════════
+   WHAT:
+     The endpoint now accepts two new optional fields:
+       • imageUrl     — data URL ("data:image/jpeg;base64,...") or http(s) URL
+       • imageBase64  — raw base64 string (no prefix)
+       • filename     — optional filename
+       • mediaType    — "image" (default) or "file"
+
+   WHY:
+     Previously this endpoint could only send plain text. Sellers who
+     wanted to promote a service with its photo had no way to attach
+     the image — it was silently dropped.
+
+   BEHAVIOR:
+     • If neither imageUrl nor imageBase64 is sent  → text-only path,
+       identical to before. Existing callers are unaffected.
+     • If an image is sent                          → uploaded via
+       WAHA /api/sendImage with the message as caption.
+     • If the image send fails for any reason       → automatically
+       falls back to queuing the plain text message, so the recipient
+       still gets notified.
+
+   HOW TO USE (from frontend):
+     POST /api/whatsapp/notify
+     {
+       "phone":   "254712345678",
+       "title":   "Promo",
+       "message": "Check out our new service!",
+       "imageUrl":"data:image/jpeg;base64,..."   ← optional
+     }
+   ═══════════════════════════════════════════════════════════════════════════ */
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
-    const { phone, title, message } = req.body || {};
+    const {
+      phone,
+      title,
+      message,
+      // NEW-FIX: optional image fields
+      imageUrl,
+      imageBase64,
+      filename,
+      mediaType = "image",
+    } = req.body || {};
+
     if (!phone || !message) {
       return res.status(400).json({ success: false, message: "phone and message required" });
     }
+
     const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
-    const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
-    if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
-    return res.json({ success: true, queued: true, phone: normalizePhoneForWa(phone) });
+
+    // NEW-FIX: normalise whatever image shape we got (dataURL, raw base64, http URL)
+    const incomingImage =
+      (typeof imageUrl === "string" && imageUrl.trim()) ||
+      (typeof imageBase64 === "string" && imageBase64.trim()) ||
+      null;
+
+    const imagePayload = incomingImage
+      ? buildWahaFilePayload(incomingImage, { filename })
+      : null;
+
+    // ---- Text-only path (unchanged) ----
+    if (!imagePayload) {
+      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
+      if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
+      return res.json({
+        success: true,
+        queued: true,
+        mode: "text",
+        phone: normalizePhoneForWa(phone),
+      });
+    }
+
+    // ---- Image path ----
+    const normalized = normalizePhoneForWa(phone);
+    if (!normalized) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+
+    try {
+      const isFile = mediaType === "file";
+      const sender = isFile ? wahaSendFile : wahaSendImage;
+
+      await sender({
+        phone: normalized,
+        ...(isFile
+          ? { fileUrl: imagePayload.mode === "url" ? imagePayload.file.url : null,
+              // For data mode with "file" type, we still go through sendImage's data path
+              ...(imagePayload.mode === "data"
+                ? { fileUrl: `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }
+                : {}) }
+          : { imageUrl: imagePayload.mode === "url"
+              ? imagePayload.file.url
+              : `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }),
+        caption: body,
+        filename: filename || imagePayload.file.filename,
+      });
+
+      console.log(`🖼️ /api/whatsapp/notify → image sent to ${normalized}`);
+      return res.json({
+        success: true,
+        sent: true,
+        mode: "image",
+        mediaType: isFile ? "file" : "image",
+        phone: normalized,
+      });
+    } catch (imgErr) {
+      console.error(`⚠️ Image send failed for ${normalized}, falling back to text:`, imgErr.message);
+      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify-fallback" });
+      return res.json({
+        success: true,
+        queued,
+        mode: "text-fallback",
+        phone: normalized,
+        imageError: imgErr.message,
+      });
+    }
   } catch (e) {
     console.error("❌ /api/whatsapp/notify failed:", e);
     return sendServerError(res, e, "WhatsApp notify failed");
   }
 });
+/* ═══════════════════════════════════════════════════════════════════════════
+   END FIX #3
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 app.post("/api/whatsapp/welcome", async (req, res) => {
   try {
@@ -3104,6 +3279,34 @@ app.post("/api/test-welcome-whatsapp", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   FIX #4 — NEW TEST ENDPOINT FOR IMAGE NOTIFY
+   WHAT: A dedicated endpoint to test /api/whatsapp/notify with an image
+         without touching any real order or promo flow.
+   WHY:  Lets you verify the new image path works end-to-end from Postman
+         or curl before wiring it into the real promotion UI.
+   ═══════════════════════════════════════════════════════════════════════════ */
+app.post("/api/test-whatsapp-notify-image", async (req, res) => {
+  try {
+    const { phone, title = "Image test", message = "Test image message", imageUrl } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    if (!imageUrl) return res.status(400).json({ success: false, message: "imageUrl required" });
+
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/whatsapp/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone, title, message, imageUrl }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.json({ success: r.ok, forwarded: data });
+  } catch (e) {
+    return sendServerError(res, e, "Test notify-image failed");
+  }
+});
+/* ═══════════════════════════════════════════════════════════════════════════
+   END FIX #4
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
@@ -3127,7 +3330,7 @@ app.get("/_health", (req, res) => {
     whatsappQueue: waQueue.length,
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     endpoints: [
-      "/api/whatsapp/notify",
+      "/api/whatsapp/notify",                 // ← FIX #3: now supports imageUrl
       "/api/whatsapp/welcome",
       "/api/whatsapp/send-media",
       "/api/service-request/notify",
@@ -3148,7 +3351,14 @@ app.get("/_health", (req, res) => {
       "/api/test-seller-flow-whatsapp",
       "/api/test-quicksale-whatsapp",
       "/api/test-welcome-whatsapp",
+      "/api/test-whatsapp-notify-image",      // ← FIX #4: new test endpoint
       "/_health",
+    ],
+    fixes: [
+      "FIX #1 — body limit bumped to 25mb for inline images",
+      "FIX #2 — buildWahaFilePayload() normalizes dataURL / base64 / URL",
+      "FIX #3 — /api/whatsapp/notify now sends images with text fallback",
+      "FIX #4 — /api/test-whatsapp-notify-image test endpoint added",
     ],
     uptime: process.uptime(),
   });
@@ -3212,6 +3422,7 @@ const server = app.listen(PORT, () => {
   console.log(`🧑✈️ Driver approvals: ✅`);
   console.log(`🔔 Admin → user notifications: ✅`);
   console.log(`💬 WhatsApp notify endpoints: ✅`);
+  console.log(`🖼️ WhatsApp image notify: ✅ (FIX #3)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
