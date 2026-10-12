@@ -8,7 +8,8 @@
 // Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
 //
 // Single-file: AutoPromo scheduler is inlined at the bottom of this file
-// (no ./autoPromo.js module needed).
+// (no ./autoPromo.js module needed). AutoPromo v2 adds a campaign calendar,
+// time/day/payday context, and 20 contextual WhatsApp templates (T1–T20).
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -148,6 +149,11 @@ const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke
 const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
 const WHATSAPP_GROUP_URL = process.env.WHATSAPP_GROUP_URL || "https://chat.whatsapp.com/GQWo3DXgRJa7hFDF6anpTH";
+
+// AutoPromo v2 — contact + APK constants
+const ADMIN_PHONE = process.env.ADMIN_PHONE || "254115988107";
+const ORDERS_PHONE = process.env.ORDERS_PHONE || "254115988107";
+const APK_DOWNLOAD_URL = process.env.APK_DOWNLOAD_URL || `${WEBSITE_URL}/apk/MarketMix-Kenya.apk`;
 
 const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
@@ -553,24 +559,436 @@ function personalizeBulkMessage(template, { name } = {}) {
    AutoPromo — INLINED (no separate file needed)
    ═══════════════════════════════════════════════════════════════ */
 
-const AutoPromoTemplates = [
-  { id: "flash", emoji: "🔥",
-    text: `🔥 *FLASH DEAL*\n\nToday only at MarketMix Kenya:\n\n{{product}}\n\nLimited stock — first come, first served.\n\n🛍️ Shop: {{link}}` },
-  { id: "spotlight", emoji: "✨",
-    text: `✨ *TODAY'S PICK*\n\nHand-picked for you:\n\n{{product}}\n\nGrab it while it lasts.\n\n🛍️ {{link}}` },
-  { id: "newstock", emoji: "📦",
-    text: `📦 *JUST RESTOCKED*\n\nBack on the shelf:\n\n{{product}}\n\nOrder today → {{link}}` },
-  { id: "deal", emoji: "🎁",
-    text: `🎁 *DEAL OF THE DAY*\n\n{{product}}\n\nDon't sleep on this one.\n\n👉 {{link}}` },
-  { id: "hot", emoji: "⚡",
-    text: `⚡ *HOT ITEM*\n\nTrending at MarketMix right now:\n\n{{product}}\n\nShop → {{link}}` },
-  { id: "weekend", emoji: "🌿",
-    text: `🌿 *WEEKEND PICK*\n\nSomething we think you'll love:\n\n{{product}}\n\nFree delivery within Nairobi on orders above KES 2,000.\n\n{{link}}` },
-];
-
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
 let autoPromoTickTimer = null;
 let autoPromoRunning = false;
+
+/* ═══ AutoPromo v2 — context, campaign, template engine ═══ */
+
+// Time / day / payday helpers (EAT = UTC+3)
+function autoPromoNowEAT() {
+  return new Date(Date.now() + 3 * 60 * 60 * 1000);
+}
+function autoPromoHourEAT() { return autoPromoNowEAT().getUTCHours(); }
+function autoPromoDowEAT() { return autoPromoNowEAT().getUTCDay(); }
+function autoPromoMonthEAT() { return autoPromoNowEAT().getUTCMonth() + 1; }
+function autoPromoDayEAT() { return autoPromoNowEAT().getUTCDate(); }
+
+function autoPromoTimeBucket(hour) {
+  if (hour >= 5  && hour < 8)  return "early_morning";
+  if (hour >= 8  && hour < 11) return "morning";
+  if (hour >= 11 && hour < 14) return "midday";
+  if (hour >= 14 && hour < 17) return "afternoon";
+  if (hour >= 17 && hour < 20) return "evening";
+  return "night";
+}
+function autoPromoDayBucket(dow) {
+  if (dow === 1) return "monday";
+  if (dow === 2 || dow === 3) return "midweek";
+  if (dow === 4) return "almost_friday";
+  if (dow === 5) return "friday";
+  if (dow === 6) return "saturday";
+  return "sunday";
+}
+function autoPromoIsPayday() {
+  const day = autoPromoDayEAT();
+  return day >= 25 || day <= 5;
+}
+function autoPromoIsMonthEnd() {
+  const day = autoPromoDayEAT();
+  return day >= 28;
+}
+function autoPromoDetectGroupKind(groupName) {
+  const n = String(groupName || "").toLowerCase();
+  if (n.includes("seller") || n.includes("vendor") || n.includes("business")) return "sellers";
+  if (n.includes("deal") || n.includes("promo") || n.includes("offer")) return "deals";
+  if (n.includes("buyer") || n.includes("customer") || n.includes("shop")) return "buyers";
+  return "general";
+}
+
+// Campaign calendar — fixed-date Kenyan + shopping events.
+const AUTO_PROMO_CAMPAIGNS = [
+  { name: "New Year",            startMonth: 12, startDay: 27, endMonth: 1,  endDay: 3,  eventMonth: 1,  eventDay: 1  },
+  { name: "Back to School Jan",  startMonth: 12, startDay: 28, endMonth: 1,  endDay: 15, eventMonth: 1,  eventDay: 8  },
+  { name: "Valentine's",         startMonth: 2,  startDay: 7,  endMonth: 2,  endDay: 14, eventMonth: 2,  eventDay: 14 },
+  { name: "March Campus Intake", startMonth: 3,  startDay: 1,  endMonth: 3,  endDay: 31, eventMonth: 3,  eventDay: 31 },
+  { name: "Easter",              startMonth: 3,  startDay: 25, endMonth: 4,  endDay: 6,  eventMonth: 4,  eventDay: 4  },
+  { name: "Labour Day",          startMonth: 4,  startDay: 24, endMonth: 5,  endDay: 1,  eventMonth: 5,  eventDay: 1  },
+  { name: "Mother's Day",        startMonth: 5,  startDay: 3,  endMonth: 5,  endDay: 10, eventMonth: 5,  eventDay: 10 },
+  { name: "Madaraka Day",        startMonth: 5,  startDay: 25, endMonth: 6,  endDay: 1,  eventMonth: 6,  eventDay: 1  },
+  { name: "Father's Day",        startMonth: 6,  startDay: 14, endMonth: 6,  endDay: 21, eventMonth: 6,  eventDay: 21 },
+  { name: "Back to School Sep",  startMonth: 8,  startDay: 8,  endMonth: 8,  endDay: 15, eventMonth: 8,  eventDay: 15 },
+  { name: "Mazingira Day",       startMonth: 10, startDay: 3,  endMonth: 10, endDay: 10, eventMonth: 10, eventDay: 10 },
+  { name: "Mashujaa Day",        startMonth: 10, startDay: 13, endMonth: 10, endDay: 20, eventMonth: 10, eventDay: 20 },
+  { name: "Diwali",              startMonth: 10, startDay: 17, endMonth: 10, endDay: 24, eventMonth: 10, eventDay: 24 },
+  { name: "Halloween",           startMonth: 10, startDay: 24, endMonth: 10, endDay: 31, eventMonth: 10, eventDay: 31 },
+  { name: "Singles' Day",        startMonth: 11, startDay: 4,  endMonth: 11, endDay: 11, eventMonth: 11, eventDay: 11 },
+  { name: "Black Friday",        startMonth: 11, startDay: 20, endMonth: 11, endDay: 26, eventMonth: 11, eventDay: 26 },
+  { name: "Cyber Monday",        startMonth: 11, startDay: 24, endMonth: 11, endDay: 29, eventMonth: 11, eventDay: 29 },
+  { name: "Christmas",           startMonth: 12, startDay: 1,  endMonth: 12, endDay: 25, eventMonth: 12, eventDay: 25 },
+  { name: "Jamhuri Day",         startMonth: 12, startDay: 5,  endMonth: 12, endDay: 12, eventMonth: 12, eventDay: 12 },
+  { name: "New Year's Eve",      startMonth: 12, startDay: 24, endMonth: 12, endDay: 31, eventMonth: 12, eventDay: 31 },
+];
+
+function autoPromoGetActiveCampaign() {
+  const nowKey = autoPromoMonthEAT() * 100 + autoPromoDayEAT();
+  for (const c of AUTO_PROMO_CAMPAIGNS) {
+    const startKey = c.startMonth * 100 + c.startDay;
+    const endKey   = c.endMonth   * 100 + c.endDay;
+    const evtKey   = c.eventMonth * 100 + c.eventDay;
+
+    let inRange = false;
+    if (startKey <= endKey) inRange = nowKey >= startKey && nowKey <= endKey;
+    else                    inRange = nowKey >= startKey || nowKey <= endKey;
+
+    if (inRange) {
+      let daysToEvent;
+      if (nowKey <= evtKey) {
+        const nowMonth = Math.floor(nowKey / 100);
+        const evtMonth = Math.floor(evtKey / 100);
+        daysToEvent = (evtMonth - nowMonth) * 30 + (c.eventDay - autoPromoDayEAT());
+      } else {
+        daysToEvent = -1;
+      }
+      return { ...c, daysToEvent };
+    }
+  }
+  return null;
+}
+
+function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
+  if (groupKind === "sellers") return "T16";
+  if (groupKind === "deals")   return "T17";
+  if (campaign) {
+    if (campaign.daysToEvent >= 5) return "T11";
+    if (campaign.daysToEvent >= 2) return "T12";
+    if (campaign.daysToEvent === 1) return "T13";
+    if (campaign.daysToEvent === 0) return "T14";
+    if (campaign.daysToEvent <  0) return "T15";
+  }
+  if (payday && timeBucket === "morning") return "T6";
+  if (monthEnd) return "T7";
+  if (dayBucket === "friday" && (timeBucket === "afternoon" || timeBucket === "evening")) return "T8";
+  if (dayBucket === "saturday") return "T9";
+  if (dayBucket === "sunday" && (timeBucket === "afternoon" || timeBucket === "evening")) return "T10";
+  switch (timeBucket) {
+    case "morning":   return "T1";
+    case "midday":    return "T2";
+    case "afternoon": return "T3";
+    case "evening":   return "T4";
+    case "night":     return "T5";
+    default:          return "T1";
+  }
+}
+
+/* ═══ AutoPromo v2 — templates T1–T20 ═══ */
+
+const AUTO_FOOTER = (v) => [
+  "━━━━━━━━━━━━━━",
+  `💬 Order on WhatsApp → wa.me/${v.phone}`,
+  `👥 Join our group → ${v.groupLink}`,
+  "━━━━━━━━━━━━━━",
+].join("\n");
+
+const AutoPromoTemplates = {
+  T1: (v) => [
+    `☀️ *MORNING PICK*`, ``,
+    `Good morning ${v.groupName}! 👋`, ``,
+    `Today's handpicked item:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🔥 Was KES ${v.originalPrice} — *${v.discount}% OFF*` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ Shop → ${v.shopLink}`, ``,
+    AUTO_FOOTER(v), ``,
+    `✨ *MarketMix Kenya* — Shop smart. Shop local.`,
+  ].filter(Boolean).join("\n"),
+
+  T2: (v) => [
+    `🍽️ *LUNCHTIME DEAL*`, ``,
+    `Hey ${v.groupName} — quick one for your lunch break 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🔥 ${v.discount}% OFF — was KES ${v.originalPrice}` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T3: (v) => [
+    `🌤️ *AFTERNOON PICK*`, ``,
+    `${v.groupName} — something fresh just dropped 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🎯 Save ${v.discount}% — was KES ${v.originalPrice}` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T4: (v) => [
+    `🌆 *EVENING DEAL*`, ``,
+    `${v.groupName} — one to end the day with 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `⏰ ${v.discount}% off — was KES ${v.originalPrice}` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ Shop tonight → ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T5: (v) => [
+    `🌙 *TONIGHT'S PICK*`, ``,
+    `${v.groupName} — one to sleep on 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🌙 ${v.discount}% off tonight` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    `💬 wa.me/${v.phone}`,
+  ].filter(Boolean).join("\n"),
+
+  T6: (v) => [
+    `💸 *PAYDAY DEAL*`, ``,
+    `Good morning ${v.groupName}! 🎉`, ``,
+    `You earned it — treat yourself:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    v.hasDiscount ? `💰 Was KES ${v.originalPrice}` : `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `⚡ Now *KES ${v.price}* (${v.discount}% OFF)` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ Shop → ${v.shopLink}`, ``,
+    AUTO_FOOTER(v), ``,
+    `✨ *MarketMix Kenya* — Shop smart. Shop local.`,
+  ].filter(Boolean).join("\n"),
+
+  T7: (v) => [
+    `📦 *STOCK UP DEAL*`, ``,
+    `${v.groupName} — month-end essentials 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `📉 ${v.discount}% OFF` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T8: (v) => [
+    `🎉 *FRIDAY PICK*`, ``,
+    `It's Friday ${v.groupName} — you earned it 🥳`, ``,
+    `Something for the weekend 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🎁 ${v.discount}% OFF — was KES ${v.originalPrice}` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v), ``,
+    `✨ *MarketMix Kenya* — Weekend sorted.`,
+  ].filter(Boolean).join("\n"),
+
+  T9: (v) => [
+    `🛍️ *WEEKEND DEAL*`, ``,
+    `Happy weekend ${v.groupName}! 🎈`, ``,
+    `Perfect time to grab this 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `⚡ ${v.discount}% OFF` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T10: (v) => [
+    `🌿 *SUNDAY PREP*`, ``,
+    `${v.groupName} — ready for the week ahead?`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `📚 ${v.discount}% off` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T11: (v) => [
+    `🔔 *${v.eventName} is coming*`, ``,
+    `${v.groupName} — ${v.daysLeft} days to go!`, ``,
+    `Start planning. Here's our top pick for early shoppers:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T12: (v) => [
+    `⏳ *${v.daysLeft} days to ${v.eventName}*`, ``,
+    `${v.groupName} — the countdown is on 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🔥 ${v.discount}% OFF` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T13: (v) => [
+    `🚨 *${v.eventName} is TOMORROW*`, ``,
+    `${v.groupName} — last chance to get ready!`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ Order tonight → ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T14: (v) => [
+    `${v.emoji} *Happy ${v.eventName}!*`, ``,
+    `${v.groupName} — 🎊`, ``,
+    `Final picks available now:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `⚡ ${v.discount}% off` : null,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v), ``,
+    `✨ *MarketMix Kenya*`,
+  ].filter(Boolean).join("\n"),
+
+  T15: (v) => [
+    `👋 *After ${v.eventName}*`, ``,
+    `${v.groupName} — hope it was great!`, ``,
+    `Still looking? A few related picks:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    `💬 wa.me/${v.phone}`,
+  ].filter(Boolean).join("\n"),
+
+  T16: (v) => [
+    `📊 *SELLER SPOTLIGHT*`, ``,
+    `Fellow sellers — a product your customers are asking about:`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 Retail: *KES ${v.price}*`,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `👀 Buyers searching for this NOW.`,
+    `🛍️ See listing → ${v.shopLink}`, ``,
+    `💬 wa.me/${v.phone}`,
+    `👥 ${v.groupLink}`,
+  ].filter(Boolean).join("\n"),
+
+  T17: (v) => [
+    `⚡ *DEAL ALERT*`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `💰 *KES ${v.price}*`,
+    v.hasDiscount ? `🔥 ${v.discount}% OFF` : null,
+    `━━━━━━━━━━━━━━`, ``,
+    `📝 ${v.shortDescription}`, ``,
+    `⏰ Limited stock`,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v),
+  ].filter(Boolean).join("\n"),
+
+  T18: (v) => [
+    `✨ *FEATURED PICK*`, ``,
+    `${v.groupName} — today's pick 👇`, ``,
+    `━━━━━━━━━━━━━━`,
+    `${v.emoji} *${v.productName}*`,
+    `━━━━━━━━━━━━━━`,
+    `💰 *KES ${v.price}*`,
+    ``, `📝 ${v.shortDescription}`, ``,
+    `🛍️ ${v.shopLink}`, ``,
+    AUTO_FOOTER(v), ``,
+    `✨ *MarketMix Kenya* — Featured today.`,
+  ].filter(Boolean).join("\n"),
+
+  T19: () => [
+    `💚 *A gentle reminder*`, ``,
+    `You never know what someone is carrying today.`, ``,
+    `A little kindness can matter more than you realise.`, ``,
+    `Check on your people. And be kind to yourself too.`, ``,
+    `━━━━━━━━━━━━━━`,
+    `💚 From all of us at *MarketMix Kenya*`,
+    `💬 wa.me/${ORDERS_PHONE}`,
+    `👥 ${WHATSAPP_GROUP_URL}`,
+    `━━━━━━━━━━━━━━`,
+  ].join("\n"),
+
+  T20: (v) => [
+    `🌿 *${v.dayOfWeek || "Today"}'s Reminder*`, ``,
+    `You don't have to fix everything this week.`, ``,
+    `Pick one thing that matters.`,
+    `Start there.`, ``,
+    `Small progress is still progress.`, ``,
+    `━━━━━━━━━━━━━━`,
+    `💚 With care, *MarketMix Kenya*`,
+    `💬 wa.me/${ORDERS_PHONE}`,
+    `👥 ${WHATSAPP_GROUP_URL}`,
+    `━━━━━━━━━━━━━━`,
+  ].join("\n"),
+};
+
+function autoPromoFillTemplate(templateId, ctx) {
+  const { product, campaign, groupName, productUrl } = ctx;
+  const priceNum = Number(product?.price || 0);
+  const originalNum = Number(product?.originalPrice || 0);
+  const discountPct = originalNum > priceNum && originalNum > 0
+    ? Math.round(((originalNum - priceNum) / originalNum) * 100)
+    : 0;
+  const shortDesc = String(product?.description || "Fresh stock available now.")
+    .replace(/\s+/g, " ").trim().slice(0, 160);
+
+  const vars = {
+    productName: product?.name || "MarketMix pick",
+    price: priceNum.toLocaleString("en-KE"),
+    originalPrice: originalNum > 0 ? originalNum.toLocaleString("en-KE") : priceNum.toLocaleString("en-KE"),
+    discount: discountPct,
+    hasDiscount: discountPct > 0,
+    shortDescription: shortDesc,
+    shopLink: productUrl,
+    phone: ORDERS_PHONE,
+    groupLink: WHATSAPP_GROUP_URL,
+    eventName: campaign?.name || "the season",
+    daysLeft: String(Math.max(0, campaign?.daysToEvent ?? 0)),
+    groupName: groupName || "MarketMix Family",
+    emoji: "🛍️",
+    dayOfWeek: ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][autoPromoDowEAT()],
+  };
+  const fn = AutoPromoTemplates[templateId] || AutoPromoTemplates.T1;
+  return fn(vars);
+}
 
 function autoPromoFmtProduct(p) {
   const name = p.name || "Special pick";
@@ -629,6 +1047,47 @@ async function autoPromoCountTodaySends(groupId) {
   return snap.size;
 }
 
+async function autoPromoPickProduct({ group, forceProductId = null, days7Window = true }) {
+  let recentIds = new Set();
+  if (days7Window) {
+    try {
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const snap = await db.collection("autoPromoLogs")
+        .where("groupId", "==", group.id)
+        .where("sentAt", ">=", cutoff)
+        .get();
+      snap.forEach(d => { const x = d.data(); if (x.productId) recentIds.add(x.productId); });
+    } catch (_) {}
+  }
+
+  if (forceProductId) {
+    const s = await db.collection("products").doc(forceProductId).get();
+    if (s.exists) return { id: s.id, ...s.data() };
+  }
+
+  const pSnap = await db.collection("products").get();
+  const all = pSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const inStock = all.filter(p => {
+    const qty = Number(p.quantity) || 0;
+    const variantStock = Array.isArray(p.variants) ? p.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0) : 0;
+    return (qty > 0 || variantStock > 0) && p.isPublished !== false;
+  });
+
+  const scored = inStock.map(p => {
+    let score = 0;
+    if (p.images?.[0]) score += 5;
+    if (p.originalPrice && Number(p.originalPrice) > Number(p.price)) score += 4;
+    const createdAt = p.createdAt?.toDate ? p.createdAt.toDate() : (p.createdAt ? new Date(p.createdAt) : null);
+    if (createdAt && (Date.now() - createdAt.getTime()) < 14 * 24 * 60 * 60 * 1000) score += 3;
+    score += recentIds.has(p.id) ? -4 : 6;
+    return { p, score };
+  }).sort((a, b) => b.score - a.score);
+
+  if (!scored.length) return null;
+  const top = scored.slice(0, 5);
+  return autoPromoPickRandom(top, 1)[0].p;
+}
+
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
   autoPromoRunning = true;
@@ -636,9 +1095,9 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     const settings = await autoPromoLoadSettings();
     if (!settings.enabled) return { skipped: "disabled" };
 
-    const eatHour = (new Date().getUTCHours() + 3) % 24;
-    if (eatHour < settings.activeHours.start || eatHour >= settings.activeHours.end) {
-      return { skipped: `outside-hours (${eatHour}h EAT)` };
+    const hourEAT = autoPromoHourEAT();
+    if (hourEAT < settings.activeHours.start || hourEAT >= settings.activeHours.end) {
+      return { skipped: `outside-hours (${hourEAT}h EAT)` };
     }
 
     let groups = [];
@@ -647,122 +1106,118 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       const data = await r.json().catch(() => ({}));
       const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
       groups = list
-        .filter((g) => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
-        .map((g) => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
+        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
+        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
     } catch (e) {
-      console.error("🤖 AutoPromo: failed to fetch groups:", e.message);
-      return { error: "groups-fetch-failed" };
+      return { error: "groups-fetch-failed", detail: e.message };
     }
 
     if (Array.isArray(forceGroupIds) && forceGroupIds.length > 0) {
       const allowed = new Set(forceGroupIds);
-      groups = groups.filter((g) => allowed.has(g.id));
-      const missing = forceGroupIds.filter((id) => !groups.find((g) => g.id === id));
+      groups = groups.filter(g => allowed.has(g.id));
+      const missing = forceGroupIds.filter(id => !groups.find(g => g.id === id));
       for (const id of missing) groups.push({ id, name: "(forced)" });
     }
 
     if (!groups.length) return { skipped: "no-groups" };
 
-    let products = [];
-    if (forceProductId) {
-      const snap = await db.collection("products").doc(forceProductId).get();
-      if (snap.exists) products = [{ id: snap.id, ...snap.data() }];
-    }
-    if (!products.length) {
-      const pSnap = await db.collection("products").get();
-      products = pSnap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((p) => {
-          const inStock =
-            (Number(p.quantity) || 0) > 0 ||
-            (Array.isArray(p.variants) && p.variants.some((v) => (Number(v.stock) || 0) > 0));
-          return inStock && (p.isPublished !== false);
-        });
-    }
+    const campaign = autoPromoGetActiveCampaign();
+    const timeBucket = autoPromoTimeBucket(hourEAT);
+    const dayBucket = autoPromoDayBucket(autoPromoDowEAT());
+    const payday = autoPromoIsPayday();
+    const monthEnd = autoPromoIsMonthEnd();
 
-    if (!products.length) return { skipped: "no-products" };
-
-    const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 4));
+    const bypassCap = !!(forceGroupIds || forceProductId);
+    const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 5));
 
     const result = {
       tick: new Date().toISOString(),
+      hourEAT,
+      campaign: campaign?.name || null,
+      campaignDaysToEvent: campaign?.daysToEvent ?? null,
+      timeBucket, dayBucket, payday, monthEnd,
       groupsConsidered: groups.length,
-      productsAvailable: products.length,
-      perGroupPerDay,
-      forcedProduct: forceProductId || null,
-      forcedGroups: Array.isArray(forceGroupIds) ? forceGroupIds.length : 0,
       sent: 0,
       skippedGroups: [],
       messages: [],
     };
 
-    const bypassCap = !!(forceGroupIds || forceProductId);
-    const perTick = bypassCap ? Math.min(perGroupPerDay, WA_MAX_PER_RUN) : Math.max(1, Math.ceil(perGroupPerDay / 4));
-
     for (const group of groups) {
       if (!bypassCap) {
         const alreadySent = await autoPromoCountTodaySends(group.id);
-        const remaining = perGroupPerDay - alreadySent;
-        if (remaining <= 0) {
-          result.skippedGroups.push({ id: group.id, reason: "daily-cap-reached" });
+        if (alreadySent >= perGroupPerDay) {
+          result.skippedGroups.push({ id: group.id, reason: "daily-cap" });
           continue;
         }
       }
 
-      const toSend = Math.min(perTick, WA_MAX_PER_RUN);
-      const chosenProducts = autoPromoPickRandom(products, toSend);
-      const gapMs = 30 * 1000 + Math.random() * 45 * 1000;
+      const kind = autoPromoDetectGroupKind(group.name);
+      const templateId = autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
 
-      for (let i = 0; i < chosenProducts.length; i++) {
-        const p = chosenProducts[i];
-        const tpl = AutoPromoTemplates[Math.floor(Math.random() * AutoPromoTemplates.length)];
-        const productBlock = autoPromoFmtProduct(p);
-        const link = `${settings.siteUrl}/product/${p.slug || p.id}`;
-        const text = tpl.text
-          .replace(/\{\{\s*product\s*\}\}/gi, productBlock.text)
-          .replace(/\{\{\s*link\s*\}\}/gi, link);
+      const product = await autoPromoPickProduct({ group, forceProductId });
+      if (!product) {
+        result.skippedGroups.push({ id: group.id, reason: "no-product" });
+        continue;
+      }
 
-        try {
-          enqueueWhatsApp(group.id, text, {
+      const productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+      const caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
+
+      try {
+        if (product.images?.[0]) {
+          enqueueWhatsAppImage(group.id, product.images[0], caption, {
             kind: "auto-promo",
+            templateId,
+            campaign: campaign?.name || null,
+            productId: product.id,
             groupName: group.name,
-            productId: p.id,
-            template: tpl.id,
           });
-          await db.collection("autoPromoLogs").add({
-            groupId: group.id,
+        } else {
+          enqueueWhatsApp(group.id, caption, {
+            kind: "auto-promo",
+            templateId,
+            campaign: campaign?.name || null,
+            productId: product.id,
             groupName: group.name,
-            productId: p.id,
-            productName: p.name || null,
-            template: tpl.id,
-            status: "sent",
-            sentAt: admin.firestore.FieldValue.serverTimestamp(),
-            preview: text.slice(0, 240),
-            forced: bypassCap,
           });
-          result.sent++;
-          result.messages.push({ group: group.name, product: p.name, template: tpl.id });
-        } catch (e) {
-          await db.collection("autoPromoLogs").add({
-            groupId: group.id,
-            groupName: group.name,
-            productId: p.id,
-            template: tpl.id,
-            status: "failed",
-            error: e.message,
-            sentAt: admin.firestore.FieldValue.serverTimestamp(),
-            forced: bypassCap,
-          }).catch(() => {});
-          console.error("🤖 AutoPromo send failed:", e.message);
         }
 
-        if (i < chosenProducts.length - 1) {
-          await new Promise((r) => setTimeout(r, gapMs));
-        }
+        await db.collection("autoPromoLogs").add({
+          groupId: group.id,
+          groupName: group.name,
+          productId: product.id,
+          productName: product.name || null,
+          templateId,
+          campaign: campaign?.name || null,
+          status: "sent",
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          preview: caption.slice(0, 240),
+          forced: bypassCap,
+        });
+
+        result.sent++;
+        result.messages.push({ group: group.name, product: product.name, templateId });
+      } catch (e) {
+        await db.collection("autoPromoLogs").add({
+          groupId: group.id,
+          groupName: group.name,
+          productId: product.id,
+          templateId,
+          status: "failed",
+          error: e.message,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          forced: bypassCap,
+        }).catch(() => {});
+        result.skippedGroups.push({ id: group.id, reason: "send-failed" });
+      }
+
+      if (result.sent < WA_MAX_PER_RUN && groups.indexOf(group) < groups.length - 1) {
+        const gapMs = 30 * 1000 + Math.random() * 45 * 1000;
+        await new Promise(r => setTimeout(r, gapMs));
       }
     }
 
-    console.log(`🤖 AutoPromo tick → ${result.sent} message(s) sent` + (bypassCap ? " (forced)" : ""));
+    console.log(`🤖 AutoPromo tick → ${result.sent} sent (campaign=${result.campaign || "none"})`);
     return result;
   } catch (e) {
     console.error("🤖 AutoPromo tick crashed:", e);
@@ -2172,16 +2627,18 @@ app.get("/api/whatsapp/groups", async (req, res) => {
   }
 });
 
-/* FIX #7 — AutoPromo admin endpoints (uses inlined AutoPromo helpers) */
+/* FIX #7 — AutoPromo admin endpoints (uses inlined AutoPromo v2 helpers) */
 app.get("/api/admin/auto-promo", async (req, res) => {
   try {
     const settings = await autoPromoLoadSettings();
     const recent = await db.collection("autoPromoLogs")
       .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
+    const campaign = autoPromoGetActiveCampaign();
     return res.json({
       success: true,
       settings,
-      templates: AutoPromoTemplates.map(t => ({ id: t.id, emoji: t.emoji, text: t.text })),
+      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
+      templates: Object.keys(AutoPromoTemplates).map(id => ({ id })),
       recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   } catch (e) {
@@ -3567,6 +4024,9 @@ app.get("/_health", (req, res) => {
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
       inlined: true,
+      version: "v2",
+      templates: Object.keys(AutoPromoTemplates),
+      campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
     },
     endpoints: [
       "/api/whatsapp/notify",
@@ -3603,7 +4063,9 @@ app.get("/_health", (req, res) => {
       "FIX #4 — /api/test-whatsapp-notify-image test endpoint",
       "FIX #5 — normalizeWaChatId + @g.us on all send paths",
       "FIX #6 — GET /api/whatsapp/groups (NOWEB /api/default/groups)",
-      "FIX #7 — AutoPromo scheduler + admin endpoints (INLINED in server.js)",
+      "FIX #7 — AutoPromo scheduler + admin endpoints (INLINED in server.js v2)",
+      "FIX #8 — AutoPromo v2 campaign calendar, time/day buckets, 20 templates (T1–T20)",
+      "FIX #9 — Admin 7am/7pm EAT flash-sales nudge (adminFlashNudgeTick)",
     ],
     uptime: process.uptime(),
   });
@@ -3655,6 +4117,65 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 // Start AutoPromo scheduler (inlined)
 autoPromoStartScheduler({ SCAN_MS: 15 * 60 * 1000 });
 
+// ============================
+// Admin flash-sales nudge (7am & 7pm EAT)
+// ============================
+let adminFlashNudgeLastKey = null;
+const ADMIN_FLASH_NUDGE_HOURS = [7, 19];
+
+async function adminFlashNudgeTick() {
+  try {
+    const hourEAT = autoPromoHourEAT();
+    const dateKey = autoPromoNowEAT().toISOString().slice(0, 10);
+    if (!ADMIN_FLASH_NUDGE_HOURS.includes(hourEAT)) return;
+    const key = `${dateKey}-${hourEAT}`;
+    if (adminFlashNudgeLastKey === key) return;
+
+    const hpSnap = await db.collection("homepage").doc("content").get();
+    const hp = hpSnap.exists ? hpSnap.data() : {};
+    const sales = Array.isArray(hp.flashSales) ? hp.flashSales : [];
+    const nowD = new Date();
+    const active = sales.filter(s => {
+      const st = s.startDate?.toDate ? s.startDate.toDate() : new Date(s.startDate);
+      const en = s.endDate?.toDate ? s.endDate.toDate() : new Date(s.endDate);
+      return st <= nowD && en >= nowD;
+    });
+
+    const campaign = autoPromoGetActiveCampaign();
+    const adminUrl = `${WEBSITE_URL.replace(/\/$/, "")}/admin/dashboard/flash-sales`;
+
+    let body;
+    if (active.length === 0) {
+      body = [
+        "🚨 *FLASH SALES NEED ATTENTION*", "",
+        "0 active flash sales right now.",
+        "Homepage rail is empty.",
+        campaign ? `\nToday's campaign: *${campaign.name}*` : "",
+        `\n👉 ${adminUrl}`,
+      ].filter(Boolean).join("\n");
+    } else {
+      const manual = active.filter(s => !s.autoCreated).length;
+      const auto = active.filter(s => s.autoCreated).length;
+      body = [
+        "📊 *Daily Flash Sales Check-In*", "",
+        `✅ Active: *${active.length}* (${manual} manual, ${auto} auto)`,
+        campaign ? `🎯 Today's campaign: *${campaign.name}*` : "",
+        `\n👉 ${adminUrl}`,
+      ].filter(Boolean).join("\n");
+    }
+
+    enqueueWhatsApp(ADMIN_PHONE, body, { kind: "admin-flash-nudge", hourEAT });
+    adminFlashNudgeLastKey = key;
+    console.log(`📣 Admin flash nudge sent (hour=${hourEAT})`);
+  } catch (e) {
+    console.error("📣 Admin nudge failed:", e.message);
+  }
+}
+
+setInterval(adminFlashNudgeTick, 5 * 60 * 1000).unref?.();
+setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
+console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
+
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
@@ -3673,7 +4194,9 @@ const server = app.listen(PORT, () => {
   console.log(`🖼️ WhatsApp image notify: ✅`);
   console.log(`👥 WhatsApp group picker: ✅`);
   console.log(`🆔 Group-aware chatId: ✅`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (inlined)`);
+  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2)`);
+  console.log(`🎯 AutoPromo campaign calendar: ✅ (${AUTO_PROMO_CAMPAIGNS.length} campaigns)`);
+  console.log(`📝 AutoPromo templates: ✅ (${Object.keys(AutoPromoTemplates).length} templates T1–T20)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
@@ -3681,6 +4204,9 @@ const server = app.listen(PORT, () => {
   console.log(`🎉 Welcome subscriber WhatsApp: ✅`);
   console.log(`🔗 Group invite on buyer/onboarding templates`);
   console.log(`📊 Inventory movements logged on /api/update-stock`);
+  console.log(`📣 Admin flash nudge: ✅ (7am & 7pm EAT)`);
+  console.log(`📞 Admin WhatsApp: ${ADMIN_PHONE}`);
+  console.log(`📞 Orders WhatsApp: ${ORDERS_PHONE}`);
 });
 
 const shutdown = () => {
