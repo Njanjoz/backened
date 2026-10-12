@@ -296,10 +296,6 @@ function normalizePhoneForWa(phoneNumber) {
 
 /* ═══════════════════════════════════════════════════════════════
    FIX #5 — GROUP-AWARE CHAT ID NORMALIZER
-   WHAT: Accepts either a phone number OR a WhatsApp group id
-         ("...@g.us") and returns the right chatId-ready string.
-   WHY:  Admin group picker sends back @g.us ids; the send paths
-         previously assumed every input was a phone.
    ═══════════════════════════════════════════════════════════════ */
 function normalizeWaChatId(input) {
   if (!input) return null;
@@ -1908,23 +1904,44 @@ app.post("/api/re/welcome", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   FIX #6 — GROUP PICKER ROUTE
-   WHAT: Lists WhatsApp groups via WAHA so the admin promote page
-         can populate its group picker.
-   WHERE: immediately above /api/whatsapp/send-media
+   FIX #6 — GROUP PICKER ROUTE (NOWEB engine, object-keyed response)
+   WHAT: WAHA NOWEB engine serves groups at /api/{session}/groups,
+         NOT /api/chats. Response is an object keyed by group id,
+         and the display name field is `subject`.
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/whatsapp/groups", async (req, res) => {
   try {
-    const r = await wahaFetch("/api/chats?session=default", { timeoutMs: 20000 });
-    const data = await r.json().catch(() => []);
-    const groups = Array.isArray(data)
-      ? data
-          .filter((c) => c && c.id && String(c.id).endsWith("@g.us"))
-          .map((c) => ({
-            id: c.id,
-            name: c.name || c.subject || "(unnamed group)",
-          }))
-      : [];
+    const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+    const raw = await r.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+
+    if (!r.ok) {
+      console.error(`❌ WAHA /api/default/groups → ${r.status}: ${raw.slice(0, 300)}`);
+      return res.status(r.status).json({
+        success: false,
+        message: "WAHA returned an error",
+        wahaStatus: r.status,
+        wahaBody: raw.slice(0, 500),
+      });
+    }
+
+    // NOWEB returns an object keyed by group id, not an array.
+    let list = [];
+    if (Array.isArray(data)) {
+      list = data;
+    } else if (data && typeof data === "object") {
+      list = Object.values(data);
+    }
+
+    const groups = list
+      .filter((c) => c && (c.id || c.chatId) && String(c.id || c.chatId).endsWith("@g.us"))
+      .map((c) => ({
+        id: c.id || c.chatId,
+        name: c.subject || c.name || "(unnamed group)",
+        size: c.size || null,
+      }));
+
     console.log(`👥 /api/whatsapp/groups → ${groups.length} group(s)`);
     return res.json({ success: true, count: groups.length, groups });
   } catch (e) {
@@ -3307,9 +3324,15 @@ app.get("/_health", (req, res) => {
     senders: SENDERS,
     whatsappQueue: waQueue.length,
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
+    whatsappGroups: {
+      route: "/api/whatsapp/groups",
+      wahaPath: "/api/default/groups",
+      engine: "NOWEB",
+      responseShape: "object keyed by group id",
+    },
     endpoints: [
       "/api/whatsapp/notify",
-      "/api/whatsapp/groups",                  // ← FIX #6: group picker
+      "/api/whatsapp/groups",
       "/api/whatsapp/welcome",
       "/api/whatsapp/send-media",
       "/api/service-request/notify",
@@ -3339,7 +3362,7 @@ app.get("/_health", (req, res) => {
       "FIX #3 — /api/whatsapp/notify now sends images with text fallback",
       "FIX #4 — /api/test-whatsapp-notify-image test endpoint added",
       "FIX #5 — normalizeWaChatId() + @g.us accepted on all send paths",
-      "FIX #6 — GET /api/whatsapp/groups for admin group picker",
+      "FIX #6 — /api/whatsapp/groups now uses /api/default/groups (NOWEB), accepts object-keyed response, reads `subject`",
     ],
     uptime: process.uptime(),
   });
@@ -3404,7 +3427,7 @@ const server = app.listen(PORT, () => {
   console.log(`🔔 Admin → user notifications: ✅`);
   console.log(`💬 WhatsApp notify endpoints: ✅`);
   console.log(`🖼️ WhatsApp image notify: ✅ (FIX #3)`);
-  console.log(`👥 WhatsApp group picker: ✅ (FIX #6)`);
+  console.log(`👥 WhatsApp group picker: ✅ (FIX #6 — /api/default/groups, NOWEB)`);
   console.log(`🆔 Group-aware chatId: ✅ (FIX #5)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
