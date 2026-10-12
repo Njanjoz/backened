@@ -14,6 +14,11 @@
 // NEW: Occasion Engine inlined at the bottom — a full-year ~90-occasion
 // library with date resolver, recurring weekly entries, movable religious
 // days, and `sensitive: true` protection that blocks promo content.
+//
+// NEW (2026-10):
+//   • Preview endpoint now respects perGroupPerDay + activeHours and merges
+//     occasion slots into the same timeline the scheduler will use.
+//   • Live scheduler de-dupes templates and products per group per day.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -660,6 +665,7 @@ function autoPromoGetActiveCampaign() {
   return null;
 }
 
+/* Legacy single-template picker (kept for backward compatibility). */
 function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
   if (groupKind === "sellers") return "T16";
   if (groupKind === "deals")   return "T17";
@@ -683,6 +689,43 @@ function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, mont
     case "night":     return "T5";
     default:          return "T1";
   }
+}
+
+/* NEW — ordered pool of template IDs appropriate for this moment.
+   The caller picks the first one not already used today. */
+function autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
+  if (groupKind === "sellers") return ["T16", "T17", "T18", "T1", "T3", "T8", "T9", "T10"];
+  if (groupKind === "deals")   return ["T17", "T16", "T18", "T2", "T3", "T4", "T9"];
+
+  const pool = [];
+
+  if (campaign) {
+    const d = campaign.daysToEvent;
+    if (d >= 5)       pool.push("T11", "T18", "T3",  "T9",  "T17");
+    else if (d >= 2)  pool.push("T12", "T11", "T17", "T3",  "T4");
+    else if (d === 1) pool.push("T13", "T12", "T17", "T4",  "T5");
+    else if (d === 0) pool.push("T14", "T18", "T1",  "T2",  "T3", "T4");
+    else if (d < 0)   pool.push("T15", "T18", "T3",  "T4",  "T9");
+  }
+
+  if (payday && timeBucket === "morning") pool.push("T6", "T1");
+  if (monthEnd) pool.push("T7", "T3");
+  if (dayBucket === "friday" && (timeBucket === "afternoon" || timeBucket === "evening")) pool.push("T8", "T9");
+  if (dayBucket === "saturday") pool.push("T9", "T18");
+  if (dayBucket === "sunday" && (timeBucket === "afternoon" || timeBucket === "evening")) pool.push("T10", "T20");
+
+  switch (timeBucket) {
+    case "early_morning":
+    case "morning":   pool.push("T1", "T18", "T17", "T2"); break;
+    case "midday":    pool.push("T2", "T17", "T18", "T3"); break;
+    case "afternoon": pool.push("T3", "T18", "T17", "T4"); break;
+    case "evening":   pool.push("T4", "T18", "T17", "T5"); break;
+    case "night":     pool.push("T5", "T19", "T20", "T18"); break;
+    default:          pool.push("T1", "T3", "T4");
+  }
+
+  const seen = new Set();
+  return pool.filter(id => { if (seen.has(id)) return false; seen.add(id); return true; });
 }
 
 /* ═══ AutoPromo v2 — templates T1–T20 ═══ */
@@ -1051,7 +1094,41 @@ async function autoPromoCountTodaySends(groupId) {
   return snap.size;
 }
 
-async function autoPromoPickProduct({ group, forceProductId = null, days7Window = true }) {
+/* NEW — templates already sent to this group today. */
+async function autoPromoTemplatesUsedToday(groupId) {
+  const used = new Set();
+  try {
+    const now = new Date();
+    const eat = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+    const startEAT = new Date(Date.UTC(eat.getUTCFullYear(), eat.getUTCMonth(), eat.getUTCDate(), 0, 0, 0) - 3 * 60 * 60 * 1000);
+    const snap = await db.collection("autoPromoLogs")
+      .where("groupId", "==", groupId)
+      .where("sentAt", ">=", startEAT)
+      .where("status", "==", "sent")
+      .get();
+    snap.forEach(d => { const x = d.data(); if (x.templateId) used.add(x.templateId); });
+  } catch (_) {}
+  return used;
+}
+
+/* NEW — products already sent to this group today. */
+async function autoPromoProductsUsedToday(groupId) {
+  const used = new Set();
+  try {
+    const now = new Date();
+    const eat = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+    const startEAT = new Date(Date.UTC(eat.getUTCFullYear(), eat.getUTCMonth(), eat.getUTCDate(), 0, 0, 0) - 3 * 60 * 60 * 1000);
+    const snap = await db.collection("autoPromoLogs")
+      .where("groupId", "==", groupId)
+      .where("sentAt", ">=", startEAT)
+      .where("status", "==", "sent")
+      .get();
+    snap.forEach(d => { const x = d.data(); if (x.productId) used.add(x.productId); });
+  } catch (_) {}
+  return used;
+}
+
+async function autoPromoPickProduct({ group, forceProductId = null, days7Window = true, excludeProductIds = null }) {
   let recentIds = new Set();
   if (days7Window) {
     try {
@@ -1069,6 +1146,9 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
     if (s.exists) return { id: s.id, ...s.data() };
   }
 
+  /* Same-day exclusions — never pick the same product twice in one EAT day. */
+  const sameDay = excludeProductIds instanceof Set ? excludeProductIds : new Set();
+
   const pSnap = await db.collection("products").get();
   const all = pSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   const inStock = all.filter(p => {
@@ -1077,7 +1157,11 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
     return (qty > 0 || variantStock > 0) && p.isPublished !== false;
   });
 
-  const scored = inStock.map(p => {
+  let candidates = inStock.filter(p => !sameDay.has(p.id));
+  if (!candidates.length) candidates = inStock;
+  if (!candidates.length) return null;
+
+  const scored = candidates.map(p => {
     let score = 0;
     if (p.images?.[0]) score += 5;
     if (p.originalPrice && Number(p.originalPrice) > Number(p.price)) score += 4;
@@ -1156,9 +1240,19 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       }
 
       const kind = autoPromoDetectGroupKind(group.name);
-      const templateId = autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
 
-      const product = await autoPromoPickProduct({ group, forceProductId });
+      /* Same-day de-dupe: fetch what this group has already seen today. */
+      const usedTodayTemplates = await autoPromoTemplatesUsedToday(group.id);
+      const usedTodayProducts  = await autoPromoProductsUsedToday(group.id);
+
+      const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
+      const templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
+
+      const product = await autoPromoPickProduct({
+        group,
+        forceProductId,
+        excludeProductIds: usedTodayProducts,
+      });
       if (!product) {
         result.skippedGroups.push({ id: group.id, reason: "no-product" });
         continue;
@@ -1570,19 +1664,11 @@ function occasionDayKey(month, day) {
   return month * 100 + day;
 }
 
-/**
- * Resolve which occasions apply on a given EAT date.
- * - Fixed-date occasions matched by month + day.
- * - Movable occasions only matched if a `resolvedDate` map is passed in
- *   (you set the actual date for each calendar year).
- * - Recurring weekly entries matched separately by weekday.
- * - `sensitive: true` entries strip promo content.
- */
 function resolveOccasionsForDate({
   month,
   day,
   weekday = null,
-  movableDates = {}, // e.g. { easter: { month: 4, day: 5, year: 2026 }, ... }
+  movableDates = {},
   includeRecurring = false,
   year = null,
 } = {}) {
@@ -1616,10 +1702,6 @@ function resolveOccasionsForDate({
   return { dated: fixed, recurring };
 }
 
-/**
- * Build the final WhatsApp message for an occasion.
- * Respects `sensitive: true` (never returns promo) and `kind`.
- */
 function buildOccasionMessage(occasion, { shopLink, name } = {}) {
   if (!occasion) return null;
   const isSensitive = occasion.sensitive === true;
@@ -1644,7 +1726,7 @@ async function occasionLoadSettings() {
     sendRecurring: true,
     activeHours: { start: 7, end: 21 },
     siteUrl: WEBSITE_URL,
-    movableDates: {}, // admin-supplied per-year dates
+    movableDates: {},
   };
   if (!snap.exists) return defaults;
   return { ...defaults, ...snap.data() };
@@ -1733,9 +1815,6 @@ async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dr
     const allOccasions = settings.sendDated === false ? [] : occasions;
 
     for (const occ of allOccasions) {
-      if (occ.sensitive && settings.allowPromoOnSensitive === false) {
-        // already handled by buildOccasionMessage
-      }
       const alreadySent = await occasionWasSentToday(occ.key);
       if (alreadySent && !forceOccasionKey) {
         result.results.push({ occasionKey: occ.key, skipped: "already-sent-today" });
@@ -1814,7 +1893,6 @@ async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dr
           });
         }
 
-        // small gap to be gentle on WAHA
         await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));
       }
     }
@@ -3232,7 +3310,7 @@ app.get("/api/whatsapp/groups", async (req, res) => {
   }
 });
 
-/* FIX #7 — AutoPromo admin endpoints (uses inlined AutoPromo v2 helpers) */
+/* FIX #7 — AutoPromo admin endpoints */
 app.get("/api/admin/auto-promo", async (req, res) => {
   try {
     const settings = await autoPromoLoadSettings();
@@ -3265,14 +3343,16 @@ app.post("/api/admin/auto-promo", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTO-PROMO PREVIEW — generates tomorrow's plan without sending
+   AUTO-PROMO PREVIEW — merged product + occasion timeline,
+   respects perGroupPerDay and activeHours, no hardcoded 5 slots.
    ═══════════════════════════════════════════════════════════════ */
 app.post("/api/admin/auto-promo/preview", async (req, res) => {
   try {
     const { date = null, groupIds = null } = req.body || {};
-    const settings = await autoPromoLoadSettings();
+    const autoSettings = await autoPromoLoadSettings();
+    const occSettings  = await occasionLoadSettings();
 
-    /* Groups */
+    /* ── Groups ── */
     let groups = [];
     try {
       const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
@@ -3284,13 +3364,44 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     } catch (e) {
       return sendServerError(res, e, "Could not fetch groups");
     }
-
     if (Array.isArray(groupIds) && groupIds.length > 0) {
       const allowed = new Set(groupIds);
       groups = groups.filter(g => allowed.has(g.id));
     }
 
-    /* Products */
+    /* ── Target date (EAT semantics — treat as UTC day) ── */
+    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const month = targetDate.getUTCMonth() + 1;
+    const day   = targetDate.getUTCDate();
+    const dow   = targetDate.getUTCDay();
+    const year  = targetDate.getUTCFullYear();
+
+    /* ── Auto-promo product slots ── */
+    const perGroupPerDay = Math.min(
+      AUTO_PROMO_MAX_PER_GROUP_PER_DAY,
+      Math.max(1, Number(autoSettings.perGroupPerDay) || 4)
+    );
+    const { start: hourStart, end: hourEnd } = autoSettings.activeHours || { start: 8, end: 21 };
+
+    const hourPool = [];
+    for (let h = hourStart; h < hourEnd; h++) hourPool.push(h);
+
+    const autoSlotHours = [];
+    if (hourPool.length && perGroupPerDay > 0) {
+      const step = hourPool.length / perGroupPerDay;
+      for (let i = 0; i < perGroupPerDay; i++) {
+        const idx = Math.min(hourPool.length - 1, Math.floor(i * step));
+        if (!autoSlotHours.includes(hourPool[idx])) autoSlotHours.push(hourPool[idx]);
+      }
+      /* If rounding collapsed two picks, fill from the remaining pool */
+      while (autoSlotHours.length < perGroupPerDay) {
+        const next = hourPool.find(h => !autoSlotHours.includes(h));
+        if (next === undefined) break;
+        autoSlotHours.push(next);
+      }
+    }
+
+    /* ── Products ── */
     const pSnap = await db.collection("products").get();
     const products = pSnap.docs
       .map(d => ({ id: d.id, ...d.data() }))
@@ -3302,29 +3413,21 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         return (qty > 0 || variantStock > 0) && p.isPublished !== false;
       });
 
-    /* Simulate the 5 daily slots */
-    const SLOT_HOURS = [8, 11, 14, 17, 20];
-    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const month = targetDate.getUTCMonth() + 1;
-    const day = targetDate.getUTCDate();
-    const dow = targetDate.getUTCDay();
-
-    /* Campaign lookup for that date */
+    /* ── Campaign lookup for that date ── */
     const nowKey = month * 100 + day;
     let campaign = null;
     for (const c of AUTO_PROMO_CAMPAIGNS) {
       const startKey = c.startMonth * 100 + c.startDay;
-      const endKey = c.endMonth * 100 + c.endDay;
-      const evtKey = c.eventMonth * 100 + c.eventDay;
+      const endKey   = c.endMonth   * 100 + c.endDay;
+      const evtKey   = c.eventMonth * 100 + c.eventDay;
       let inRange = false;
       if (startKey <= endKey) inRange = nowKey >= startKey && nowKey <= endKey;
-      else inRange = nowKey >= startKey || nowKey <= endKey;
+      else                    inRange = nowKey >= startKey || nowKey <= endKey;
       if (inRange) {
         const evtMonth = Math.floor(evtKey / 100);
-        const evtDay = c.eventDay;
         const nowMonth = Math.floor(nowKey / 100);
         const daysToEvent = nowKey <= evtKey
-          ? (evtMonth - nowMonth) * 30 + (evtDay - day)
+          ? (evtMonth - nowMonth) * 30 + (c.eventDay - day)
           : -1;
         campaign = { ...c, daysToEvent };
         break;
@@ -3336,57 +3439,93 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       : dow === 4 ? "almost_friday"
       : dow === 5 ? "friday"
       : dow === 6 ? "saturday" : "sunday";
-    const payday = day >= 25 || day <= 5;
+    const payday   = day >= 25 || day <= 5;
     const monthEnd = day >= 28;
 
-    const slots = [];
+    const autoSlots = [];
     const usedProducts = new Set();
+    const usedTemplates = new Set();
 
-    for (const hour of SLOT_HOURS) {
+    for (const hour of autoSlotHours) {
       const timeBucket = autoPromoTimeBucket(hour);
       const kind = groups[0] ? autoPromoDetectGroupKind(groups[0].name) : "general";
-      const templateId = autoPromoPickTemplateId({
-        campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind,
-      });
 
-      /* Pick a product — avoid repeats within the same preview */
+      const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
+      const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
+      usedTemplates.add(templateId);
+
       const available = products.filter(p => !usedProducts.has(p.id));
-      const pool = available.length ? available : products;
-      if (!pool.length) {
-        slots.push({
+      const pickFrom = available.length ? available : products;
+      if (!pickFrom.length) {
+        autoSlots.push({
           time: `${String(hour).padStart(2, "0")}:00`,
-          timeBucket, templateId, skipped: true, reason: "no-products",
+          hourEAT: hour, timeBucket, templateId,
+          slotKind: "promo", skipped: true, reason: "no-products",
+          productName: null, imageUrl: null,
+          caption: "(no product available)",
         });
         continue;
       }
-
-      const product = pool[Math.floor(Math.random() * pool.length)];
+      const product = pickFrom[Math.floor(Math.random() * pickFrom.length)];
       usedProducts.add(product.id);
 
-      const productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+      const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
       const caption = autoPromoFillTemplate(templateId, {
         product, campaign, groupName: groups[0]?.name || "MarketMix Family", productUrl,
       });
 
-      slots.push({
+      autoSlots.push({
         time: `${String(hour).padStart(2, "0")}:00`,
-        hourEAT: hour,
-        timeBucket,
-        templateId,
+        hourEAT: hour, timeBucket, templateId,
+        slotKind: "promo",
         productId: product.id,
         productName: product.name || "—",
         imageUrl: product.images?.[0] || null,
         caption,
-        groupCount: groups.length,
         skipped: false,
       });
     }
+
+    /* ── Occasion slots for that date ── */
+    const { dated, recurring } = resolveOccasionsForDate({
+      month, day, weekday: dow, year,
+      movableDates: occSettings.movableDates || {},
+      includeRecurring: !!occSettings.sendRecurring,
+    });
+
+    const occasionSlots = [];
+    for (const occ of [...dated, ...recurring]) {
+      const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
+      if (!message) continue;
+      const isRecurring = !!occ.recurring;
+      const isSensitive = !!occ.sensitive;
+      const baseHour = isRecurring ? 15 : 9;
+      occasionSlots.push({
+        time: `${String(baseHour).padStart(2, "0")}:00`,
+        hourEAT: baseHour,
+        slotKind: isSensitive ? "non-promo" : "occasion",
+        templateId: null,
+        occasionKey: occ.key,
+        occasionName: occ.name,
+        sensitive: isSensitive,
+        productName: occ.name,
+        imageUrl: null,
+        caption: message,
+        skipped: false,
+      });
+    }
+
+    /* ── Merge & sort by time ── */
+    const slots = [...autoSlots, ...occasionSlots]
+      .sort((a, b) => a.time.localeCompare(b.time));
 
     return res.json({
       success: true,
       date: targetDate.toISOString().slice(0, 10),
       campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
       groupCount: groups.length,
+      perGroupPerDay,
+      activeHours: autoSettings.activeHours || { start: 8, end: 21 },
       slots,
     });
   } catch (e) {
@@ -4887,7 +5026,7 @@ app.get("/_health", (req, res) => {
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
       inlined: true,
-      version: "v2",
+      version: "v2.1",
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
     },
@@ -4938,21 +5077,26 @@ app.get("/_health", (req, res) => {
       "/_health",
     ],
     fixes: [
-      "FIX #1 — body limit bumped to 25mb",
-      "FIX #2 — buildWahaFilePayload normalizes dataURL / base64 / URL",
-      "FIX #3 — /api/whatsapp/notify supports images with text fallback",
-      "FIX #4 — /api/test-whatsapp-notify-image test endpoint",
-      "FIX #5 — normalizeWaChatId + @g.us on all send paths",
-      "FIX #6 — GET /api/whatsapp/groups (NOWEB /api/default/groups)",
-      "FIX #7 — AutoPromo scheduler + admin endpoints (INLINED in server.js v2)",
-      "FIX #8 — AutoPromo v2 campaign calendar, time/day buckets, 20 templates (T1–T20)",
-      "FIX #9 — Admin 7am/7pm EAT flash-sales nudge (adminFlashNudgeTick)",
+      "FIX #1  — body limit bumped to 25mb",
+      "FIX #2  — buildWahaFilePayload normalizes dataURL / base64 / URL",
+      "FIX #3  — /api/whatsapp/notify supports images with text fallback",
+      "FIX #4  — /api/test-whatsapp-notify-image test endpoint",
+      "FIX #5  — normalizeWaChatId + @g.us on all send paths",
+      "FIX #6  — GET /api/whatsapp/groups (NOWEB /api/default/groups)",
+      "FIX #7  — AutoPromo scheduler + admin endpoints (INLINED in server.js v2)",
+      "FIX #8  — AutoPromo v2 campaign calendar, time/day buckets, 20 templates (T1–T20)",
+      "FIX #9  — Admin 7am/7pm EAT flash-sales nudge (adminFlashNudgeTick)",
       "FIX #10 — /api/admin/auto-promo/preview (dry-run planner for tomorrow)",
       "FIX #11 — OCCASION ENGINE: full-year ~90-occasion library + date resolver",
       "FIX #12 — Occasion scheduler + admin endpoints (GET / POST / preview / run-now)",
       "FIX #13 — Sensitive occasions (sensitive: true) never send promo content",
       "FIX #14 — Recurring weekly entries scheduled separately from dated occasions",
       "FIX #15 — fillOccasionTemplate() with {shop_link} placeholder support",
+      "FIX #16 — Preview now respects perGroupPerDay + activeHours (no hardcoded 5 slots)",
+      "FIX #17 — Preview merges auto-promo AND occasion slots into one timeline",
+      "FIX #18 — Live scheduler de-dupes templates and products per group per day",
+      "FIX #19 — autoPromoPickTemplatePool() replaces single-template picker for rotation",
+      "FIX #20 — autoPromoTemplatesUsedToday() + autoPromoProductsUsedToday() helpers",
     ],
     uptime: process.uptime(),
   });
@@ -5084,10 +5228,10 @@ const server = app.listen(PORT, () => {
   console.log(`🖼️ WhatsApp image notify: ✅`);
   console.log(`👥 WhatsApp group picker: ✅`);
   console.log(`🆔 Group-aware chatId: ✅`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2)`);
+  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2.1)`);
   console.log(`🎯 AutoPromo campaign calendar: ✅ (${AUTO_PROMO_CAMPAIGNS.length} campaigns)`);
   console.log(`📝 AutoPromo templates: ✅ (${Object.keys(AutoPromoTemplates).length} templates T1–T20)`);
-  console.log(`🔮 AutoPromo preview endpoint: ✅ (/api/admin/auto-promo/preview)`);
+  console.log(`🔮 AutoPromo preview endpoint: ✅ (respects perGroupPerDay + occasions)`);
   console.log(`🎯 Occasion engine: ✅ (${OCCASION_LIBRARY.length} occasions)`);
   console.log(`📅 Occasion movable: ✅ (${OCCASION_LIBRARY.filter(o => o.movable).length})`);
   console.log(`🔁 Occasion recurring: ✅ (${OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length})`);
