@@ -558,7 +558,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 // ============================
-// AutoPromo — scheduler module
+// AutoPromo — random scheduler module
 // ============================
 const AutoPromo = require("./autoPromo");
 
@@ -1909,7 +1909,7 @@ app.post("/api/re/welcome", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   FIX #6 — GROUP PICKER ROUTE (NOWEB engine, object-keyed response)
+   FIX #6 — GROUP PICKER ROUTE (NOWEB engine)
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/whatsapp/groups", async (req, res) => {
   try {
@@ -1950,6 +1950,58 @@ app.get("/api/whatsapp/groups", async (req, res) => {
     return sendServerError(res, e, "Could not list groups");
   }
 });
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX #7 — AUTO-RANDOM PROMO ADMIN ENDPOINTS
+   ═══════════════════════════════════════════════════════════════ */
+app.get("/api/admin/auto-promo", async (req, res) => {
+  try {
+    const settings = await AutoPromo.loadSettings(db);
+    const recent = await db.collection("autoPromoLogs")
+      .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
+    return res.json({
+      success: true,
+      settings,
+      templates: AutoPromo.TEMPLATES.map(t => ({ id: t.id, emoji: t.emoji, text: t.text })),
+      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load auto-promo settings");
+  }
+});
+
+app.post("/api/admin/auto-promo", async (req, res) => {
+  try {
+    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl"];
+    const patch = {};
+    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+    await AutoPromo.saveSettings(db, patch, req.body?.uid || "admin");
+    const settings = await AutoPromo.loadSettings(db);
+    return res.json({ success: true, settings });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save auto-promo settings");
+  }
+});
+
+app.post("/api/admin/auto-promo/run-now", async (req, res) => {
+  try {
+    const settings = await AutoPromo.loadSettings(db);
+    await AutoPromo.saveSettings(db, { enabled: true }, "admin-run-now");
+    const result = await AutoPromo.runAutoPromoTick({
+      db, reDb, wahaFetch, enqueueWhatsApp,
+      WA_MAX_PER_RUN: 3,
+      forceGroupIds: Array.isArray(req.body?.groupIds) ? req.body.groupIds : null,
+      forceProductId: req.body?.productId || null,
+    });
+    await AutoPromo.saveSettings(db, { enabled: !!settings.enabled }, "admin-run-now-restore");
+    return res.json({ success: true, result });
+  } catch (e) {
+    return sendServerError(res, e, "Run-now failed");
+  }
+});
+/* ═══════════════════════════════════════════════════════════════
+   END FIX #7
+   ═══════════════════════════════════════════════════════════════ */
 
 app.post("/api/whatsapp/send-media", async (req, res) => {
   try {
@@ -2035,58 +2087,6 @@ app.post("/api/whatsapp/send-media", async (req, res) => {
     return sendServerError(res, e, "Bulk WhatsApp send failed");
   }
 });
-
-/* ═══════════════════════════════════════════════════════════════
-   FIX #7 — AUTO-RANDOM PROMO ADMIN ENDPOINTS
-   ═══════════════════════════════════════════════════════════════ */
-app.get("/api/admin/auto-promo", async (req, res) => {
-  try {
-    const settings = await AutoPromo.loadSettings(db);
-    const recent = await db.collection("autoPromoLogs")
-      .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
-    return res.json({
-      success: true,
-      settings,
-      templates: AutoPromo.TEMPLATES.map(t => ({ id: t.id, emoji: t.emoji, text: t.text })),
-      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
-    });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load auto-promo settings");
-  }
-});
-
-app.post("/api/admin/auto-promo", async (req, res) => {
-  try {
-    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl"];
-    const patch = {};
-    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-    await AutoPromo.saveSettings(db, patch, req.body?.uid || "admin");
-    const settings = await AutoPromo.loadSettings(db);
-    return res.json({ success: true, settings });
-  } catch (e) {
-    return sendServerError(res, e, "Could not save auto-promo settings");
-  }
-});
-
-app.post("/api/admin/auto-promo/run-now", async (req, res) => {
-  try {
-    const settings = await AutoPromo.loadSettings(db);
-    await AutoPromo.saveSettings(db, { enabled: true }, "admin-run-now");
-    const result = await AutoPromo.runAutoPromoTick({
-      db, reDb, wahaFetch, enqueueWhatsApp,
-      WA_MAX_PER_RUN: 3,
-      forceGroupIds: Array.isArray(req.body?.groupIds) ? req.body.groupIds : null,
-      forceProductId: req.body?.productId || null,
-    });
-    await AutoPromo.saveSettings(db, { enabled: !!settings.enabled }, "admin-run-now-restore");
-    return res.json({ success: true, result });
-  } catch (e) {
-    return sendServerError(res, e, "Run-now failed");
-  }
-});
-/* ═══════════════════════════════════════════════════════════════
-   END FIX #7
-   ═══════════════════════════════════════════════════════════════ */
 
 app.post("/api/admin/notify-user", async (req, res) => {
   try {
@@ -3416,7 +3416,7 @@ app.get("/_health", (req, res) => {
       "FIX #3 — /api/whatsapp/notify now sends images with text fallback",
       "FIX #4 — /api/test-whatsapp-notify-image test endpoint added",
       "FIX #5 — normalizeWaChatId() + @g.us accepted on all send paths",
-      "FIX #6 — GET /api/whatsapp/groups: /api/default/groups (NOWEB), accepts object-keyed response, reads `subject`",
+      "FIX #6 — GET /api/whatsapp/groups: /api/default/groups (NOWEB), object-keyed response, reads `subject`",
       "FIX #7 — AutoPromo scheduler + admin endpoints (random products to groups on a schedule)",
     ],
     uptime: process.uptime(),
@@ -3491,9 +3491,9 @@ const server = app.listen(PORT, () => {
   console.log(`🔔 Admin → user notifications: ✅`);
   console.log(`💬 WhatsApp notify endpoints: ✅`);
   console.log(`🖼️ WhatsApp image notify: ✅ (FIX #3)`);
-  console.log(`👥 WhatsApp group picker: ✅ (FIX #6 — /api/default/groups, NOWEB)`);
+  console.log(`👥 WhatsApp group picker: ✅ (FIX #6)`);
   console.log(`🆔 Group-aware chatId: ✅ (FIX #5)`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (FIX #7 — random daily groups promos)`);
+  console.log(`🤖 AutoPromo scheduler: ✅ (FIX #7)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
