@@ -6,6 +6,9 @@
 // Emails can optionally mirror to WhatsApp by passing a phone number.
 // Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
 // Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
+//
+// Single-file: AutoPromo scheduler is inlined at the bottom of this file
+// (no ./autoPromo.js module needed).
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -51,9 +54,7 @@ app.use(cors({
   credentials: true,
 }));
 
-/* ═══════════════════════════════════════════════════════════════
-   FIX #1 — INCREASED BODY LIMIT FOR INLINE IMAGES
-   ═══════════════════════════════════════════════════════════════ */
+/* FIX #1 — BODY LIMIT FOR INLINE IMAGES */
 app.use(bodyParser.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
@@ -88,7 +89,7 @@ if (missing.length) {
 }
 
 // ============================
-// Firebase — two Admin apps
+// Firebase
 // ============================
 let shopApp;
 let reApp;
@@ -134,20 +135,15 @@ const intasend = new IntaSend(
 );
 
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
-
 const REAL_ESTATE_RECEIPT_URL =
   process.env.REAL_ESTATE_RECEIPT_URL ||
   "https://marketmix-realestates.vercel.app/receipt";
-
 const MARKETPLACE_URL = "https://my-campus-store-frontend.vercel.app";
-
 const REAL_ESTATE_APP_URL = "https://marketmix-realestates.vercel.app";
 const MOVING_URL = `${REAL_ESTATE_APP_URL}/`;
 const DRIVER_DASHBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
-
 const SELLER_DASHBOARD_URL = `${MARKETPLACE_URL}/seller/dashboard/orders`;
-
 const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke";
 const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
@@ -157,7 +153,7 @@ const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
 
 // ============================
-// Brevo senders
+// Brevo
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
@@ -252,7 +248,7 @@ const sendEmail = async (to, subject, html, type = "security", phone = null) => 
 })();
 
 // ============================
-// WhatsApp (WAHA) — queued sender
+// WAHA
 // ============================
 const WAHA_URL = process.env.WAHA_URL;
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
@@ -294,9 +290,7 @@ function normalizePhoneForWa(phoneNumber) {
   return digits;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   FIX #5 — GROUP-AWARE CHAT ID NORMALIZER
-   ═══════════════════════════════════════════════════════════════ */
+/* FIX #5 — group-aware chat id normalizer */
 function normalizeWaChatId(input) {
   if (!input) return null;
   const s = String(input).trim();
@@ -304,9 +298,7 @@ function normalizeWaChatId(input) {
   return normalizePhoneForWa(s);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   FIX #2 — BASE64 IMAGE NORMALIZER
-   ═══════════════════════════════════════════════════════════════ */
+/* FIX #2 — image normalizer */
 function buildWahaFilePayload(input, { filename, mimeOverride } = {}) {
   if (!input || typeof input !== "string") return null;
   const s = input.trim();
@@ -557,13 +549,249 @@ function personalizeBulkMessage(template, { name } = {}) {
   console.log("🌀 WAHA keep-alive active (every 4 min)");
 })();
 
-// ============================
-// AutoPromo — random scheduler module
-// ============================
-const AutoPromo = require("./autoPromo");
+/* ═══════════════════════════════════════════════════════════════
+   AutoPromo — INLINED (no separate file needed)
+   ═══════════════════════════════════════════════════════════════ */
+
+const AutoPromoTemplates = [
+  { id: "flash", emoji: "🔥",
+    text: `🔥 *FLASH DEAL*\n\nToday only at MarketMix Kenya:\n\n{{product}}\n\nLimited stock — first come, first served.\n\n🛍️ Shop: {{link}}` },
+  { id: "spotlight", emoji: "✨",
+    text: `✨ *TODAY'S PICK*\n\nHand-picked for you:\n\n{{product}}\n\nGrab it while it lasts.\n\n🛍️ {{link}}` },
+  { id: "newstock", emoji: "📦",
+    text: `📦 *JUST RESTOCKED*\n\nBack on the shelf:\n\n{{product}}\n\nOrder today → {{link}}` },
+  { id: "deal", emoji: "🎁",
+    text: `🎁 *DEAL OF THE DAY*\n\n{{product}}\n\nDon't sleep on this one.\n\n👉 {{link}}` },
+  { id: "hot", emoji: "⚡",
+    text: `⚡ *HOT ITEM*\n\nTrending at MarketMix right now:\n\n{{product}}\n\nShop → {{link}}` },
+  { id: "weekend", emoji: "🌿",
+    text: `🌿 *WEEKEND PICK*\n\nSomething we think you'll love:\n\n{{product}}\n\nFree delivery within Nairobi on orders above KES 2,000.\n\n{{link}}` },
+];
+
+const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
+let autoPromoTickTimer = null;
+let autoPromoRunning = false;
+
+function autoPromoFmtProduct(p) {
+  const name = p.name || "Special pick";
+  const price = Number(p.price || 0);
+  const desc = String(p.description || "").replace(/\s+/g, " ").trim().slice(0, 140);
+  const lines = [`🛍️ *${name.toUpperCase()}*`];
+  if (price > 0) lines.push(`💰 KES ${price.toLocaleString("en-KE")}`);
+  if (p.brand) lines.push(`🏷️ ${p.brand}`);
+  if (p.category) lines.push(`📦 ${p.category}`);
+  if (desc) { lines.push(""); lines.push(desc + (String(p.description || "").length > 140 ? "…" : "")); }
+  return { text: lines.join("\n") };
+}
+
+function autoPromoPickRandom(arr, n = 1) {
+  const copy = [...arr];
+  const out = [];
+  while (out.length < n && copy.length) {
+    const i = Math.floor(Math.random() * copy.length);
+    out.push(copy.splice(i, 1)[0]);
+  }
+  return out;
+}
+
+async function autoPromoLoadSettings() {
+  const ref = db.collection("platformSettings").doc("autoPromo");
+  const snap = await ref.get();
+  const defaults = {
+    enabled: false,
+    perGroupPerDay: 4,
+    minGapMinutes: 90,
+    activeHours: { start: 8, end: 21 },
+    siteUrl: "https://www.marketmixkenya.co.ke",
+  };
+  if (!snap.exists) return defaults;
+  return { ...defaults, ...snap.data() };
+}
+
+async function autoPromoSaveSettings(patch, uid = "system") {
+  const ref = db.collection("platformSettings").doc("autoPromo");
+  await ref.set({
+    ...patch,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedBy: uid,
+  }, { merge: true });
+}
+
+async function autoPromoCountTodaySends(groupId) {
+  const now = new Date();
+  const eat = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const startEAT = new Date(Date.UTC(eat.getUTCFullYear(), eat.getUTCMonth(), eat.getUTCDate(), 0, 0, 0) - 3 * 60 * 60 * 1000);
+  const snap = await db.collection("autoPromoLogs")
+    .where("groupId", "==", groupId)
+    .where("sentAt", ">=", startEAT)
+    .where("status", "==", "sent")
+    .get();
+  return snap.size;
+}
+
+async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
+  if (autoPromoRunning) return { skipped: "already-running" };
+  autoPromoRunning = true;
+  try {
+    const settings = await autoPromoLoadSettings();
+    if (!settings.enabled) return { skipped: "disabled" };
+
+    const eatHour = (new Date().getUTCHours() + 3) % 24;
+    if (eatHour < settings.activeHours.start || eatHour >= settings.activeHours.end) {
+      return { skipped: `outside-hours (${eatHour}h EAT)` };
+    }
+
+    let groups = [];
+    try {
+      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+      const data = await r.json().catch(() => ({}));
+      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      groups = list
+        .filter((g) => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
+        .map((g) => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
+    } catch (e) {
+      console.error("🤖 AutoPromo: failed to fetch groups:", e.message);
+      return { error: "groups-fetch-failed" };
+    }
+
+    if (Array.isArray(forceGroupIds) && forceGroupIds.length > 0) {
+      const allowed = new Set(forceGroupIds);
+      groups = groups.filter((g) => allowed.has(g.id));
+      const missing = forceGroupIds.filter((id) => !groups.find((g) => g.id === id));
+      for (const id of missing) groups.push({ id, name: "(forced)" });
+    }
+
+    if (!groups.length) return { skipped: "no-groups" };
+
+    let products = [];
+    if (forceProductId) {
+      const snap = await db.collection("products").doc(forceProductId).get();
+      if (snap.exists) products = [{ id: snap.id, ...snap.data() }];
+    }
+    if (!products.length) {
+      const pSnap = await db.collection("products").get();
+      products = pSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((p) => {
+          const inStock =
+            (Number(p.quantity) || 0) > 0 ||
+            (Array.isArray(p.variants) && p.variants.some((v) => (Number(v.stock) || 0) > 0));
+          return inStock && (p.isPublished !== false);
+        });
+    }
+
+    if (!products.length) return { skipped: "no-products" };
+
+    const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 4));
+
+    const result = {
+      tick: new Date().toISOString(),
+      groupsConsidered: groups.length,
+      productsAvailable: products.length,
+      perGroupPerDay,
+      forcedProduct: forceProductId || null,
+      forcedGroups: Array.isArray(forceGroupIds) ? forceGroupIds.length : 0,
+      sent: 0,
+      skippedGroups: [],
+      messages: [],
+    };
+
+    const bypassCap = !!(forceGroupIds || forceProductId);
+    const perTick = bypassCap ? Math.min(perGroupPerDay, WA_MAX_PER_RUN) : Math.max(1, Math.ceil(perGroupPerDay / 4));
+
+    for (const group of groups) {
+      if (!bypassCap) {
+        const alreadySent = await autoPromoCountTodaySends(group.id);
+        const remaining = perGroupPerDay - alreadySent;
+        if (remaining <= 0) {
+          result.skippedGroups.push({ id: group.id, reason: "daily-cap-reached" });
+          continue;
+        }
+      }
+
+      const toSend = Math.min(perTick, WA_MAX_PER_RUN);
+      const chosenProducts = autoPromoPickRandom(products, toSend);
+      const gapMs = 30 * 1000 + Math.random() * 45 * 1000;
+
+      for (let i = 0; i < chosenProducts.length; i++) {
+        const p = chosenProducts[i];
+        const tpl = AutoPromoTemplates[Math.floor(Math.random() * AutoPromoTemplates.length)];
+        const productBlock = autoPromoFmtProduct(p);
+        const link = `${settings.siteUrl}/product/${p.slug || p.id}`;
+        const text = tpl.text
+          .replace(/\{\{\s*product\s*\}\}/gi, productBlock.text)
+          .replace(/\{\{\s*link\s*\}\}/gi, link);
+
+        try {
+          enqueueWhatsApp(group.id, text, {
+            kind: "auto-promo",
+            groupName: group.name,
+            productId: p.id,
+            template: tpl.id,
+          });
+          await db.collection("autoPromoLogs").add({
+            groupId: group.id,
+            groupName: group.name,
+            productId: p.id,
+            productName: p.name || null,
+            template: tpl.id,
+            status: "sent",
+            sentAt: admin.firestore.FieldValue.serverTimestamp(),
+            preview: text.slice(0, 240),
+            forced: bypassCap,
+          });
+          result.sent++;
+          result.messages.push({ group: group.name, product: p.name, template: tpl.id });
+        } catch (e) {
+          await db.collection("autoPromoLogs").add({
+            groupId: group.id,
+            groupName: group.name,
+            productId: p.id,
+            template: tpl.id,
+            status: "failed",
+            error: e.message,
+            sentAt: admin.firestore.FieldValue.serverTimestamp(),
+            forced: bypassCap,
+          }).catch(() => {});
+          console.error("🤖 AutoPromo send failed:", e.message);
+        }
+
+        if (i < chosenProducts.length - 1) {
+          await new Promise((r) => setTimeout(r, gapMs));
+        }
+      }
+    }
+
+    console.log(`🤖 AutoPromo tick → ${result.sent} message(s) sent` + (bypassCap ? " (forced)" : ""));
+    return result;
+  } catch (e) {
+    console.error("🤖 AutoPromo tick crashed:", e);
+    return { error: e.message };
+  } finally {
+    autoPromoRunning = false;
+  }
+}
+
+function autoPromoStartScheduler({ SCAN_MS = 15 * 60 * 1000 } = {}) {
+  const tick = async () => {
+    try {
+      await autoPromoRunTick({});
+    } catch (e) {
+      console.error("🤖 AutoPromo scheduled tick error:", e.message);
+    }
+    autoPromoTickTimer = setTimeout(tick, SCAN_MS).unref?.();
+  };
+  autoPromoTickTimer = setTimeout(tick, 60 * 1000).unref?.();
+  console.log(`🤖 AutoPromo scheduler armed (scan every ${SCAN_MS / 60000} min)`);
+  return () => { if (autoPromoTickTimer) clearTimeout(autoPromoTickTimer); };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   END AutoPromo inline block
+   ═══════════════════════════════════════════════════════════════ */
 
 // ============================
-// WhatsApp templates — MarketMix store
+// WhatsApp templates
 // ============================
 
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
@@ -861,17 +1089,14 @@ const isQuicksaleRef    = (r) => typeof r === "string" && r.startsWith("QS_");
 function isRealEstateOrder(apiRef, orderData) {
   return isRealEstateRef(apiRef) || orderData?.orderType === "real_estate" || orderData?.isRealEstate === true;
 }
-
 function isQuicksaleOrder(orderData) {
   return orderData?.type === "QUICK_SALE" || orderData?.isQuicksale === true;
 }
-
 function getSellerItems(orderData, sellerId) {
   const items = orderData?.items;
   if (!Array.isArray(items)) return [];
   return items.filter((it) => it?.sellerId === sellerId);
 }
-
 function getSellerItemSummary(orderData, sellerId) {
   const items = getSellerItems(orderData, sellerId);
   if (!items.length) return "—";
@@ -880,12 +1105,10 @@ function getSellerItemSummary(orderData, sellerId) {
     .map((it) => `${it.name} x${it.quantity}`)
     .join(", ") + (items.length > 3 ? ` +${items.length - 3} more` : "");
 }
-
 function getSellerRevenue(orderData, sellerId) {
   const items = getSellerItems(orderData, sellerId);
   return items.reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.quantity) || 0), 0);
 }
-
 function quicksaleItemSummary(orderData) {
   const items = Array.isArray(orderData?.items) ? orderData.items : [];
   if (!items.length) return "Your purchase";
@@ -957,7 +1180,7 @@ const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
 // ============================
-// Order confirmation email (buyer)
+// Order confirmation email
 // ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
@@ -1174,7 +1397,7 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
 };
 
 // ============================
-// Real Estates — welcome email (signup + role switch)
+// Real Estates — welcome email
 // ============================
 const sendRealEstateWelcomeEmail = async ({
   userEmail,
@@ -1263,7 +1486,7 @@ const sendRealEstateWelcomeEmail = async ({
 };
 
 // ============================
-// PIN recovery helpers
+// PIN recovery
 // ============================
 const generateReplacementCode = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
@@ -1407,7 +1630,7 @@ const activateSellerSubscription = async (s, mpesaReference) => {
 };
 
 // ============================
-// Notify all sellers of a new paid order
+// notifySellersOfNewOrder
 // ============================
 async function notifySellersOfNewOrder(orderId, orderData) {
   const sellerIds = Array.isArray(orderData?.involvedSellerIds) ? orderData.involvedSellerIds : [];
@@ -1482,7 +1705,7 @@ async function notifySellersOfNewOrder(orderId, orderData) {
 }
 
 // ============================
-// 6h seller nudge scheduler
+// Nudge scheduler
 // ============================
 const NUDGE_MAX = 4;
 const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -1908,9 +2131,7 @@ app.post("/api/re/welcome", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   FIX #6 — GROUP PICKER ROUTE (NOWEB engine)
-   ═══════════════════════════════════════════════════════════════ */
+/* FIX #6 — group picker */
 app.get("/api/whatsapp/groups", async (req, res) => {
   try {
     const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
@@ -1951,18 +2172,16 @@ app.get("/api/whatsapp/groups", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   FIX #7 — AUTO-RANDOM PROMO ADMIN ENDPOINTS
-   ═══════════════════════════════════════════════════════════════ */
+/* FIX #7 — AutoPromo admin endpoints (uses inlined AutoPromo helpers) */
 app.get("/api/admin/auto-promo", async (req, res) => {
   try {
-    const settings = await AutoPromo.loadSettings(db);
+    const settings = await autoPromoLoadSettings();
     const recent = await db.collection("autoPromoLogs")
       .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
     return res.json({
       success: true,
       settings,
-      templates: AutoPromo.TEMPLATES.map(t => ({ id: t.id, emoji: t.emoji, text: t.text })),
+      templates: AutoPromoTemplates.map(t => ({ id: t.id, emoji: t.emoji, text: t.text })),
       recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   } catch (e) {
@@ -1975,8 +2194,8 @@ app.post("/api/admin/auto-promo", async (req, res) => {
     const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl"];
     const patch = {};
     for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-    await AutoPromo.saveSettings(db, patch, req.body?.uid || "admin");
-    const settings = await AutoPromo.loadSettings(db);
+    await autoPromoSaveSettings(patch, req.body?.uid || "admin");
+    const settings = await autoPromoLoadSettings();
     return res.json({ success: true, settings });
   } catch (e) {
     return sendServerError(res, e, "Could not save auto-promo settings");
@@ -1985,23 +2204,19 @@ app.post("/api/admin/auto-promo", async (req, res) => {
 
 app.post("/api/admin/auto-promo/run-now", async (req, res) => {
   try {
-    const settings = await AutoPromo.loadSettings(db);
-    await AutoPromo.saveSettings(db, { enabled: true }, "admin-run-now");
-    const result = await AutoPromo.runAutoPromoTick({
-      db, reDb, wahaFetch, enqueueWhatsApp,
+    const settings = await autoPromoLoadSettings();
+    await autoPromoSaveSettings({ enabled: true }, "admin-run-now");
+    const result = await autoPromoRunTick({
       WA_MAX_PER_RUN: 3,
       forceGroupIds: Array.isArray(req.body?.groupIds) ? req.body.groupIds : null,
       forceProductId: req.body?.productId || null,
     });
-    await AutoPromo.saveSettings(db, { enabled: !!settings.enabled }, "admin-run-now-restore");
+    await autoPromoSaveSettings({ enabled: !!settings.enabled }, "admin-run-now-restore");
     return res.json({ success: true, result });
   } catch (e) {
     return sendServerError(res, e, "Run-now failed");
   }
 });
-/* ═══════════════════════════════════════════════════════════════
-   END FIX #7
-   ═══════════════════════════════════════════════════════════════ */
 
 app.post("/api/whatsapp/send-media", async (req, res) => {
   try {
@@ -2279,18 +2494,11 @@ app.post("/api/driver/decision", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   FIX #3 — /api/whatsapp/notify NOW SUPPORTS IMAGES
-   ═══════════════════════════════════════════════════════════════════════════ */
+/* FIX #3 — /api/whatsapp/notify with images */
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
     const {
-      phone,
-      title,
-      message,
-      imageUrl,
-      imageBase64,
-      filename,
+      phone, title, message, imageUrl, imageBase64, filename,
       mediaType = "image",
     } = req.body || {};
 
@@ -2313,9 +2521,7 @@ app.post("/api/whatsapp/notify", async (req, res) => {
       const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
       if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
       return res.json({
-        success: true,
-        queued: true,
-        mode: "text",
+        success: true, queued: true, mode: "text",
         phone: normalizeWaChatId(phone),
       });
     }
@@ -2345,9 +2551,7 @@ app.post("/api/whatsapp/notify", async (req, res) => {
 
       console.log(`🖼️ /api/whatsapp/notify → image sent to ${normalized}`);
       return res.json({
-        success: true,
-        sent: true,
-        mode: "image",
+        success: true, sent: true, mode: "image",
         mediaType: isFile ? "file" : "image",
         phone: normalized,
       });
@@ -2355,11 +2559,8 @@ app.post("/api/whatsapp/notify", async (req, res) => {
       console.error(`⚠️ Image send failed for ${normalized}, falling back to text:`, imgErr.message);
       const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify-fallback" });
       return res.json({
-        success: true,
-        queued,
-        mode: "text-fallback",
-        phone: normalized,
-        imageError: imgErr.message,
+        success: true, queued, mode: "text-fallback",
+        phone: normalized, imageError: imgErr.message,
       });
     }
   } catch (e) {
@@ -2367,9 +2568,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
     return sendServerError(res, e, "WhatsApp notify failed");
   }
 });
-/* ═══════════════════════════════════════════════════════════════════════════
-   END FIX #3
-   ═══════════════════════════════════════════════════════════════════════════ */
 
 app.post("/api/whatsapp/welcome", async (req, res) => {
   try {
@@ -3082,12 +3280,8 @@ app.post("/api/seller/reset-pin", async (req, res) => {
 app.post("/api/update-stock", async (req, res) => {
   try {
     const {
-      productId,
-      quantity,
-      channel = null,
-      orderId = null,
-      reason = "sale",
-      createdBy = "system",
+      productId, quantity, channel = null, orderId = null,
+      reason = "sale", createdBy = "system",
     } = req.body || {};
 
     if (!productId || typeof quantity !== "number" || quantity <= 0) {
@@ -3111,12 +3305,9 @@ app.post("/api/update-stock", async (req, res) => {
 
     if (sellerId) {
       await logInventoryMovement({
-        productId,
-        sellerId,
+        productId, sellerId,
         delta: -Math.abs(quantity),
-        reason,
-        channel,
-        orderId,
+        reason, channel, orderId,
         note: `Stock ${oldQty} → ${oldQty - quantity}`,
         createdBy,
       });
@@ -3331,9 +3522,6 @@ app.post("/api/test-welcome-whatsapp", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   FIX #4 — NEW TEST ENDPOINT FOR IMAGE NOTIFY
-   ═══════════════════════════════════════════════════════════════════════════ */
 app.post("/api/test-whatsapp-notify-image", async (req, res) => {
   try {
     const { phone, title = "Image test", message = "Test image message", imageUrl } = req.body || {};
@@ -3351,9 +3539,6 @@ app.post("/api/test-whatsapp-notify-image", async (req, res) => {
     return sendServerError(res, e, "Test notify-image failed");
   }
 });
-/* ═══════════════════════════════════════════════════════════════════════════
-   END FIX #4
-   ═══════════════════════════════════════════════════════════════════════════ */
 
 app.get("/_health", (req, res) => {
   res.json({
@@ -3381,6 +3566,7 @@ app.get("/_health", (req, res) => {
       endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now"],
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
+      inlined: true,
     },
     endpoints: [
       "/api/whatsapp/notify",
@@ -3411,13 +3597,13 @@ app.get("/_health", (req, res) => {
       "/_health",
     ],
     fixes: [
-      "FIX #1 — body limit bumped to 25mb for inline images",
-      "FIX #2 — buildWahaFilePayload() normalizes dataURL / base64 / URL",
-      "FIX #3 — /api/whatsapp/notify now sends images with text fallback",
-      "FIX #4 — /api/test-whatsapp-notify-image test endpoint added",
-      "FIX #5 — normalizeWaChatId() + @g.us accepted on all send paths",
-      "FIX #6 — GET /api/whatsapp/groups: /api/default/groups (NOWEB), object-keyed response, reads `subject`",
-      "FIX #7 — AutoPromo scheduler + admin endpoints (random products to groups on a schedule)",
+      "FIX #1 — body limit bumped to 25mb",
+      "FIX #2 — buildWahaFilePayload normalizes dataURL / base64 / URL",
+      "FIX #3 — /api/whatsapp/notify supports images with text fallback",
+      "FIX #4 — /api/test-whatsapp-notify-image test endpoint",
+      "FIX #5 — normalizeWaChatId + @g.us on all send paths",
+      "FIX #6 — GET /api/whatsapp/groups (NOWEB /api/default/groups)",
+      "FIX #7 — AutoPromo scheduler + admin endpoints (INLINED in server.js)",
     ],
     uptime: process.uptime(),
   });
@@ -3466,14 +3652,8 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
-/* ─── AutoPromo scheduler start ─────────────────────────────────────────── */
-AutoPromo.startAutoPromoScheduler({
-  db,
-  reDb,
-  wahaFetch,
-  enqueueWhatsApp,
-  SCAN_MS: 15 * 60 * 1000,
-});
+// Start AutoPromo scheduler (inlined)
+autoPromoStartScheduler({ SCAN_MS: 15 * 60 * 1000 });
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
@@ -3490,15 +3670,15 @@ const server = app.listen(PORT, () => {
   console.log(`🧑✈️ Driver approvals: ✅`);
   console.log(`🔔 Admin → user notifications: ✅`);
   console.log(`💬 WhatsApp notify endpoints: ✅`);
-  console.log(`🖼️ WhatsApp image notify: ✅ (FIX #3)`);
-  console.log(`👥 WhatsApp group picker: ✅ (FIX #6)`);
-  console.log(`🆔 Group-aware chatId: ✅ (FIX #5)`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (FIX #7)`);
+  console.log(`🖼️ WhatsApp image notify: ✅`);
+  console.log(`👥 WhatsApp group picker: ✅`);
+  console.log(`🆔 Group-aware chatId: ✅`);
+  console.log(`🤖 AutoPromo scheduler: ✅ (inlined)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
   console.log(`⚡ Quicksale WhatsApp: ✅`);
-  console.log(`🎉 Welcome subscriber WhatsApp: ✅ (/api/whatsapp/welcome)`);
+  console.log(`🎉 Welcome subscriber WhatsApp: ✅`);
   console.log(`🔗 Group invite on buyer/onboarding templates`);
   console.log(`📊 Inventory movements logged on /api/update-stock`);
 });
