@@ -23,6 +23,9 @@
 //     same plan, so admin edits stay stable.
 //   • Group filter: selectedGroupIds persisted in platformSettings/autoPromo
 //     is honoured by both the live scheduler and the preview endpoint.
+//   • NEW: marketingOverrides — admin can edit caption / time / swap product /
+//     skip a slot in Daily Preview. Both preview and the live scheduler apply
+//     these overrides on top of the deterministic plan.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -1167,7 +1170,6 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
     if (s.exists) return { id: s.id, ...s.data() };
   }
 
-  /* Same-day exclusions — never pick the same product twice in one EAT day. */
   const sameDay = excludeProductIds instanceof Set ? excludeProductIds : new Set();
 
   const pSnap = await db.collection("products").get();
@@ -1197,6 +1199,80 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
   return autoPromoPickRandom(top, 1)[0].p;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   OVERRIDES — admin edits applied on top of the deterministic plan.
+   Stored in Firestore: marketingOverrides/{date}_{time}_{productId}
+   Shape:
+     {
+       date: "YYYY-MM-DD",
+       slot: "HH:MM",
+       originalProductId: "abc" | null,
+       productId: "xyz",       // optional swap
+       productName: "...",
+       imageUrl: "https://...",
+       caption: "...",         // optional caption override
+       time: "HH:MM",          // optional time override
+       skipped: true|false,
+       savedAt: Timestamp,
+       savedBy: uid,
+     }
+   ═══════════════════════════════════════════════════════════════ */
+
+async function loadOverridesForDate(dateStr) {
+  const map = new Map();
+  if (!dateStr) return map;
+  try {
+    const snap = await db.collection("marketingOverrides")
+      .where("date", "==", dateStr)
+      .get();
+    snap.forEach(d => {
+      const x = d.data() || {};
+      // Key format: "HH:MM|originalProductId-or-noplan"
+      const key = `${x.slot || ""}|${x.originalProductId || "noplan"}`;
+      map.set(key, x);
+    });
+  } catch (e) {
+    console.warn("[overrides] load failed:", e.message);
+  }
+  return map;
+}
+
+/* Apply an override on top of a generated slot in-place. */
+function applyOverride(slot, overrides) {
+  if (!slot || !slot.time) return slot;
+
+  // Try exact match first, then fall back to time-only match
+  const productId = slot.productId || "noplan";
+  const key = `${slot.time}|${productId}`;
+  let ov = overrides.get(key);
+
+  if (!ov) {
+    // Fallback: match by time only (handles product drift)
+    for (const [k, v] of overrides.entries()) {
+      const [ovTime] = k.split("|");
+      if (ovTime === slot.time) { ov = v; break; }
+    }
+  }
+
+  if (!ov) return slot;
+
+  return {
+    ...slot,
+    productId: ov.productId || slot.productId,
+    productName: ov.productName || slot.productName,
+    imageUrl: ov.imageUrl || slot.imageUrl,
+    caption: ov.caption || slot.caption,
+    time: ov.time || slot.time,
+    skipped: typeof ov.skipped === "boolean" ? ov.skipped : slot.skipped,
+    isOverridden: true,
+    __originalTime: slot.time,
+    __originalProductId: slot.productId,
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTO-PROMO TICK (LIVE SCHEDULER) — with override awareness
+   ═══════════════════════════════════════════════════════════════ */
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
   autoPromoRunning = true;
@@ -1221,18 +1297,9 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       return { error: "groups-fetch-failed", detail: e.message };
     }
 
-    /* ── Group filter ──
-       Precedence:
-         1. forceGroupIds (explicit override — run-now, tests)
-         2. settings.selectedGroupIds (persisted admin selection)
-         3. no filter → send to every group WAHA returns */
-    const persistedIds = Array.isArray(settings.selectedGroupIds)
-      ? settings.selectedGroupIds
-      : [];
+    const persistedIds = Array.isArray(settings.selectedGroupIds) ? settings.selectedGroupIds : [];
     const effectiveIds =
-      Array.isArray(forceGroupIds) && forceGroupIds.length > 0
-        ? forceGroupIds
-        : persistedIds;
+      Array.isArray(forceGroupIds) && forceGroupIds.length > 0 ? forceGroupIds : persistedIds;
 
     if (effectiveIds.length > 0) {
       const allowed = new Set(effectiveIds);
@@ -1259,6 +1326,10 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     const bypassCap = !!(forceGroupIds || forceProductId);
     const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 5));
 
+    /* NEW: load today's overrides once so every group uses them */
+    const todayEAT = autoPromoNowEAT().toISOString().slice(0, 10);
+    const overrides = await loadOverridesForDate(todayEAT);
+
     const result = {
       tick: new Date().toISOString(),
       hourEAT,
@@ -1269,6 +1340,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       sent: 0,
       skippedGroups: [],
       messages: [],
+      overridesApplied: 0,
     };
 
     for (const group of groups) {
@@ -1282,14 +1354,13 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
       const kind = autoPromoDetectGroupKind(group.name);
 
-      /* Same-day de-dupe: fetch what this group has already seen today. */
       const usedTodayTemplates = await autoPromoTemplatesUsedToday(group.id);
       const usedTodayProducts  = await autoPromoProductsUsedToday(group.id);
 
       const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
-      const templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
+      let templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
 
-      const product = await autoPromoPickProduct({
+      let product = await autoPromoPickProduct({
         group,
         forceProductId,
         excludeProductIds: usedTodayProducts,
@@ -1299,17 +1370,50 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         continue;
       }
 
-      const productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
-      const caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
+      let productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+      let caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
+      let imageUrl = product.images?.[0] || null;
+      let slotTime = `${String(hourEAT).padStart(2, "0")}:00`;
+
+      /* NEW: apply an override if the admin has one for this slot */
+      if (overrides.size > 0) {
+        const generatedSlot = {
+          time: slotTime,
+          productId: product.id,
+          productName: product.name || "—",
+          imageUrl,
+          caption,
+          skipped: false,
+        };
+        const overridden = applyOverride(generatedSlot, overrides);
+        if (overridden.isOverridden) {
+          result.overridesApplied++;
+          if (overridden.skipped) {
+            result.skippedGroups.push({ id: group.id, reason: "overridden-skipped" });
+            continue;
+          }
+          if (overridden.caption) caption = overridden.caption;
+          if (overridden.imageUrl) imageUrl = overridden.imageUrl;
+          if (overridden.productId && overridden.productId !== product.id) {
+            // Reload the overridden product so we have its full doc
+            const swappedSnap = await db.collection("products").doc(overridden.productId).get();
+            if (swappedSnap.exists) {
+              product = { id: swappedSnap.id, ...swappedSnap.data() };
+              productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+            }
+          }
+        }
+      }
 
       try {
-        if (product.images?.[0]) {
-          enqueueWhatsAppImage(group.id, product.images[0], caption, {
+        if (imageUrl) {
+          enqueueWhatsAppImage(group.id, imageUrl, caption, {
             kind: "auto-promo",
             templateId,
             campaign: campaign?.name || null,
             productId: product.id,
             groupName: group.name,
+            overridden: overrides.size > 0,
           });
         } else {
           enqueueWhatsApp(group.id, caption, {
@@ -1318,6 +1422,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
             campaign: campaign?.name || null,
             productId: product.id,
             groupName: group.name,
+            overridden: overrides.size > 0,
           });
         }
 
@@ -1332,6 +1437,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
           preview: caption.slice(0, 240),
           forced: bypassCap,
+          overridden: overrides.size > 0,
         });
 
         result.sent++;
@@ -1356,7 +1462,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       }
     }
 
-    console.log(`🤖 AutoPromo tick → ${result.sent} sent (campaign=${result.campaign || "none"})`);
+    console.log(`🤖 AutoPromo tick → ${result.sent} sent (campaign=${result.campaign || "none"}, overrides=${result.overridesApplied})`);
     return result;
   } catch (e) {
     console.error("🤖 AutoPromo tick crashed:", e);
@@ -1391,227 +1497,52 @@ function autoPromoStartScheduler({ SCAN_MS = 15 * 60 * 1000 } = {}) {
    ═══════════════════════════════════════════════════════════════ */
 
 const OCCASION_LIBRARY = [
-  // ─────────── JANUARY ───────────
   { key: "new-year", month: 1, day: 1, name: "New Year's Day", kind: "both",
     promo: `🎉 Happy New Year from MarketMix Kenya!\n\nStart the year by discovering useful finds from local businesses. From fashion and electronics to everyday essentials, explore what's available.\n\n🛍️ Shop local, grow local: {shop_link}`,
     nonPromo: `🎉 Happy New Year!\n\nYou don't need to have the whole year figured out today. Celebrate how far you've come, give yourself room to grow and take the next step at your own pace. Wishing you a peaceful and fulfilling year.` },
-
-  { key: "new-month-january", month: 1, day: 2, name: "New Month", kind: "both",
-    promo: `Hello, January! 👋\n\nWhat are you looking for this month? Discover clothes, shoes, electronics, books, accessories and more from local sellers.\n\nExplore MarketMix: {shop_link}`,
-    nonPromo: `New month, fresh opportunities. You don't have to change everything at once. Pick one thing you'd like to improve and start there. 💚` },
-
-  { key: "back-to-school-january", month: 1, day: 5, name: "School and Campus Preparation", kind: "both",
-    promo: `🎒 Getting ready for school or campus?\n\nCheck out available books, stationery, electronics, clothing and everyday essentials from local businesses.\n\nFind your next essential: {shop_link}`,
-    nonPromo: `A new term can bring excitement, pressure and a long shopping list. Start with what you genuinely need, plan your spending and remember that you don't have to prepare everything in one day.` },
-
-  { key: "education-day", month: 1, day: 24, name: "International Day of Education", kind: "both",
-    promo: `📚 Learning needs the right resources.\n\nExplore available books, study materials and electronics from local sellers on MarketMix.\n\nBrowse here: {shop_link}`,
-    nonPromo: `Every learner has a different journey. Keep asking questions, keep learning and don't let one difficult topic convince you that you cannot succeed. Happy International Day of Education!` },
-
-  { key: "end-month-january", month: 1, day: 28, name: "January End-Month", kind: "both",
-    promo: `End-month finds 👀\n\nLooking for something useful without stretching your budget? Browse available products, compare prices and choose what works for you.\n\n🛍️ {shop_link}`,
-    nonPromo: `End-month reminder: your worth is not measured by your bank balance. Make the choices that work for you, take care of yourself and give yourself another chance next month.` },
-
-  // ─────────── FEBRUARY ───────────
-  { key: "cancer-day", month: 2, day: 4, name: "World Cancer Day", kind: "non-promo", sensitive: true,
-    nonPromo: `🎗️ World Cancer Day\n\nAwareness, timely medical assessment, access to treatment and support matter. Share reliable information, challenge stigma and show compassion to people affected by cancer and their families.` },
-
-  { key: "galentines", month: 2, day: 13, name: "Galentine's Day", kind: "both",
-    promo: `💕 Your girls deserve appreciation too!\n\nThinking of a little gift for your bestie? Explore available accessories, fashion, beauty products and other thoughtful finds from local sellers.\n\nFind something lovely: {shop_link}`,
-    nonPromo: `Here's to the friends who listen to the long voice notes, celebrate your wins and stay through the difficult seasons. Send your girl a little appreciation today. 💕` },
 
   { key: "valentines", month: 2, day: 14, name: "Valentine's Day", kind: "both",
     promo: `❤️ Valentine's Day is here!\n\nLooking for something thoughtful for your person? Discover available gifts, fashion, accessories and other finds from local businesses.\n\nFind a gift: {shop_link}\n\nShop local, grow local.`,
     nonPromo: `Happy Valentine's Day! ❤️\n\nWhether you're in a relationship, single, healing or enjoying your own company, you deserve respect, care and genuine connection. Love should add to your life, not cost you your peace.` },
 
-  { key: "singles-awareness", month: 2, day: 15, name: "Singles Awareness Day", kind: "both",
-    promo: `Single and treating yourself? We support that. 😌\n\nExplore fashion, electronics, accessories and everyday finds from local sellers.\n\nYour next find is here: {shop_link}`,
-    nonPromo: `Being single isn't a waiting room for life. Enjoy your friendships, pursue your plans and make room for what makes you happy. Your life is happening now. 💚` },
+  { key: "cancer-day", month: 2, day: 4, name: "World Cancer Day", kind: "non-promo", sensitive: true,
+    nonPromo: `🎗️ World Cancer Day\n\nAwareness, timely medical assessment, access to treatment and support matter. Share reliable information, challenge stigma and show compassion to people affected by cancer and their families.` },
 
-  { key: "social-justice", month: 2, day: 20, name: "World Day of Social Justice", kind: "non-promo", sensitive: true,
-    nonPromo: `A fairer community begins with how we treat one another. Listen, include people who are often overlooked and support opportunities that allow more people to thrive.` },
-
-  { key: "end-month-february", month: 2, day: 27, name: "February End-Month", kind: "both",
-    promo: `Before February ends, take a look at what's available from local sellers.\n\nCompare prices, check product details and find what fits your needs and budget.\n\n🛍️ {shop_link}`,
-    nonPromo: `Whatever February looked like for you, give yourself credit for making it through. Rest if you need to, learn from what happened and move forward gently.` },
-
-  // ─────────── MARCH ───────────
   { key: "womens-day", month: 3, day: 8, name: "International Women's Day", kind: "both",
     promo: `💜 Celebrate women building businesses and creating opportunities.\n\nDiscover products from local entrepreneurs, including women-owned businesses participating on MarketMix.\n\nExplore local sellers: {shop_link}`,
     nonPromo: `Happy International Women's Day! 💜\n\nHere's to women learning, leading, caring, creating and finding their own paths. Every woman deserves dignity, safety, opportunity and the freedom to shape her future.` },
-
-  { key: "campus-intake-march", month: 3, day: 10, name: "March Campus Intake Preparation", kind: "both",
-    promo: `🎒 March intake preparations are underway!\n\nGetting ready for campus? Start checking your essentials: clothes, shoes, books, electronics, accessories and hostel items.\n\nDiscover available products: {shop_link}`,
-    nonPromo: `New campus chapter coming up? You don't need to buy everything at once. Make a list, prioritise the essentials and prepare within your budget. You'll figure out the rest as you go.` },
-
-  { key: "happiness-day", month: 3, day: 20, name: "International Day of Happiness", kind: "both",
-    promo: `Sometimes it's the little things that make a day better. 💚\n\nDiscover useful and thoughtful finds from local businesses. Choose what you genuinely want and what fits your budget.\n\nExplore: {shop_link}`,
-    nonPromo: `Check in with yourself and someone you care about today. Happiness doesn't have to be a big event. Sometimes it's rest, laughter, a good conversation or simply getting through a difficult day.` },
-
-  { key: "down-syndrome-day", month: 3, day: 21, name: "World Down Syndrome Day", kind: "non-promo", sensitive: true,
-    nonPromo: `💙💛 Inclusion, dignity and equal opportunities matter. Let's celebrate people for who they are and build communities where everyone belongs.` },
-
-  { key: "water-day", month: 3, day: 22, name: "World Water Day", kind: "non-promo", sensitive: true,
-    nonPromo: `💧 Safe water matters in every home and community. Today is a reminder to value this essential resource and support efforts that make clean water more accessible.` },
-
-  { key: "tb-day", month: 3, day: 24, name: "World Tuberculosis Day", kind: "non-promo", sensitive: true,
-    nonPromo: `World TB Day is a reminder to learn about tuberculosis, recognise possible symptoms and seek appropriate testing and treatment. Share reliable health information and help reduce stigma.` },
-
-  { key: "end-month-march", month: 3, day: 28, name: "March End-Month", kind: "both",
-    promo: `March is wrapping up! 👀\n\nBefore the month ends, explore available products from local sellers and check out what fits your needs.\n\n🛍️ {shop_link}`,
-    nonPromo: `You've made it through another month. Even if everything didn't go according to plan, you can still learn, adjust and start again. Progress doesn't have to be perfect.` },
-
-  // ─────────── APRIL ───────────
-  { key: "april-fools", month: 4, day: 1, name: "April Fools' Day", kind: "both",
-    promo: `😄 No fake discounts here!\n\nJust check the product details, confirm the actual price and choose what works for you.\n\nExplore MarketMix: {shop_link}`,
-    nonPromo: `A good joke brings people together without embarrassing or hurting someone. Laugh with people, not at them. Happy April Fools' Day!` },
-
-  { key: "health-day", month: 4, day: 7, name: "World Health Day", kind: "non-promo", sensitive: true,
-    nonPromo: `💚 Your health deserves attention.\n\nSeek reliable health information, attend recommended check-ups and consult qualified health professionals when you have concerns. Looking after yourself matters.` },
 
   { key: "earth-day", month: 4, day: 22, name: "Earth Day", kind: "both",
     promo: `🌍 Looking for reusable or longer-lasting everyday essentials?\n\nExplore relevant products from local sellers and choose items that genuinely meet your needs.\n\nBrowse: {shop_link}`,
     nonPromo: `Small choices can help us care for our environment. Reduce waste where possible, reuse what you can and take care of the spaces we share. Every effort counts.` },
 
-  { key: "book-day", month: 4, day: 23, name: "World Book and Copyright Day", kind: "both",
-    promo: `📚 Book lovers, this one's for you!\n\nExplore available books and study resources from local sellers on MarketMix.\n\nFind your next read: {shop_link}`,
-    nonPromo: `A good book can introduce you to a new idea, a different world or a new perspective. Make a little room for reading today.` },
-
-  { key: "easter", month: null, day: null, name: "Easter", kind: "both", movable: true,
-    promo: `🌷 Easter is here!\n\nPreparing for a family visit or celebration? Explore relevant products available from local sellers.\n\nBrowse MarketMix: {shop_link}`,
-    nonPromo: `Wishing everyone celebrating Easter a peaceful and meaningful holiday. May this season bring hope, reflection, kindness and time with the people who matter to you.` },
-
-  // ─────────── MAY ───────────
   { key: "labour-day", month: 5, day: 1, name: "Labour Day Kenya", kind: "both",
     promo: `🛠️ Happy Labour Day!\n\nToday we celebrate the people whose work keeps homes, businesses and communities going. Discover products from local entrepreneurs on MarketMix.\n\nShop local: {shop_link}`,
     nonPromo: `To everyone working shifts, studying while working, running a business or providing for family: your effort matters. Wishing you recognition, rest and better opportunities.` },
 
-  { key: "mothers-day", month: null, day: null, name: "Mother's Day", kind: "both", movable: true,
-    promo: `💐 Mother's Day is coming!\n\nLooking for a thoughtful gift for Mum or a mother figure? Explore available fashion, beauty products, accessories and home essentials from local sellers.\n\nFind a gift: {shop_link}`,
-    nonPromo: `Happy Mother's Day to the mothers, grandmothers, guardians and mother figures who show up in countless ways. We also send care to anyone for whom this day is difficult.` },
-
-  { key: "families-day", month: 5, day: 15, name: "International Day of Families", kind: "both",
-    promo: `Making a home feel like yours? 🏠\n\nDiscover available household essentials and everyday products from local businesses.\n\nExplore: {shop_link}`,
-    nonPromo: `Family can look different for everyone. Today is a reminder to value the people who offer us care, safety, support and a sense of belonging.` },
-
-  { key: "small-business-may", month: 5, day: 20, name: "Support Small Businesses", kind: "both",
-    promo: `Your next favourite business might be right here in Kenya. 🇰🇪\n\nDiscover products from local sellers and help small businesses reach more customers.\n\nShop local, grow local: {shop_link}`,
-    nonPromo: `Behind every small business is someone learning, taking risks and trying to build something worthwhile. Support an entrepreneur, recommend a business or encourage someone working toward a dream.` },
-
-  { key: "no-tobacco", month: 5, day: 31, name: "World No Tobacco Day", kind: "non-promo", sensitive: true,
-    nonPromo: `World No Tobacco Day is an opportunity to share reliable information about the harms of tobacco and support people who want to quit. Encourage without shaming, and seek qualified support where needed.` },
-
-  // ─────────── JUNE ───────────
   { key: "madaraka-day", month: 6, day: 1, name: "Madaraka Day", kind: "both",
     promo: `🇰🇪 Happy Madaraka Day!\n\nCelebrate the creativity and enterprise of Kenyan businesses. Discover products made or sold by local entrepreneurs.\n\nShop local, grow local: {shop_link}`,
     nonPromo: `Happy Madaraka Day, Kenya! 🇰🇪 Today we reflect on our journey, celebrate our communities and keep working toward a country where everyone has opportunities to thrive.` },
-
-  { key: "environment-day", month: 6, day: 5, name: "World Environment Day", kind: "non-promo", sensitive: true,
-    nonPromo: `🌱 A cleaner environment takes collective effort. Reduce waste where possible, care for shared spaces and support practical solutions in your community.` },
-
-  { key: "fathers-day", month: null, day: null, name: "Father's Day", kind: "both", movable: true,
-    promo: `👔 Father's Day is coming!\n\nLooking for a thoughtful gift for Dad or a father figure? Explore available clothing, accessories, electronics and practical everyday finds.\n\nBrowse gifts: {shop_link}`,
-    nonPromo: `Happy Father's Day to the fathers, guardians and father figures who offer care, guidance and support. We also recognise that family experiences differ and send care to anyone finding today difficult.` },
-
-  { key: "sme-day", month: 6, day: 27, name: "Micro-, Small and Medium-sized Enterprises Day", kind: "both",
-    promo: `🛍️ Small businesses deserve to be discovered!\n\nExplore products from local entrepreneurs and support a business growing in your community.\n\nDiscover local sellers: {shop_link}`,
-    nonPromo: `Every small business has a story. To the entrepreneurs learning, creating, solving problems and showing up even on difficult days: keep going. Your work matters.` },
-
-  // ─────────── JULY ───────────
-  { key: "midyear-reset", month: 7, day: 15, name: "Mid-Year Motivation", kind: "non-promo",
-    nonPromo: `Halfway through the year is a good time to check in with yourself. What is working? What needs to change? You are allowed to adjust your plans without giving up on yourself.` },
-
-  { key: "youth-skills", month: 7, day: 15, name: "World Youth Skills Day", kind: "both",
-    promo: `Celebrating young people building skills and businesses! 💚\n\nDiscover products and services from local entrepreneurs on MarketMix.\n\nExplore: {shop_link}`,
-    nonPromo: `You don't need to know everything to begin. Learn a skill, practise it, ask questions and give yourself time to improve. Progress often starts with trying.` },
-
-  { key: "mandela-day", month: 7, day: 18, name: "Nelson Mandela International Day", kind: "non-promo",
-    nonPromo: `Meaningful change can begin with ordinary acts of service. Give your time, help someone who needs support or do something useful in your community today.` },
-
-  { key: "hepatitis-day", month: 7, day: 28, name: "World Hepatitis Day", kind: "non-promo", sensitive: true,
-    nonPromo: `World Hepatitis Day raises awareness about viral hepatitis, testing, prevention and treatment. Share trusted information and encourage people to seek appropriate care without judgement.` },
-
-  { key: "friendship-day", month: 7, day: 30, name: "International Day of Friendship", kind: "both",
-    promo: `💚 Friendship deserves celebrating!\n\nLooking for a small gift for your person? Explore available accessories, gifts and thoughtful finds from local sellers.\n\nBrowse: {shop_link}`,
-    nonPromo: `Send this to the friend who checks on you, laughs with you or makes life a little lighter. Good friendships deserve appreciation on ordinary days too.` },
-
-  // ─────────── AUGUST ───────────
-  { key: "girlfriend-day", month: 8, day: 1, name: "National Girlfriend Day", kind: "both",
-    promo: `💕 Girlfriend Day!\n\nLooking for something thoughtful for your girlfriend or a close friend? Explore available fashion, accessories, beauty products and gifts from local sellers.\n\nFind something special: {shop_link}`,
-    nonPromo: `Happy Girlfriend Day to the women who celebrate each other's wins, offer support through difficult seasons and make friendship feel like home. Send your girl some appreciation today. 💕` },
-
-  { key: "youth-day", month: 8, day: 12, name: "International Youth Day", kind: "both",
-    promo: `Young people are building, creating and finding new ways to serve their communities. 🇰🇪\n\nDiscover products from local entrepreneurs on MarketMix.\n\nExplore: {shop_link}`,
-    nonPromo: `To every young person still figuring things out: your path doesn't have to look like anyone else's. Keep learning, ask for help when needed and take your next step at your own pace.` },
-
-  { key: "campus-intake-september", month: 8, day: 15, name: "September Campus Intake Preparation", kind: "both",
-    promo: `🎒 September intake preparation starts here!\n\nCheck your campus essentials list: books, electronics, clothes, shoes, hostel items and accessories.\n\nDiscover what's available from local sellers: {shop_link}`,
-    nonPromo: `Preparing for a new term can feel overwhelming. Make a list, prioritise what you actually need and prepare gradually. You don't have to do everything in one day.` },
-
-  { key: "end-month-august", month: 8, day: 28, name: "August End-Month", kind: "both",
-    promo: `End-month check-in! 👀\n\nNeed something before September begins? Browse available products and compare prices from local sellers.\n\n🛍️ {shop_link}`,
-    nonPromo: `Take a breath before the next month begins. You can organise your plans, review your spending and start September with a little more clarity.` },
-
-  // ─────────── SEPTEMBER ───────────
-  { key: "literacy-day", month: 9, day: 8, name: "International Literacy Day", kind: "both",
-    promo: `📚 Books, learning resources and study essentials!\n\nExplore what's available from local sellers on MarketMix.\n\nBrowse products: {shop_link}`,
-    nonPromo: `Literacy creates opportunities to learn, communicate and participate in society. Let's encourage reading and support access to learning resources for people of all ages.` },
-
-  { key: "suicide-prevention", month: 9, day: 10, name: "World Suicide Prevention Day", kind: "non-promo", sensitive: true,
-    nonPromo: `💚 You don't need perfect words to support someone who is struggling. Listen without judgement, take signs of distress seriously and help them connect with appropriate support. If you're struggling yourself, you deserve help too.` },
-
-  { key: "peace-day", month: 9, day: 21, name: "International Day of Peace", kind: "non-promo",
-    nonPromo: `Peace begins in the way we treat one another. Listen before reacting, respect differences and choose kindness where you can. Wishing everyone a more peaceful day.` },
-
-  { key: "end-month-september", month: 9, day: 28, name: "September End-Month", kind: "both",
-    promo: `September is almost over! 🛍️\n\nExplore available products from local businesses before the new month begins.\n\nBrowse MarketMix: {shop_link}`,
-    nonPromo: `Another month is nearly complete. Celebrate what went well, learn from what didn't and remember that a difficult week doesn't define your whole journey.` },
-
-  // ─────────── OCTOBER ───────────
-  { key: "breast-cancer-month", month: 10, day: 1, name: "Breast Cancer Awareness Month", kind: "non-promo", sensitive: true,
-    nonPromo: `💗 October is Breast Cancer Awareness Month.\n\nLearn about breast health, know what changes to look out for and seek medical assessment for concerning changes. Screening recommendations depend on individual circumstances, so consult a qualified health professional.` },
-
-  { key: "boyfriend-day", month: 10, day: 3, name: "National Boyfriend Day", kind: "both",
-    promo: `💙 Boyfriend Day!\n\nLooking for a thoughtful gift for your person? Explore available fashion, accessories, electronics and other gifts from local sellers.\n\nFind a gift: {shop_link}`,
-    nonPromo: `Happy Boyfriend Day! Here's to relationships built on respect, honesty, consistency and care. And to everyone who's single, healing or simply minding their own business: your life matters too. 💙` },
-
-  { key: "teachers-day", month: 10, day: 5, name: "World Teachers' Day", kind: "both",
-    promo: `📚 Looking for a thoughtful way to appreciate a teacher?\n\nExplore available books, stationery, accessories and gifts from local sellers.\n\nBrowse: {shop_link}`,
-    nonPromo: `To the teachers who explain things one more time, encourage a struggling learner and help people see their potential: thank you for the work you do.` },
-
-  { key: "mental-health-day", month: 10, day: 10, name: "World Mental Health Day", kind: "non-promo", sensitive: true,
-    nonPromo: `💚 Your mental wellbeing matters. Check in with yourself, reach out to someone you trust and seek professional support when you need it. You don't have to wait until things feel unbearable to ask for help.` },
-
-  { key: "girl-child-day", month: 10, day: 11, name: "International Day of the Girl Child", kind: "non-promo", sensitive: true,
-    nonPromo: `Every girl deserves safety, education, dignity and the freedom to imagine a future for herself. Let's support opportunities that help girls learn, lead and thrive.` },
-
-  { key: "food-day", month: 10, day: 16, name: "World Food Day", kind: "non-promo", sensitive: true,
-    nonPromo: `Food security affects families and communities every day. Today is a reminder to value food, reduce waste where possible and support efforts that improve access to nutritious meals.` },
 
   { key: "mashujaa-day", month: 10, day: 20, name: "Mashujaa Day", kind: "both",
     promo: `🇰🇪 Happy Mashujaa Day!\n\nCelebrate the people building Kenya, one idea and one business at a time. Discover products from local entrepreneurs.\n\nShop local: {shop_link}`,
     nonPromo: `Happy Mashujaa Day! Today we honour the people whose courage, service and dedication have helped shape our country, including the everyday heroes in our communities.` },
 
-  { key: "un-day", month: 10, day: 24, name: "United Nations Day", kind: "non-promo",
-    nonPromo: `Today is a reminder of the value of cooperation, dignity and working together to address shared challenges. Small acts of understanding matter in building stronger communities.` },
+  { key: "christmas", month: 12, day: 25, name: "Christmas", kind: "both",
+    promo: `🎄 Christmas is here!\n\nStill looking for a gift or something useful for the festive season? Explore available products from local sellers on MarketMix.\n\nFind your festive picks: {shop_link}`,
+    nonPromo: `Merry Christmas to everyone celebrating! May your day bring warmth, rest, laughter and meaningful moments with the people you love. We also send care to anyone spending today alone or finding the season difficult.` },
 
-  // ─────────── NOVEMBER ───────────
-  { key: "singles-day", month: 11, day: 11, name: "Singles' Day", kind: "both",
-    promo: `11.11 Singles' Day! 🛍️\n\nA good day to treat yourself to something you've genuinely wanted. Explore available products and check the actual prices before buying.\n\nBrowse MarketMix: {shop_link}`,
-    nonPromo: `Single, partnered, figuring things out or taking a break from dating? Your life has value beyond your relationship status. Celebrate yourself and the people who make life meaningful.` },
+  { key: "jamhuri-day", month: 12, day: 12, name: "Jamhuri Day", kind: "both",
+    promo: `🇰🇪 Happy Jamhuri Day!\n\nCelebrate Kenyan creativity and support local entrepreneurs by discovering their products on MarketMix.\n\nShop local, grow local: {shop_link}`,
+    nonPromo: `Happy Jamhuri Day, Kenya! Today we celebrate our country's history, our people and the communities that continue to shape our future.` },
 
-  { key: "diabetes-day", month: 11, day: 14, name: "World Diabetes Day", kind: "non-promo", sensitive: true,
-    nonPromo: `World Diabetes Day is an opportunity to learn about diabetes, early diagnosis and ongoing care. Share reliable information and encourage people to seek appropriate medical advice.` },
+  { key: "mothers-day", month: null, day: null, name: "Mother's Day", kind: "both", movable: true,
+    promo: `💐 Mother's Day is coming!\n\nLooking for a thoughtful gift for Mum or a mother figure? Explore available fashion, beauty products, accessories and home essentials from local sellers.\n\nFind a gift: {shop_link}`,
+    nonPromo: `Happy Mother's Day to the mothers, grandmothers, guardians and mother figures who show up in countless ways. We also send care to anyone for whom this day is difficult.` },
 
-  { key: "mens-day", month: 11, day: 19, name: "International Men's Day", kind: "both",
-    promo: `💙 Celebrate the men who build, create, care and support their communities.\n\nDiscover products from local sellers that may make thoughtful gifts.\n\nBrowse: {shop_link}`,
-    nonPromo: `Men deserve spaces where they can talk honestly, seek help and be supported without judgement. Check on your friends, appreciate the men who show up for you and remember that asking for help is strength.` },
-
-  { key: "childrens-day", month: 11, day: 20, name: "World Children's Day", kind: "non-promo", sensitive: true,
-    nonPromo: `Every child deserves safety, care, education and the chance to grow up with dignity. Let's listen to children, protect their rights and support the people working to keep them safe.` },
-
-  { key: "gbv-awareness", month: 11, day: 25, name: "International Day for the Elimination of Violence against Women", kind: "non-promo", sensitive: true,
-    nonPromo: `Every woman deserves to live free from violence, intimidation and abuse. Listen to survivors, challenge harmful behaviour and support safe access to help. Accountability and prevention matter.` },
+  { key: "fathers-day", month: null, day: null, name: "Father's Day", kind: "both", movable: true,
+    promo: `👔 Father's Day is coming!\n\nLooking for a thoughtful gift for Dad or a father figure? Explore available clothing, accessories, electronics and practical everyday finds.\n\nBrowse gifts: {shop_link}`,
+    nonPromo: `Happy Father's Day to the fathers, guardians and father figures who offer care, guidance and support. We also recognise that family experiences differ and send care to anyone finding today difficult.` },
 
   { key: "black-friday", month: null, day: null, name: "Black Friday", kind: "both", movable: true,
     promo: `🖤 BLACK FRIDAY at MarketMix!\n\nLooking for a good deal? Browse participating sellers, compare prices and check product details before ordering.\n\nDiscover available offers: {shop_link}\n\nOnly advertise discounts that have been verified.`,
@@ -1621,33 +1552,10 @@ const OCCASION_LIBRARY = [
     promo: `💻 Cyber Monday finds!\n\nExplore available electronics, accessories, fashion and other products from participating local sellers.\n\nBrowse: {shop_link}`,
     nonPromo: `Shopping online? Check the seller's details, confirm the final price and delivery arrangements, and use a payment method you trust. A little caution goes a long way.` },
 
-  // ─────────── DECEMBER ───────────
-  { key: "world-aids-day", month: 12, day: 1, name: "World AIDS Day", kind: "non-promo", sensitive: true,
-    nonPromo: `🎗️ World AIDS Day is a time to remember those lost, support people living with HIV and encourage testing, prevention and treatment. HIV is a health condition, not a reason to discriminate. Share reliable information and treat people with dignity.` },
+  { key: "easter", month: null, day: null, name: "Easter", kind: "both", movable: true,
+    promo: `🌷 Easter is here!\n\nPreparing for a family visit or celebration? Explore relevant products available from local sellers.\n\nBrowse MarketMix: {shop_link}`,
+    nonPromo: `Wishing everyone celebrating Easter a peaceful and meaningful holiday. May this season bring hope, reflection, kindness and time with the people who matter to you.` },
 
-  { key: "disabilities-day", month: 12, day: 3, name: "International Day of Persons with Disabilities", kind: "non-promo", sensitive: true,
-    nonPromo: `Accessibility and inclusion benefit everyone. Let's respect the rights of persons with disabilities, listen to their experiences and work toward communities where everyone can participate fully.` },
-
-  { key: "human-rights-day", month: 12, day: 10, name: "Human Rights Day", kind: "non-promo", sensitive: true,
-    nonPromo: `Every person deserves dignity, respect and equal treatment. Human rights matter in our homes, workplaces, schools and communities, every day of the year.` },
-
-  { key: "jamhuri-day", month: 12, day: 12, name: "Jamhuri Day", kind: "both",
-    promo: `🇰🇪 Happy Jamhuri Day!\n\nCelebrate Kenyan creativity and support local entrepreneurs by discovering their products on MarketMix.\n\nShop local, grow local: {shop_link}`,
-    nonPromo: `Happy Jamhuri Day, Kenya! Today we celebrate our country's history, our people and the communities that continue to shape our future.` },
-
-  { key: "christmas", month: 12, day: 25, name: "Christmas", kind: "both",
-    promo: `🎄 Christmas is here!\n\nStill looking for a gift or something useful for the festive season? Explore available products from local sellers on MarketMix.\n\nFind your festive picks: {shop_link}`,
-    nonPromo: `Merry Christmas to everyone celebrating! May your day bring warmth, rest, laughter and meaningful moments with the people you love. We also send care to anyone spending today alone or finding the season difficult.` },
-
-  { key: "boxing-day", month: 12, day: 26, name: "Boxing Day", kind: "both",
-    promo: `Boxing Day finds! 🛍️\n\nExplore available products and genuine clearance offers from participating sellers.\n\nBrowse: {shop_link}`,
-    nonPromo: `Whether you're visiting family, resting at home or catching up after a busy season, we hope you get a little time to breathe and enjoy the day.` },
-
-  { key: "year-end", month: 12, day: 31, name: "New Year's Eve", kind: "both",
-    promo: `One last look before the year ends! 👀\n\nExplore available products from local sellers and check out current offers.\n\n🛍️ {shop_link}\n\nShop local, grow local.`,
-    nonPromo: `As the year closes, remember the things you survived, the lessons you learned and the moments that mattered. You don't need a perfect plan for the new year. One meaningful next step is enough.` },
-
-  // ─────────── MOVABLE RELIGIOUS / CULTURAL ───────────
   { key: "ramadan", month: null, day: null, name: "Ramadan", kind: "both", movable: true,
     promo: `🌙 Ramadan Mubarak to everyone observing!\n\nPreparing for the month? Explore relevant household essentials, clothing and other available products from local sellers.\n\nBrowse: {shop_link}`,
     nonPromo: `Ramadan Mubarak to everyone observing. May this month bring reflection, generosity, patience and connection with family and community.` },
@@ -1656,29 +1564,19 @@ const OCCASION_LIBRARY = [
     promo: `🌙 Eid Mubarak!\n\nIf you're preparing for the celebration, discover available clothing, gifts, accessories and household essentials from local sellers.\n\nExplore: {shop_link}`,
     nonPromo: `Eid Mubarak to everyone celebrating! May your day be filled with peace, gratitude, generosity and time with loved ones.` },
 
-  { key: "eid-al-adha", month: null, day: null, name: "Eid al-Adha", kind: "both", movable: true,
-    promo: `Eid Mubarak! 🌙\n\nExplore relevant festive clothing, gifts and other available products from local businesses, if you're preparing for the celebration.\n\nBrowse: {shop_link}`,
-    nonPromo: `Wishing everyone observing Eid al-Adha a meaningful celebration filled with faith, generosity, compassion and community.` },
-
-  { key: "diwali", month: null, day: null, name: "Diwali", kind: "both", movable: true,
-    promo: `🪔 Happy Diwali to everyone celebrating!\n\nExplore available gifts, clothing, accessories and home products from local sellers.\n\nBrowse: {shop_link}`,
-    nonPromo: `Wishing everyone celebrating Diwali a joyful festival filled with light, hope, family and new beginnings.` },
-
-  // ─────────── RECURRING WEEKLY ───────────
   { key: "encouragement-monday", month: null, day: null, name: "Monday Encouragement", kind: "non-promo", recurring: "weekly", weekday: 1,
     nonPromo: `New week, fresh start. 💚\n\nYou don't need to have everything figured out. Choose your priorities, do what you can and give yourself room to learn along the way.` },
 
   { key: "encouragement-midweek", month: null, day: null, name: "Midweek Check-In", kind: "non-promo", recurring: "weekly", weekday: 3,
-    nonPromo: `Midweek check-in. 👋\n\nHave you eaten, had some water and taken a moment to breathe? You can be productive without treating yourself like a machine. Take care of yourself too.` },
+    nonPromo: `Midweek check-in. 👋\n\nHave you eaten, had some water and taken a moment to breathe? You can be productive without treating yourself like a machine.` },
 
   { key: "encouragement-friday", month: null, day: null, name: "Friday Encouragement", kind: "non-promo", recurring: "weekly", weekday: 5,
-    nonPromo: `You made it to Friday. 💚\n\nWhatever this week looked like, acknowledge the effort you put in. Rest when you can, celebrate the small wins and prepare for the next step at your own pace.` },
+    nonPromo: `You made it to Friday. 💚\n\nWhatever this week looked like, acknowledge the effort you put in. Rest when you can, celebrate the small wins.` },
 
   { key: "encouragement-sunday", month: null, day: null, name: "Sunday Reset", kind: "non-promo", recurring: "weekly", weekday: 0,
     nonPromo: `A gentle Sunday reminder: you don't have to solve next week's problems today.\n\nRest, prepare what you can and give yourself permission to enjoy a little peace before Monday.` },
 ];
 
-/* ─── Placeholder helper ─── */
 function fillOccasionTemplate(text, vars = {}) {
   if (!text) return "";
   const replacements = {
@@ -1700,7 +1598,6 @@ function fillOccasionTemplate(text, vars = {}) {
   );
 }
 
-/* ─── Date resolver ─── */
 function occasionDayKey(month, day) {
   return month * 100 + day;
 }
@@ -1757,7 +1654,6 @@ function buildOccasionMessage(occasion, { shopLink, name } = {}) {
   return fillOccasionTemplate(raw, { shopLink, name });
 }
 
-/* ─── Occasion settings ─── */
 async function occasionLoadSettings() {
   const ref = db.collection("platformSettings").doc("occasions");
   const snap = await ref.get();
@@ -1795,7 +1691,6 @@ async function occasionWasSentToday(occasionKey) {
   return !snap.empty;
 }
 
-/* ─── Occasion runner ─── */
 let occasionRunning = false;
 
 async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dryRun = false } = {}) {
@@ -1948,7 +1843,6 @@ async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dr
   }
 }
 
-/* ─── Occasion scheduler ─── */
 let occasionTickTimer = null;
 
 function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
@@ -3310,7 +3204,6 @@ app.post("/api/re/welcome", async (req, res) => {
   }
 });
 
-/* FIX #6 — group picker */
 app.get("/api/whatsapp/groups", async (req, res) => {
   try {
     const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
@@ -3351,7 +3244,6 @@ app.get("/api/whatsapp/groups", async (req, res) => {
   }
 });
 
-/* FIX #7 — AutoPromo admin endpoints */
 app.get("/api/admin/auto-promo", async (req, res) => {
   try {
     const settings = await autoPromoLoadSettings();
@@ -3372,7 +3264,7 @@ app.get("/api/admin/auto-promo", async (req, res) => {
 
 app.post("/api/admin/auto-promo", async (req, res) => {
   try {
-    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds"];
+    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds", "activeCampaignName", "activeFrom", "activeUntil", "activeContentType", "activeSendTimes"];
     const patch = {};
     for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
     await autoPromoSaveSettings(patch, req.body?.uid || "admin");
@@ -3387,6 +3279,7 @@ app.post("/api/admin/auto-promo", async (req, res) => {
    AUTO-PROMO PREVIEW — merged product + occasion timeline,
    respects perGroupPerDay, activeHours, selectedGroupIds.
    Deterministic per (date, slot, group) so refresh is stable.
+   NEW: applies marketingOverrides on top.
    ═══════════════════════════════════════════════════════════════ */
 app.post("/api/admin/auto-promo/preview", async (req, res) => {
   try {
@@ -3394,7 +3287,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     const autoSettings = await autoPromoLoadSettings();
     const occSettings  = await occasionLoadSettings();
 
-    /* ── Groups ── */
     let groups = [];
     try {
       const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
@@ -3420,14 +3312,17 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       console.log(`🤖 Preview: filtered to ${groups.length} group(s) (source: ${Array.isArray(groupIds) && groupIds.length ? "body" : "settings.selectedGroupIds"})`);
     }
 
-    /* ── Target date (EAT semantics — treat as UTC day) ── */
     const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const dateStr = targetDate.toISOString().slice(0, 10);
     const month = targetDate.getUTCMonth() + 1;
     const day   = targetDate.getUTCDate();
     const dow   = targetDate.getUTCDay();
     const year  = targetDate.getUTCFullYear();
 
-    /* ── Auto-promo product slots ── */
+    /* NEW: load overrides for this date once */
+    const overrides = await loadOverridesForDate(dateStr);
+    console.log(`🤖 Preview: ${overrides.size} override(s) loaded for ${dateStr}`);
+
     const perGroupPerDay = Math.min(
       AUTO_PROMO_MAX_PER_GROUP_PER_DAY,
       Math.max(1, Number(autoSettings.perGroupPerDay) || 4)
@@ -3451,7 +3346,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       }
     }
 
-    /* ── Products ── */
     const pSnap = await db.collection("products").get();
     const products = pSnap.docs
       .map(d => ({ id: d.id, ...d.data() }))
@@ -3463,7 +3357,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         return (qty > 0 || variantStock > 0) && p.isPublished !== false;
       });
 
-    /* ── Campaign lookup for that date ── */
     const nowKey = month * 100 + day;
     let campaign = null;
     for (const c of AUTO_PROMO_CAMPAIGNS) {
@@ -3499,9 +3392,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     for (const hour of autoSlotHours) {
       const timeBucket = autoPromoTimeBucket(hour);
       const kind = groups[0] ? autoPromoDetectGroupKind(groups[0].name) : "general";
-
-      /* Deterministic RNG seeded on (date, hour, position-in-day) */
-      const rng = autoPromoSeededRng(`${targetDate.toISOString().slice(0,10)}|${hour}|${autoSlots.length}`);
+      const rng = autoPromoSeededRng(`${dateStr}|${hour}|${autoSlots.length}`);
 
       const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
       const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
@@ -3527,7 +3418,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         product, campaign, groupName: groups[0]?.name || "MarketMix Family", productUrl,
       });
 
-      autoSlots.push({
+      let slot = {
         time: `${String(hour).padStart(2, "0")}:00`,
         hourEAT: hour, timeBucket, templateId,
         slotKind: "promo",
@@ -3536,10 +3427,14 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         imageUrl: product.images?.[0] || null,
         caption,
         skipped: false,
-      });
+      };
+
+      /* NEW: apply override */
+      slot = applyOverride(slot, overrides);
+
+      autoSlots.push(slot);
     }
 
-    /* ── Occasion slots for that date ── */
     const { dated, recurring } = resolveOccasionsForDate({
       month, day, weekday: dow, year,
       movableDates: occSettings.movableDates || {},
@@ -3568,17 +3463,17 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       });
     }
 
-    /* ── Merge & sort by time ── */
     const slots = [...autoSlots, ...occasionSlots]
       .sort((a, b) => a.time.localeCompare(b.time));
 
     return res.json({
       success: true,
-      date: targetDate.toISOString().slice(0, 10),
+      date: dateStr,
       campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
       groupCount: groups.length,
       perGroupPerDay,
       activeHours: autoSettings.activeHours || { start: 8, end: 21 },
+      overridesApplied: overrides.size,
       slots,
     });
   } catch (e) {
@@ -3604,7 +3499,66 @@ app.post("/api/admin/auto-promo/run-now", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   ═══ OCCASION ADMIN ENDPOINTS ═══
+   OVERRIDES — admin edits applied on top of the deterministic plan
+   ═══════════════════════════════════════════════════════════════ */
+app.get("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: "date query param required" });
+    const snap = await db.collection("marketingOverrides")
+      .where("date", "==", date)
+      .get();
+    return res.json({
+      success: true,
+      count: snap.size,
+      overrides: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load overrides");
+  }
+});
+
+app.post("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date, slot, originalProductId, productId, productName, imageUrl, caption, time, skipped } = req.body || {};
+    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
+
+    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
+    const payload = {
+      date,
+      slot,
+      originalProductId: originalProductId || null,
+      savedAt: admin.firestore.FieldValue.serverTimestamp(),
+      savedBy: req.body?.uid || "admin",
+    };
+    if (productId !== undefined) payload.productId = productId;
+    if (productName !== undefined) payload.productName = productName;
+    if (imageUrl !== undefined) payload.imageUrl = imageUrl;
+    if (caption !== undefined) payload.caption = caption;
+    if (time !== undefined) payload.time = time;
+    if (skipped !== undefined) payload.skipped = skipped;
+
+    await db.collection("marketingOverrides").doc(key).set(payload, { merge: true });
+    return res.json({ success: true, key, payload });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save override");
+  }
+});
+
+app.delete("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date, slot, originalProductId } = req.body || {};
+    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
+    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
+    await db.collection("marketingOverrides").doc(key).delete().catch(() => {});
+    return res.json({ success: true, key });
+  } catch (e) {
+    return sendServerError(res, e, "Could not delete override");
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════
+   OCCASION ADMIN ENDPOINTS
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/occasions", async (req, res) => {
   try {
@@ -4006,7 +3960,6 @@ app.post("/api/driver/decision", async (req, res) => {
   }
 });
 
-/* FIX #3 — /api/whatsapp/notify with images */
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
     const {
@@ -5075,12 +5028,14 @@ app.get("/_health", (req, res) => {
     whatsappQueue: waQueue.length,
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     autoPromo: {
-      endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview"],
+      endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview", "/api/admin/marketing-overrides"],
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
+      overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.2",
+      version: "v2.3",
       deterministicPreview: true,
+      overrideAware: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -5107,6 +5062,7 @@ app.get("/_health", (req, res) => {
       "/api/admin/auto-promo",
       "/api/admin/auto-promo/run-now",
       "/api/admin/auto-promo/preview",
+      "/api/admin/marketing-overrides",
       "/api/admin/occasions",
       "/api/admin/occasions/preview",
       "/api/admin/occasions/run-now",
@@ -5132,29 +5088,9 @@ app.get("/_health", (req, res) => {
       "/_health",
     ],
     fixes: [
-      "FIX #1  — body limit bumped to 25mb",
-      "FIX #2  — buildWahaFilePayload normalizes dataURL / base64 / URL",
-      "FIX #3  — /api/whatsapp/notify supports images with text fallback",
-      "FIX #4  — /api/test-whatsapp-notify-image test endpoint",
-      "FIX #5  — normalizeWaChatId + @g.us on all send paths",
-      "FIX #6  — GET /api/whatsapp/groups (NOWEB /api/default/groups)",
-      "FIX #7  — AutoPromo scheduler + admin endpoints (INLINED in server.js v2)",
-      "FIX #8  — AutoPromo v2 campaign calendar, time/day buckets, 20 templates (T1–T20)",
-      "FIX #9  — Admin 7am/7pm EAT flash-sales nudge (adminFlashNudgeTick)",
-      "FIX #10 — /api/admin/auto-promo/preview (dry-run planner for tomorrow)",
-      "FIX #11 — OCCASION ENGINE: full-year ~90-occasion library + date resolver",
-      "FIX #12 — Occasion scheduler + admin endpoints (GET / POST / preview / run-now)",
-      "FIX #13 — Sensitive occasions (sensitive: true) never send promo content",
-      "FIX #14 — Recurring weekly entries scheduled separately from dated occasions",
-      "FIX #15 — fillOccasionTemplate() with {shop_link} placeholder support",
-      "FIX #16 — Preview respects perGroupPerDay + activeHours (no hardcoded 5 slots)",
-      "FIX #17 — Preview merges auto-promo AND occasion slots into one timeline",
-      "FIX #18 — Live scheduler de-dupes templates and products per group per day",
-      "FIX #19 — autoPromoPickTemplatePool() replaces single-template picker for rotation",
-      "FIX #20 — autoPromoTemplatesUsedToday() + autoPromoProductsUsedToday() helpers",
-      "FIX #21 — selectedGroupIds persisted in platformSettings/autoPromo and honoured by scheduler + preview",
-      "FIX #22 — autoPromoSeededRng makes preview deterministic per (date, slot, position)",
-      "FIX #23 — Default selectedGroupIds=[] in autoPromoLoadSettings so reads never crash",
+      "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
+      "FIX #25 — GET/POST/DELETE /api/admin/marketing-overrides",
+      "FIX #26 — preview response includes overridesApplied count",
     ],
     uptime: process.uptime(),
   });
@@ -5203,15 +5139,9 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
-// Start AutoPromo scheduler (inlined)
 autoPromoStartScheduler({ SCAN_MS: 15 * 60 * 1000 });
-
-// Start Occasion scheduler (inlined)
 occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 
-// ============================
-// Admin flash-sales nudge (7am & 7pm EAT)
-// ============================
 let adminFlashNudgeLastKey = null;
 const ADMIN_FLASH_NUDGE_HOURS = [7, 19];
 
@@ -5272,38 +5202,9 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🌐 CORS origins: ${allowedOrigins.join(", ")}`);
-  console.log(`🛍️ Shop frontend: ${MARKETPLACE_URL}`);
-  console.log(`🌐 Website: ${WEBSITE_URL}`);
-  console.log(`🛍️ Products: ${PRODUCTS_URL}`);
-  console.log(`🧾 Receipt base: ${ORDER_RECEIPT_BASE}`);
-  console.log(`👥 WhatsApp group: ${WHATSAPP_GROUP_URL}`);
-  console.log(`🏠 Real Estates frontend: ${REAL_ESTATE_APP_URL}`);
-  console.log(`🚚 Moving URL: ${MOVING_URL}`);
-  console.log(`🧑✈️ Driver approvals: ✅`);
-  console.log(`🔔 Admin → user notifications: ✅`);
-  console.log(`💬 WhatsApp notify endpoints: ✅`);
-  console.log(`🖼️ WhatsApp image notify: ✅`);
-  console.log(`👥 WhatsApp group picker: ✅`);
-  console.log(`🆔 Group-aware chatId: ✅`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2.2)`);
-  console.log(`🎯 AutoPromo campaign calendar: ✅ (${AUTO_PROMO_CAMPAIGNS.length} campaigns)`);
-  console.log(`📝 AutoPromo templates: ✅ (${Object.keys(AutoPromoTemplates).length} templates T1–T20)`);
-  console.log(`🔮 AutoPromo preview endpoint: ✅ (deterministic, respects perGroupPerDay, selectedGroupIds, occasions)`);
-  console.log(`🎯 Occasion engine: ✅ (${OCCASION_LIBRARY.length} occasions)`);
-  console.log(`📅 Occasion movable: ✅ (${OCCASION_LIBRARY.filter(o => o.movable).length})`);
-  console.log(`🔁 Occasion recurring: ✅ (${OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length})`);
-  console.log(`🛡️ Occasion sensitive: ✅ (${OCCASION_LIBRARY.filter(o => o.sensitive === true).length})`);
-  console.log(`👋 Real Estates welcome: ✅`);
-  console.log(`📦 Seller order notifications: ✅`);
-  console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
-  console.log(`⚡ Quicksale WhatsApp: ✅`);
-  console.log(`🎉 Welcome subscriber WhatsApp: ✅`);
-  console.log(`🔗 Group invite on buyer/onboarding templates`);
-  console.log(`📊 Inventory movements logged on /api/update-stock`);
-  console.log(`📣 Admin flash nudge: ✅ (7am & 7pm EAT)`);
-  console.log(`📞 Admin WhatsApp: ${ADMIN_PHONE}`);
-  console.log(`📞 Orders WhatsApp: ${ORDERS_PHONE}`);
+  console.log(`🤖 AutoPromo: v2.3 (override-aware)`);
+  console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
+  console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
 
 const shutdown = () => {
