@@ -2659,6 +2659,137 @@ app.post("/api/admin/auto-promo", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════
+   AUTO-PROMO PREVIEW — generates tomorrow's plan without sending
+   ═══════════════════════════════════════════════════════════════ */
+app.post("/api/admin/auto-promo/preview", async (req, res) => {
+  try {
+    const { date = null, groupIds = null } = req.body || {};
+    const settings = await autoPromoLoadSettings();
+
+    /* Groups */
+    let groups = [];
+    try {
+      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+      const data = await r.json().catch(() => ({}));
+      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      groups = list
+        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
+        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
+    } catch (e) {
+      return sendServerError(res, e, "Could not fetch groups");
+    }
+
+    if (Array.isArray(groupIds) && groupIds.length > 0) {
+      const allowed = new Set(groupIds);
+      groups = groups.filter(g => allowed.has(g.id));
+    }
+
+    /* Products */
+    const pSnap = await db.collection("products").get();
+    const products = pSnap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(p => {
+        const qty = Number(p.quantity) || 0;
+        const variantStock = Array.isArray(p.variants)
+          ? p.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0)
+          : 0;
+        return (qty > 0 || variantStock > 0) && p.isPublished !== false;
+      });
+
+    /* Simulate the 5 daily slots */
+    const SLOT_HOURS = [8, 11, 14, 17, 20];
+    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const month = targetDate.getUTCMonth() + 1;
+    const day = targetDate.getUTCDate();
+    const dow = targetDate.getUTCDay();
+
+    /* Campaign lookup for that date */
+    const nowKey = month * 100 + day;
+    let campaign = null;
+    for (const c of AUTO_PROMO_CAMPAIGNS) {
+      const startKey = c.startMonth * 100 + c.startDay;
+      const endKey = c.endMonth * 100 + c.endDay;
+      const evtKey = c.eventMonth * 100 + c.eventDay;
+      let inRange = false;
+      if (startKey <= endKey) inRange = nowKey >= startKey && nowKey <= endKey;
+      else inRange = nowKey >= startKey || nowKey <= endKey;
+      if (inRange) {
+        const evtMonth = Math.floor(evtKey / 100);
+        const evtDay = c.eventDay;
+        const nowMonth = Math.floor(nowKey / 100);
+        const daysToEvent = nowKey <= evtKey
+          ? (evtMonth - nowMonth) * 30 + (evtDay - day)
+          : -1;
+        campaign = { ...c, daysToEvent };
+        break;
+      }
+    }
+
+    const dayBucket = dow === 1 ? "monday"
+      : (dow === 2 || dow === 3) ? "midweek"
+      : dow === 4 ? "almost_friday"
+      : dow === 5 ? "friday"
+      : dow === 6 ? "saturday" : "sunday";
+    const payday = day >= 25 || day <= 5;
+    const monthEnd = day >= 28;
+
+    const slots = [];
+    const usedProducts = new Set();
+
+    for (const hour of SLOT_HOURS) {
+      const timeBucket = autoPromoTimeBucket(hour);
+      const kind = groups[0] ? autoPromoDetectGroupKind(groups[0].name) : "general";
+      const templateId = autoPromoPickTemplateId({
+        campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind,
+      });
+
+      /* Pick a product — avoid repeats within the same preview */
+      const available = products.filter(p => !usedProducts.has(p.id));
+      const pool = available.length ? available : products;
+      if (!pool.length) {
+        slots.push({
+          time: `${String(hour).padStart(2, "0")}:00`,
+          timeBucket, templateId, skipped: true, reason: "no-products",
+        });
+        continue;
+      }
+
+      const product = pool[Math.floor(Math.random() * pool.length)];
+      usedProducts.add(product.id);
+
+      const productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+      const caption = autoPromoFillTemplate(templateId, {
+        product, campaign, groupName: groups[0]?.name || "MarketMix Family", productUrl,
+      });
+
+      slots.push({
+        time: `${String(hour).padStart(2, "0")}:00`,
+        hourEAT: hour,
+        timeBucket,
+        templateId,
+        productId: product.id,
+        productName: product.name || "—",
+        imageUrl: product.images?.[0] || null,
+        caption,
+        groupCount: groups.length,
+        skipped: false,
+      });
+    }
+
+    return res.json({
+      success: true,
+      date: targetDate.toISOString().slice(0, 10),
+      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
+      groupCount: groups.length,
+      slots,
+    });
+  } catch (e) {
+    console.error("❌ /api/admin/auto-promo/preview failed:", e);
+    return sendServerError(res, e, "Preview failed");
+  }
+});
+
 app.post("/api/admin/auto-promo/run-now", async (req, res) => {
   try {
     const settings = await autoPromoLoadSettings();
@@ -4020,7 +4151,7 @@ app.get("/_health", (req, res) => {
     whatsappQueue: waQueue.length,
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     autoPromo: {
-      endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now"],
+      endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview"],
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
       inlined: true,
@@ -4035,6 +4166,7 @@ app.get("/_health", (req, res) => {
       "/api/whatsapp/send-media",
       "/api/admin/auto-promo",
       "/api/admin/auto-promo/run-now",
+      "/api/admin/auto-promo/preview",
       "/api/service-request/notify",
       "/api/moving/notify",
       "/api/re/welcome",
@@ -4066,6 +4198,7 @@ app.get("/_health", (req, res) => {
       "FIX #7 — AutoPromo scheduler + admin endpoints (INLINED in server.js v2)",
       "FIX #8 — AutoPromo v2 campaign calendar, time/day buckets, 20 templates (T1–T20)",
       "FIX #9 — Admin 7am/7pm EAT flash-sales nudge (adminFlashNudgeTick)",
+      "FIX #10 — /api/admin/auto-promo/preview (dry-run planner for tomorrow)",
     ],
     uptime: process.uptime(),
   });
@@ -4197,6 +4330,7 @@ const server = app.listen(PORT, () => {
   console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2)`);
   console.log(`🎯 AutoPromo campaign calendar: ✅ (${AUTO_PROMO_CAMPAIGNS.length} campaigns)`);
   console.log(`📝 AutoPromo templates: ✅ (${Object.keys(AutoPromoTemplates).length} templates T1–T20)`);
+  console.log(`🔮 AutoPromo preview endpoint: ✅ (/api/admin/auto-promo/preview)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
