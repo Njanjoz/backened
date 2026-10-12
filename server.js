@@ -16,9 +16,13 @@
 // days, and `sensitive: true` protection that blocks promo content.
 //
 // NEW (2026-10):
-//   • Preview endpoint now respects perGroupPerDay + activeHours and merges
+//   • Preview endpoint respects perGroupPerDay + activeHours and merges
 //     occasion slots into the same timeline the scheduler will use.
 //   • Live scheduler de-dupes templates and products per group per day.
+//   • Preview is deterministic per (date, slot, group) — refresh returns the
+//     same plan, so admin edits stay stable.
+//   • Group filter: selectedGroupIds persisted in platformSettings/autoPromo
+//     is honoured by both the live scheduler and the preview endpoint.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -665,6 +669,22 @@ function autoPromoGetActiveCampaign() {
   return null;
 }
 
+/* Deterministic PRNG seeded from a string. Same seed → same sequence. */
+function autoPromoSeededRng(seedStr) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return function () {
+    h += 0x6D2B79F5;
+    let t = h;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 /* Legacy single-template picker (kept for backward compatibility). */
 function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
   if (groupKind === "sellers") return "T16";
@@ -691,7 +711,7 @@ function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, mont
   }
 }
 
-/* NEW — ordered pool of template IDs appropriate for this moment.
+/* Ordered pool of template IDs appropriate for this moment.
    The caller picks the first one not already used today. */
 function autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
   if (groupKind === "sellers") return ["T16", "T17", "T18", "T1", "T3", "T8", "T9", "T10"];
@@ -1068,6 +1088,7 @@ async function autoPromoLoadSettings() {
     minGapMinutes: 90,
     activeHours: { start: 8, end: 21 },
     siteUrl: "https://www.marketmixkenya.co.ke",
+    selectedGroupIds: [],
   };
   if (!snap.exists) return defaults;
   return { ...defaults, ...snap.data() };
@@ -1094,7 +1115,7 @@ async function autoPromoCountTodaySends(groupId) {
   return snap.size;
 }
 
-/* NEW — templates already sent to this group today. */
+/* Templates already sent to this group today. */
 async function autoPromoTemplatesUsedToday(groupId) {
   const used = new Set();
   try {
@@ -1111,7 +1132,7 @@ async function autoPromoTemplatesUsedToday(groupId) {
   return used;
 }
 
-/* NEW — products already sent to this group today. */
+/* Products already sent to this group today. */
 async function autoPromoProductsUsedToday(groupId) {
   const used = new Set();
   try {
@@ -1200,11 +1221,31 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       return { error: "groups-fetch-failed", detail: e.message };
     }
 
-    if (Array.isArray(forceGroupIds) && forceGroupIds.length > 0) {
-      const allowed = new Set(forceGroupIds);
+    /* ── Group filter ──
+       Precedence:
+         1. forceGroupIds (explicit override — run-now, tests)
+         2. settings.selectedGroupIds (persisted admin selection)
+         3. no filter → send to every group WAHA returns */
+    const persistedIds = Array.isArray(settings.selectedGroupIds)
+      ? settings.selectedGroupIds
+      : [];
+    const effectiveIds =
+      Array.isArray(forceGroupIds) && forceGroupIds.length > 0
+        ? forceGroupIds
+        : persistedIds;
+
+    if (effectiveIds.length > 0) {
+      const allowed = new Set(effectiveIds);
+      const before = groups.length;
       groups = groups.filter(g => allowed.has(g.id));
-      const missing = forceGroupIds.filter(id => !groups.find(g => g.id === id));
+      const missing = effectiveIds.filter(id => !groups.find(g => g.id === id));
       for (const id of missing) groups.push({ id, name: "(forced)" });
+      console.log(
+        `🤖 AutoPromo: filtered groups ${before} → ${groups.length} ` +
+        `(source: ${Array.isArray(forceGroupIds) && forceGroupIds.length ? "forceGroupIds" : "settings.selectedGroupIds"})`
+      );
+    } else {
+      console.log(`🤖 AutoPromo: no group filter set — sending to all ${groups.length} groups`);
     }
 
     if (!groups.length) return { skipped: "no-groups" };
@@ -3331,7 +3372,7 @@ app.get("/api/admin/auto-promo", async (req, res) => {
 
 app.post("/api/admin/auto-promo", async (req, res) => {
   try {
-    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl"];
+    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds"];
     const patch = {};
     for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
     await autoPromoSaveSettings(patch, req.body?.uid || "admin");
@@ -3344,7 +3385,8 @@ app.post("/api/admin/auto-promo", async (req, res) => {
 
 /* ═══════════════════════════════════════════════════════════════
    AUTO-PROMO PREVIEW — merged product + occasion timeline,
-   respects perGroupPerDay and activeHours, no hardcoded 5 slots.
+   respects perGroupPerDay, activeHours, selectedGroupIds.
+   Deterministic per (date, slot, group) so refresh is stable.
    ═══════════════════════════════════════════════════════════════ */
 app.post("/api/admin/auto-promo/preview", async (req, res) => {
   try {
@@ -3364,9 +3406,18 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     } catch (e) {
       return sendServerError(res, e, "Could not fetch groups");
     }
-    if (Array.isArray(groupIds) && groupIds.length > 0) {
-      const allowed = new Set(groupIds);
+
+    const previewPersistedIds = Array.isArray(autoSettings.selectedGroupIds)
+      ? autoSettings.selectedGroupIds
+      : [];
+    const previewEffectiveIds =
+      Array.isArray(groupIds) && groupIds.length > 0
+        ? groupIds
+        : previewPersistedIds;
+    if (previewEffectiveIds.length > 0) {
+      const allowed = new Set(previewEffectiveIds);
       groups = groups.filter(g => allowed.has(g.id));
+      console.log(`🤖 Preview: filtered to ${groups.length} group(s) (source: ${Array.isArray(groupIds) && groupIds.length ? "body" : "settings.selectedGroupIds"})`);
     }
 
     /* ── Target date (EAT semantics — treat as UTC day) ── */
@@ -3393,7 +3444,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         const idx = Math.min(hourPool.length - 1, Math.floor(i * step));
         if (!autoSlotHours.includes(hourPool[idx])) autoSlotHours.push(hourPool[idx]);
       }
-      /* If rounding collapsed two picks, fill from the remaining pool */
       while (autoSlotHours.length < perGroupPerDay) {
         const next = hourPool.find(h => !autoSlotHours.includes(h));
         if (next === undefined) break;
@@ -3450,6 +3500,9 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       const timeBucket = autoPromoTimeBucket(hour);
       const kind = groups[0] ? autoPromoDetectGroupKind(groups[0].name) : "general";
 
+      /* Deterministic RNG seeded on (date, hour, position-in-day) */
+      const rng = autoPromoSeededRng(`${targetDate.toISOString().slice(0,10)}|${hour}|${autoSlots.length}`);
+
       const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
       const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
       usedTemplates.add(templateId);
@@ -3466,7 +3519,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         });
         continue;
       }
-      const product = pickFrom[Math.floor(Math.random() * pickFrom.length)];
+      const product = pickFrom[Math.floor(rng() * pickFrom.length)];
       usedProducts.add(product.id);
 
       const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
@@ -3499,7 +3552,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       if (!message) continue;
       const isRecurring = !!occ.recurring;
       const isSensitive = !!occ.sensitive;
-      const baseHour = isRecurring ? 15 : 9;
+      const baseHour = isRecurring ? 3 : 9;
       occasionSlots.push({
         time: `${String(baseHour).padStart(2, "0")}:00`,
         hourEAT: baseHour,
@@ -5026,7 +5079,9 @@ app.get("/_health", (req, res) => {
       firestoreSettingsDoc: "platformSettings/autoPromo",
       logCollection: "autoPromoLogs",
       inlined: true,
-      version: "v2.1",
+      version: "v2.2",
+      deterministicPreview: true,
+      groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
     },
@@ -5092,11 +5147,14 @@ app.get("/_health", (req, res) => {
       "FIX #13 — Sensitive occasions (sensitive: true) never send promo content",
       "FIX #14 — Recurring weekly entries scheduled separately from dated occasions",
       "FIX #15 — fillOccasionTemplate() with {shop_link} placeholder support",
-      "FIX #16 — Preview now respects perGroupPerDay + activeHours (no hardcoded 5 slots)",
+      "FIX #16 — Preview respects perGroupPerDay + activeHours (no hardcoded 5 slots)",
       "FIX #17 — Preview merges auto-promo AND occasion slots into one timeline",
       "FIX #18 — Live scheduler de-dupes templates and products per group per day",
       "FIX #19 — autoPromoPickTemplatePool() replaces single-template picker for rotation",
       "FIX #20 — autoPromoTemplatesUsedToday() + autoPromoProductsUsedToday() helpers",
+      "FIX #21 — selectedGroupIds persisted in platformSettings/autoPromo and honoured by scheduler + preview",
+      "FIX #22 — autoPromoSeededRng makes preview deterministic per (date, slot, position)",
+      "FIX #23 — Default selectedGroupIds=[] in autoPromoLoadSettings so reads never crash",
     ],
     uptime: process.uptime(),
   });
@@ -5228,10 +5286,10 @@ const server = app.listen(PORT, () => {
   console.log(`🖼️ WhatsApp image notify: ✅`);
   console.log(`👥 WhatsApp group picker: ✅`);
   console.log(`🆔 Group-aware chatId: ✅`);
-  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2.1)`);
+  console.log(`🤖 AutoPromo scheduler: ✅ (inlined v2.2)`);
   console.log(`🎯 AutoPromo campaign calendar: ✅ (${AUTO_PROMO_CAMPAIGNS.length} campaigns)`);
   console.log(`📝 AutoPromo templates: ✅ (${Object.keys(AutoPromoTemplates).length} templates T1–T20)`);
-  console.log(`🔮 AutoPromo preview endpoint: ✅ (respects perGroupPerDay + occasions)`);
+  console.log(`🔮 AutoPromo preview endpoint: ✅ (deterministic, respects perGroupPerDay, selectedGroupIds, occasions)`);
   console.log(`🎯 Occasion engine: ✅ (${OCCASION_LIBRARY.length} occasions)`);
   console.log(`📅 Occasion movable: ✅ (${OCCASION_LIBRARY.filter(o => o.movable).length})`);
   console.log(`🔁 Occasion recurring: ✅ (${OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length})`);
