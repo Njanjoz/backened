@@ -53,16 +53,11 @@ app.use(cors({
 
 /* ═══════════════════════════════════════════════════════════════
    FIX #1 — INCREASED BODY LIMIT FOR INLINE IMAGES
-   WHAT: Bumps JSON body limit from 15mb → 25mb.
-   WHY:  Base64-encoded images sent to /api/whatsapp/notify can
-         easily exceed 15mb for large photos. 25mb gives headroom
-         while still rejecting truly abusive payloads.
    ═══════════════════════════════════════════════════════════════ */
 app.use(bodyParser.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
   try {
-    // NEW-FIX: Skip logging giant base64 image payloads to keep logs readable
     const logBody = { ...req.body };
     if (logBody.imageUrl && typeof logBody.imageUrl === "string" && logBody.imageUrl.length > 200) {
       logBody.imageUrl = `[base64 image: ${logBody.imageUrl.length} chars]`;
@@ -116,8 +111,8 @@ try {
   process.exit(1);
 }
 
-db = shopApp.firestore();   // Shop Firestore
-reDb = reApp.firestore();   // Real Estate Firestore
+db = shopApp.firestore();
+reDb = reApp.firestore();
 
 async function verifyAnyToken(idToken) {
   try {
@@ -153,7 +148,6 @@ const DRIVER_ONBOARD_URL = `${REAL_ESTATE_APP_URL}/`;
 
 const SELLER_DASHBOARD_URL = `${MARKETPLACE_URL}/seller/dashboard/orders`;
 
-// ⭐ PROMO — customer-facing URLs + WhatsApp group invite
 const WEBSITE_URL = process.env.WEBSITE_URL || "https://www.marketmixkenya.co.ke";
 const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
@@ -301,22 +295,27 @@ function normalizePhoneForWa(phoneNumber) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   FIX #5 — GROUP-AWARE CHAT ID NORMALIZER
+   WHAT: Accepts either a phone number OR a WhatsApp group id
+         ("...@g.us") and returns the right chatId-ready string.
+   WHY:  Admin group picker sends back @g.us ids; the send paths
+         previously assumed every input was a phone.
+   ═══════════════════════════════════════════════════════════════ */
+function normalizeWaChatId(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  if (s.endsWith("@g.us")) return s;
+  return normalizePhoneForWa(s);
+}
+
+/* ═══════════════════════════════════════════════════════════════
    FIX #2 — BASE64 IMAGE NORMALIZER
-   WHAT: Converts any accepted image format into the object shape
-         WAHA's /api/sendImage expects.
-   WHY:  Your frontend may pass:
-           • a full data URL:  "data:image/jpeg;base64,XXXX"
-           • a raw base64:     "XXXX"
-           • an http(s) URL:   "https://..."
-         This helper normalizes all three so the send path stays
-         clean and predictable.
    ═══════════════════════════════════════════════════════════════ */
 function buildWahaFilePayload(input, { filename, mimeOverride } = {}) {
   if (!input || typeof input !== "string") return null;
   const s = input.trim();
   if (!s) return null;
 
-  // Case 1: data URL  → data:image/png;base64,XXXX
   if (s.startsWith("data:")) {
     const match = /^data:([^;]+);base64,(.+)$/i.exec(s);
     if (!match) return null;
@@ -331,12 +330,10 @@ function buildWahaFilePayload(input, { filename, mimeOverride } = {}) {
     };
   }
 
-  // Case 2: plain http(s) URL
   if (/^https?:\/\//i.test(s)) {
     return { mode: "url", file: { url: s, filename: filename || undefined } };
   }
 
-  // Case 3: raw base64 (assume JPEG unless overridden)
   if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 64) {
     const mimetype = mimeOverride || "image/jpeg";
     return {
@@ -365,9 +362,9 @@ function backoffForAttempt(attempts) {
 }
 
 function enqueueWhatsApp(phoneNumber, message, meta = {}) {
-  const normalized = normalizePhoneForWa(phoneNumber);
+  const normalized = normalizeWaChatId(phoneNumber);
   if (!normalized) {
-    console.log("⚠️ WhatsApp skipped — invalid phone:", phoneNumber, meta);
+    console.log("⚠️ WhatsApp skipped — invalid phone/group:", phoneNumber, meta);
     return false;
   }
   waQueue.push({
@@ -384,9 +381,9 @@ function enqueueWhatsApp(phoneNumber, message, meta = {}) {
 }
 
 function enqueueWhatsAppImage(phoneNumber, imageUrl, caption = "", meta = {}) {
-  const normalized = normalizePhoneForWa(phoneNumber);
+  const normalized = normalizeWaChatId(phoneNumber);
   if (!normalized) {
-    console.log("⚠️ WA image skipped — invalid phone:", phoneNumber, meta);
+    console.log("⚠️ WA image skipped — invalid phone/group:", phoneNumber, meta);
     return false;
   }
   waQueue.push({
@@ -438,7 +435,7 @@ async function attemptWaSend(job) {
     : timeoutForAttempt(job.attempts);
 
   try {
-    const chatId = `${job.phone}@c.us`;
+    const chatId = job.phone.endsWith("@g.us") ? job.phone : `${job.phone}@c.us`;
 
     if (job.kind === "image" && job.imageUrl) {
       const res = await wahaFetch(WAHA_SEND_IMAGE_PATH, {
@@ -487,9 +484,9 @@ async function attemptWaSend(job) {
 const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
 
 async function wahaSendImage({ phone, imageUrl, caption, filename }) {
-  const normalized = normalizePhoneForWa(phone);
-  if (!normalized) throw new Error(`Invalid phone: ${phone}`);
-  const chatId = `${normalized}@c.us`;
+  const normalized = normalizeWaChatId(phone);
+  if (!normalized) throw new Error(`Invalid phone/group: ${phone}`);
+  const chatId = normalized.endsWith("@g.us") ? normalized : `${normalized}@c.us`;
 
   const body = {
     session: "default",
@@ -516,9 +513,9 @@ async function wahaSendImage({ phone, imageUrl, caption, filename }) {
 }
 
 async function wahaSendFile({ phone, fileUrl, filename, caption }) {
-  const normalized = normalizePhoneForWa(phone);
-  if (!normalized) throw new Error(`Invalid phone: ${phone}`);
-  const chatId = `${normalized}@c.us`;
+  const normalized = normalizeWaChatId(phone);
+  if (!normalized) throw new Error(`Invalid phone/group: ${phone}`);
+  const chatId = normalized.endsWith("@g.us") ? normalized : `${normalized}@c.us`;
 
   const body = {
     session: "default",
@@ -568,7 +565,6 @@ function personalizeBulkMessage(template, { name } = {}) {
 // WhatsApp templates — MarketMix store
 // ============================
 
-// ⭐ BUYER — payment received (Explore + Group, no duplicate shop link)
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -595,7 +591,6 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
   ].join("\n");
 }
 
-// ⭐ BUYER — order confirmed (Track + Group, no duplicate shop link)
 function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -628,7 +623,6 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
   ].join("\n");
 }
 
-// ⭐ BUYER — status update (Track + Group)
 function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -666,7 +660,6 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   ].join("\n");
 }
 
-// ⭐ BUYER — quicksale (Explore + Group)
 function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -775,7 +768,6 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
   ].join("\n");
 }
 
-// ⭐ Welcome WhatsApp for new newsletter subscribers
 function welcomeSubscriberWhatsApp({ name }) {
   const displayName = name && String(name).trim() ? String(name).trim() : "there";
   return [
@@ -1915,6 +1907,32 @@ app.post("/api/re/welcome", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════
+   FIX #6 — GROUP PICKER ROUTE
+   WHAT: Lists WhatsApp groups via WAHA so the admin promote page
+         can populate its group picker.
+   WHERE: immediately above /api/whatsapp/send-media
+   ═══════════════════════════════════════════════════════════════ */
+app.get("/api/whatsapp/groups", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/chats?session=default", { timeoutMs: 20000 });
+    const data = await r.json().catch(() => []);
+    const groups = Array.isArray(data)
+      ? data
+          .filter((c) => c && c.id && String(c.id).endsWith("@g.us"))
+          .map((c) => ({
+            id: c.id,
+            name: c.name || c.subject || "(unnamed group)",
+          }))
+      : [];
+    console.log(`👥 /api/whatsapp/groups → ${groups.length} group(s)`);
+    return res.json({ success: true, count: groups.length, groups });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/groups failed:", e);
+    return sendServerError(res, e, "Could not list groups");
+  }
+});
+
 app.post("/api/whatsapp/send-media", async (req, res) => {
   try {
     const {
@@ -2193,36 +2211,6 @@ app.post("/api/driver/decision", async (req, res) => {
 
 /* ═══════════════════════════════════════════════════════════════════════════
    FIX #3 — /api/whatsapp/notify NOW SUPPORTS IMAGES
-   ═══════════════════════════════════════════════════════════════════════════
-   WHAT:
-     The endpoint now accepts two new optional fields:
-       • imageUrl     — data URL ("data:image/jpeg;base64,...") or http(s) URL
-       • imageBase64  — raw base64 string (no prefix)
-       • filename     — optional filename
-       • mediaType    — "image" (default) or "file"
-
-   WHY:
-     Previously this endpoint could only send plain text. Sellers who
-     wanted to promote a service with its photo had no way to attach
-     the image — it was silently dropped.
-
-   BEHAVIOR:
-     • If neither imageUrl nor imageBase64 is sent  → text-only path,
-       identical to before. Existing callers are unaffected.
-     • If an image is sent                          → uploaded via
-       WAHA /api/sendImage with the message as caption.
-     • If the image send fails for any reason       → automatically
-       falls back to queuing the plain text message, so the recipient
-       still gets notified.
-
-   HOW TO USE (from frontend):
-     POST /api/whatsapp/notify
-     {
-       "phone":   "254712345678",
-       "title":   "Promo",
-       "message": "Check out our new service!",
-       "imageUrl":"data:image/jpeg;base64,..."   ← optional
-     }
    ═══════════════════════════════════════════════════════════════════════════ */
 app.post("/api/whatsapp/notify", async (req, res) => {
   try {
@@ -2230,7 +2218,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
       phone,
       title,
       message,
-      // NEW-FIX: optional image fields
       imageUrl,
       imageBase64,
       filename,
@@ -2243,7 +2230,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
 
     const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
 
-    // NEW-FIX: normalise whatever image shape we got (dataURL, raw base64, http URL)
     const incomingImage =
       (typeof imageUrl === "string" && imageUrl.trim()) ||
       (typeof imageBase64 === "string" && imageBase64.trim()) ||
@@ -2253,7 +2239,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
       ? buildWahaFilePayload(incomingImage, { filename })
       : null;
 
-    // ---- Text-only path (unchanged) ----
     if (!imagePayload) {
       const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
       if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
@@ -2261,12 +2246,11 @@ app.post("/api/whatsapp/notify", async (req, res) => {
         success: true,
         queued: true,
         mode: "text",
-        phone: normalizePhoneForWa(phone),
+        phone: normalizeWaChatId(phone),
       });
     }
 
-    // ---- Image path ----
-    const normalized = normalizePhoneForWa(phone);
+    const normalized = normalizeWaChatId(phone);
     if (!normalized) {
       return res.status(400).json({ success: false, message: "Invalid phone number" });
     }
@@ -2279,7 +2263,6 @@ app.post("/api/whatsapp/notify", async (req, res) => {
         phone: normalized,
         ...(isFile
           ? { fileUrl: imagePayload.mode === "url" ? imagePayload.file.url : null,
-              // For data mode with "file" type, we still go through sendImage's data path
               ...(imagePayload.mode === "data"
                 ? { fileUrl: `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }
                 : {}) }
@@ -3056,7 +3039,6 @@ app.post("/api/update-stock", async (req, res) => {
       t.update(pRef, { quantity: q - quantity });
     });
 
-    // Movement is informative, not authoritative — if it fails, stock is still correct.
     if (sellerId) {
       await logInventoryMovement({
         productId,
@@ -3281,10 +3263,6 @@ app.post("/api/test-welcome-whatsapp", async (req, res) => {
 
 /* ═══════════════════════════════════════════════════════════════════════════
    FIX #4 — NEW TEST ENDPOINT FOR IMAGE NOTIFY
-   WHAT: A dedicated endpoint to test /api/whatsapp/notify with an image
-         without touching any real order or promo flow.
-   WHY:  Lets you verify the new image path works end-to-end from Postman
-         or curl before wiring it into the real promotion UI.
    ═══════════════════════════════════════════════════════════════════════════ */
 app.post("/api/test-whatsapp-notify-image", async (req, res) => {
   try {
@@ -3330,7 +3308,8 @@ app.get("/_health", (req, res) => {
     whatsappQueue: waQueue.length,
     nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
     endpoints: [
-      "/api/whatsapp/notify",                 // ← FIX #3: now supports imageUrl
+      "/api/whatsapp/notify",
+      "/api/whatsapp/groups",                  // ← FIX #6: group picker
       "/api/whatsapp/welcome",
       "/api/whatsapp/send-media",
       "/api/service-request/notify",
@@ -3351,7 +3330,7 @@ app.get("/_health", (req, res) => {
       "/api/test-seller-flow-whatsapp",
       "/api/test-quicksale-whatsapp",
       "/api/test-welcome-whatsapp",
-      "/api/test-whatsapp-notify-image",      // ← FIX #4: new test endpoint
+      "/api/test-whatsapp-notify-image",
       "/_health",
     ],
     fixes: [
@@ -3359,6 +3338,8 @@ app.get("/_health", (req, res) => {
       "FIX #2 — buildWahaFilePayload() normalizes dataURL / base64 / URL",
       "FIX #3 — /api/whatsapp/notify now sends images with text fallback",
       "FIX #4 — /api/test-whatsapp-notify-image test endpoint added",
+      "FIX #5 — normalizeWaChatId() + @g.us accepted on all send paths",
+      "FIX #6 — GET /api/whatsapp/groups for admin group picker",
     ],
     uptime: process.uptime(),
   });
@@ -3423,6 +3404,8 @@ const server = app.listen(PORT, () => {
   console.log(`🔔 Admin → user notifications: ✅`);
   console.log(`💬 WhatsApp notify endpoints: ✅`);
   console.log(`🖼️ WhatsApp image notify: ✅ (FIX #3)`);
+  console.log(`👥 WhatsApp group picker: ✅ (FIX #6)`);
+  console.log(`🆔 Group-aware chatId: ✅ (FIX #5)`);
   console.log(`👋 Real Estates welcome: ✅`);
   console.log(`📦 Seller order notifications: ✅`);
   console.log(`⏰ Seller nudge scheduler: ✅ (every 6h, max 4, scan ${NUDGE_SCAN_MS / 60000}min)`);
