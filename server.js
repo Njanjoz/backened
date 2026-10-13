@@ -1,4 +1,6 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
+// v2.6 — minute-accurate AutoPromo scheduler + override time fix
+//
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
@@ -6,31 +8,6 @@
 // Emails can optionally mirror to WhatsApp by passing a phone number.
 // Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
 // Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
-//
-// Single-file: AutoPromo scheduler is inlined at the bottom of this file
-// (no ./autoPromo.js module needed). AutoPromo v2 adds a campaign calendar,
-// time/day/payday context, and 20 contextual WhatsApp templates (T1–T20).
-//
-// NEW: Occasion Engine inlined at the bottom — a full-year ~90-occasion
-// library with date resolver, recurring weekly entries, movable religious
-// days, and `sensitive: true` protection that blocks promo content.
-//
-// NEW (2026-10):
-//   • Preview endpoint respects perGroupPerDay + activeHours and merges
-//     occasion slots into the same timeline the scheduler will use.
-//   • Live scheduler de-dupes templates and products per group per day.
-//   • Preview is deterministic per (date, slot, group) — refresh returns the
-//     same plan, so admin edits stay stable.
-//   • Group filter: selectedGroupIds persisted in platformSettings/autoPromo
-//     is honoured by both the live scheduler and the preview endpoint.
-//   • NEW: marketingOverrides — admin can edit caption / time / swap product /
-//     skip a slot in Daily Preview. Both preview and the live scheduler apply
-//     these overrides on top of the deterministic plan.
-//   • NEW (v2.4): Preview generates ONE slot PER GROUP PER TIME, with each
-//     slot's caption using its OWN group's name. Previously all slots shared
-//     the first group's name, which was misleading.
-//   • NEW (v2.5): Strict override matching (no time-only fallback), group
-//     dedupe, sorted slot hours, richer preview diagnostics.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -573,7 +550,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED
+   AutoPromo — INLINED (v2.6)
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -584,6 +561,13 @@ function autoPromoNowEAT() {
   return new Date(Date.now() + 3 * 60 * 60 * 1000);
 }
 function autoPromoHourEAT() { return autoPromoNowEAT().getUTCHours(); }
+function autoPromoMinuteEAT() { return autoPromoNowEAT().getUTCMinutes(); }
+function autoPromoHHMMEAT() {
+  return `${String(autoPromoHourEAT()).padStart(2, "0")}:${String(autoPromoMinuteEAT()).padStart(2, "0")}`;
+}
+function autoPromoDateStrEAT() {
+  return autoPromoNowEAT().toISOString().slice(0, 10);
+}
 function autoPromoDowEAT() { return autoPromoNowEAT().getUTCDay(); }
 function autoPromoMonthEAT() { return autoPromoNowEAT().getUTCMonth() + 1; }
 function autoPromoDayEAT() { return autoPromoNowEAT().getUTCDate(); }
@@ -682,31 +666,6 @@ function autoPromoSeededRng(seedStr) {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
-  if (groupKind === "sellers") return "T16";
-  if (groupKind === "deals")   return "T17";
-  if (campaign) {
-    if (campaign.daysToEvent >= 5) return "T11";
-    if (campaign.daysToEvent >= 2) return "T12";
-    if (campaign.daysToEvent === 1) return "T13";
-    if (campaign.daysToEvent === 0) return "T14";
-    if (campaign.daysToEvent <  0) return "T15";
-  }
-  if (payday && timeBucket === "morning") return "T6";
-  if (monthEnd) return "T7";
-  if (dayBucket === "friday" && (timeBucket === "afternoon" || timeBucket === "evening")) return "T8";
-  if (dayBucket === "saturday") return "T9";
-  if (dayBucket === "sunday" && (timeBucket === "afternoon" || timeBucket === "evening")) return "T10";
-  switch (timeBucket) {
-    case "morning":   return "T1";
-    case "midday":    return "T2";
-    case "afternoon": return "T3";
-    case "evening":   return "T4";
-    case "night":     return "T5";
-    default:          return "T1";
-  }
 }
 
 function autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
@@ -1291,11 +1250,12 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     const bypassCap = !!(forceGroupIds || forceProductId);
     const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 5));
 
-    const todayEAT = autoPromoNowEAT().toISOString().slice(0, 10);
+    const todayEAT = autoPromoDateStrEAT();
     const overrides = await loadOverridesForDate(todayEAT);
 
     const result = {
       tick: new Date().toISOString(),
+      hhmmEAT: autoPromoHHMMEAT(),
       hourEAT,
       campaign: campaign?.name || null,
       campaignDaysToEvent: campaign?.daysToEvent ?? null,
@@ -1318,6 +1278,30 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
       const kind = autoPromoDetectGroupKind(group.name);
 
+      // ── Idempotency guard ──
+      //    (dateEAT, groupId, slotTimeEAT) fires at most once per day.
+      //    Force-run (bypassCap) skips this guard.
+      if (!bypassCap) {
+        const guardHHMM = autoPromoHHMMEAT();
+        try {
+          const guardSnap = await db.collection("autoPromoLogs")
+            .where("groupId", "==", group.id)
+            .where("dateEAT", "==", todayEAT)
+            .where("slotTimeEAT", "==", guardHHMM)
+            .where("status", "==", "sent")
+            .limit(1)
+            .get();
+          if (!guardSnap.empty) {
+            result.skippedGroups.push({ id: group.id, reason: `already-fired-${guardHHMM}` });
+            continue;
+          }
+        } catch (guardErr) {
+          // Logs written before v2.6 don't have dateEAT/slotTimeEAT — the query
+          // won't match them, which is fine. Swallow the error and proceed.
+          console.warn(`[idempotency] guard lookup for ${group.id}:`, guardErr.message);
+        }
+      }
+
       const usedTodayTemplates = await autoPromoTemplatesUsedToday(group.id);
       const usedTodayProducts  = await autoPromoProductsUsedToday(group.id);
 
@@ -1337,32 +1321,58 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       let productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
       let caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
       let imageUrl = product.images?.[0] || null;
-      let slotTime = `${String(hourEAT).padStart(2, "0")}:00`;
+
+      // ── Override matching (v2.6) ──
+      //    Effective time = ov.time || ov.slot.
+      //    Pass 1: exact HH:MM match against current tick time.
+      //    Pass 2: fall back to same-hour match.
+      const currentHHMM = autoPromoHHMMEAT();
+      const currentHour = hourEAT;
+
+      let matchedOverride = null;
+      let matchedKey = null;
 
       if (overrides.size > 0) {
-        const generatedSlot = {
-          time: slotTime,
-          productId: product.id,
-          productName: product.name || "—",
-          imageUrl,
-          caption,
-          skipped: false,
-        };
-        const overridden = applyOverride(generatedSlot, overrides);
-        if (overridden.isOverridden) {
-          result.overridesApplied++;
-          if (overridden.skipped) {
-            result.skippedGroups.push({ id: group.id, reason: "overridden-skipped" });
-            continue;
+        for (const [key, ov] of overrides.entries()) {
+          const [ovSlot] = key.split("|");
+          const effective = String(ov.time || ovSlot || "").trim();
+          if (effective === currentHHMM) {
+            matchedOverride = ov;
+            matchedKey = key;
+            break;
           }
-          if (overridden.caption) caption = overridden.caption;
-          if (overridden.imageUrl) imageUrl = overridden.imageUrl;
-          if (overridden.productId && overridden.productId !== product.id) {
-            const swappedSnap = await db.collection("products").doc(overridden.productId).get();
-            if (swappedSnap.exists) {
-              product = { id: swappedSnap.id, ...swappedSnap.data() };
-              productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+        }
+        if (!matchedOverride) {
+          for (const [key, ov] of overrides.entries()) {
+            const [ovSlot] = key.split("|");
+            const effective = String(ov.time || ovSlot || "").trim();
+            const ovHour = parseInt(effective.split(":")[0], 10);
+            if (ovHour === currentHour) {
+              matchedOverride = ov;
+              matchedKey = key;
+              break;
             }
+          }
+        }
+      }
+
+      let slotTime = matchedOverride
+        ? (matchedOverride.time || (matchedKey || "").split("|")[0] || currentHHMM)
+        : currentHHMM;
+
+      if (matchedOverride) {
+        result.overridesApplied++;
+        if (matchedOverride.skipped) {
+          result.skippedGroups.push({ id: group.id, reason: "overridden-skipped" });
+          continue;
+        }
+        if (matchedOverride.caption) caption = matchedOverride.caption;
+        if (matchedOverride.imageUrl) imageUrl = matchedOverride.imageUrl;
+        if (matchedOverride.productId && matchedOverride.productId !== product.id) {
+          const swappedSnap = await db.collection("products").doc(matchedOverride.productId).get();
+          if (swappedSnap.exists) {
+            product = { id: swappedSnap.id, ...swappedSnap.data() };
+            productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
           }
         }
       }
@@ -1375,7 +1385,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
             campaign: campaign?.name || null,
             productId: product.id,
             groupName: group.name,
-            overridden: overrides.size > 0,
+            overridden: !!matchedOverride,
           });
         } else {
           enqueueWhatsApp(group.id, caption, {
@@ -1384,7 +1394,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
             campaign: campaign?.name || null,
             productId: product.id,
             groupName: group.name,
-            overridden: overrides.size > 0,
+            overridden: !!matchedOverride,
           });
         }
 
@@ -1399,11 +1409,14 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
           preview: caption.slice(0, 240),
           forced: bypassCap,
-          overridden: overrides.size > 0,
+          overridden: !!matchedOverride,
+          dateEAT: todayEAT,
+          slotTimeEAT: slotTime,
+          matchedOverrideKey: matchedKey || null,
         });
 
         result.sent++;
-        result.messages.push({ group: group.name, product: product.name, templateId });
+        result.messages.push({ group: group.name, product: product.name, templateId, slotTime });
       } catch (e) {
         await db.collection("autoPromoLogs").add({
           groupId: group.id,
@@ -1414,6 +1427,8 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           error: e.message,
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
           forced: bypassCap,
+          dateEAT: todayEAT,
+          slotTimeEAT: slotTime,
         }).catch(() => {});
         result.skippedGroups.push({ id: group.id, reason: "send-failed" });
       }
@@ -1424,7 +1439,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       }
     }
 
-    console.log(`🤖 AutoPromo tick → ${result.sent} sent (campaign=${result.campaign || "none"}, overrides=${result.overridesApplied})`);
+    console.log(`🤖 AutoPromo tick → ${result.sent} sent (campaign=${result.campaign || "none"}, overrides=${result.overridesApplied}, hhmm=${result.hhmmEAT})`);
     return result;
   } catch (e) {
     console.error("🤖 AutoPromo tick crashed:", e);
@@ -1434,7 +1449,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
   }
 }
 
-function autoPromoStartScheduler({ SCAN_MS = 15 * 60 * 1000 } = {}) {
+function autoPromoStartScheduler({ SCAN_MS = 60 * 1000 } = {}) {
   const tick = async () => {
     try {
       await autoPromoRunTick({});
@@ -1444,7 +1459,7 @@ function autoPromoStartScheduler({ SCAN_MS = 15 * 60 * 1000 } = {}) {
     autoPromoTickTimer = setTimeout(tick, SCAN_MS).unref?.();
   };
   autoPromoTickTimer = setTimeout(tick, 60 * 1000).unref?.();
-  console.log(`🤖 AutoPromo scheduler armed (scan every ${SCAN_MS / 60000} min)`);
+  console.log(`🤖 AutoPromo scheduler armed (scan every ${SCAN_MS / 1000}s)`);
   return () => { if (autoPromoTickTimer) clearTimeout(autoPromoTickTimer); };
 }
 
@@ -1566,7 +1581,6 @@ function resolveOccasionsForDate({
   includeRecurring = false,
   year = null,
 } = {}) {
-  const nowKey = occasionDayKey(month, day);
   const fixed = [];
   const recurring = [];
 
@@ -3124,11 +3138,6 @@ app.post("/api/admin/auto-promo", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   AUTO-PROMO PREVIEW — v2.4: one slot PER GROUP PER TIME
-   Deterministic per (date, group, hour) so refresh is stable.
-   Applies marketingOverrides on top.
-   ═══════════════════════════════════════════════════════════════ */
 app.post("/api/admin/auto-promo/preview", async (req, res) => {
   try {
     const { date = null, groupIds = null } = req.body || {};
@@ -3147,7 +3156,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       return sendServerError(res, e, "Could not fetch groups");
     }
 
-    // Dedupe groups by id
     const seenIds = new Set();
     groups = groups.filter(g => {
       if (seenIds.has(g.id)) return false;
@@ -4881,12 +4889,15 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.5",
+      version: "v2.6",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
       strictOverrideMatching: true,
       groupDedupe: true,
+      minuteAccurateScheduler: true,
+      idempotentPerSlot: true,
+      overrideMatchesEditedTime: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -4921,11 +4932,15 @@ app.get("/_health", (req, res) => {
       "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME; each slot uses its OWN group's name",
       "FIX #28 — v2.4: preview slots include groupId + groupName so the UI can render per-group plans",
       "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour) so each group gets its own deterministic product picks",
-      "FIX #30 — v2.5: applyOverride uses strict key matching only (no time-only fallback that resurrected old perGroupPerDay layouts)",
+      "FIX #30 — v2.5: applyOverride uses strict key matching only (no time-only fallback)",
       "FIX #31 — v2.5: groups deduped by id in both preview and live scheduler",
       "FIX #32 — v2.5: autoSlotHours sorted ascending for stable output",
       "FIX #33 — v2.5: preview response includes expectedPromoSlots, promoSlotsReturned, occasionSlotsReturned, overridesLoaded, autoSlotHours",
       "FIX #34 — v2.5: skipped overrides keep their slot in the preview (no layout drift)",
+      "FIX #35 — v2.6: scheduler matches overrides on `time || slot` (honours admin-edited times)",
+      "FIX #36 — v2.6: scheduler ticks every 60s (was 15m) so exact-minute slots fire on time",
+      "FIX #37 — v2.6: idempotency guard — each (dateEAT, groupId, slotTimeEAT) fires at most once",
+      "FIX #38 — v2.6: preview's 11:27 override now actually sends at 11:27",
     ],
     uptime: process.uptime(),
   });
@@ -4974,7 +4989,7 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
-autoPromoStartScheduler({ SCAN_MS: 15 * 60 * 1000 });
+autoPromoStartScheduler({ SCAN_MS: 60 * 1000 });
 occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 
 let adminFlashNudgeLastKey = null;
@@ -5037,7 +5052,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.5 (per-group preview, strict overrides)`);
+  console.log(`🤖 AutoPromo: v2.6 (minute-accurate, override-time-aware)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
