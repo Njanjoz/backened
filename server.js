@@ -26,6 +26,9 @@
 //   • NEW: marketingOverrides — admin can edit caption / time / swap product /
 //     skip a slot in Daily Preview. Both preview and the live scheduler apply
 //     these overrides on top of the deterministic plan.
+//   • NEW (v2.4): Preview generates ONE slot PER GROUP PER TIME, with each
+//     slot's caption using its OWN group's name. Previously all slots shared
+//     the first group's name, which was misleading.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -71,7 +74,6 @@ app.use(cors({
   credentials: true,
 }));
 
-/* FIX #1 — BODY LIMIT FOR INLINE IMAGES */
 app.use(bodyParser.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
@@ -166,7 +168,6 @@ const PRODUCTS_URL = process.env.PRODUCTS_URL || `${WEBSITE_URL}/products`;
 const ORDER_RECEIPT_BASE = process.env.ORDER_RECEIPT_BASE || `${WEBSITE_URL}/order-receipt`;
 const WHATSAPP_GROUP_URL = process.env.WHATSAPP_GROUP_URL || "https://chat.whatsapp.com/GQWo3DXgRJa7hFDF6anpTH";
 
-// AutoPromo v2 — contact + APK constants
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "254115988107";
 const ORDERS_PHONE = process.env.ORDERS_PHONE || "254115988107";
 const APK_DOWNLOAD_URL = process.env.APK_DOWNLOAD_URL || `${WEBSITE_URL}/apk/MarketMix-Kenya.apk`;
@@ -312,7 +313,6 @@ function normalizePhoneForWa(phoneNumber) {
   return digits;
 }
 
-/* FIX #5 — group-aware chat id normalizer */
 function normalizeWaChatId(input) {
   if (!input) return null;
   const s = String(input).trim();
@@ -320,7 +320,6 @@ function normalizeWaChatId(input) {
   return normalizePhoneForWa(s);
 }
 
-/* FIX #2 — image normalizer */
 function buildWahaFilePayload(input, { filename, mimeOverride } = {}) {
   if (!input || typeof input !== "string") return null;
   const s = input.trim();
@@ -572,16 +571,13 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (no separate file needed)
+   AutoPromo — INLINED
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
 let autoPromoTickTimer = null;
 let autoPromoRunning = false;
 
-/* ═══ AutoPromo v2 — context, campaign, template engine ═══ */
-
-// Time / day / payday helpers (EAT = UTC+3)
 function autoPromoNowEAT() {
   return new Date(Date.now() + 3 * 60 * 60 * 1000);
 }
@@ -622,7 +618,6 @@ function autoPromoDetectGroupKind(groupName) {
   return "general";
 }
 
-// Campaign calendar — fixed-date Kenyan + shopping events.
 const AUTO_PROMO_CAMPAIGNS = [
   { name: "New Year",            startMonth: 12, startDay: 27, endMonth: 1,  endDay: 3,  eventMonth: 1,  eventDay: 1  },
   { name: "Back to School Jan",  startMonth: 12, startDay: 28, endMonth: 1,  endDay: 15, eventMonth: 1,  eventDay: 8  },
@@ -672,7 +667,6 @@ function autoPromoGetActiveCampaign() {
   return null;
 }
 
-/* Deterministic PRNG seeded from a string. Same seed → same sequence. */
 function autoPromoSeededRng(seedStr) {
   let h = 2166136261 >>> 0;
   for (let i = 0; i < seedStr.length; i++) {
@@ -688,7 +682,6 @@ function autoPromoSeededRng(seedStr) {
   };
 }
 
-/* Legacy single-template picker (kept for backward compatibility). */
 function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
   if (groupKind === "sellers") return "T16";
   if (groupKind === "deals")   return "T17";
@@ -714,8 +707,6 @@ function autoPromoPickTemplateId({ campaign, timeBucket, dayBucket, payday, mont
   }
 }
 
-/* Ordered pool of template IDs appropriate for this moment.
-   The caller picks the first one not already used today. */
 function autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind }) {
   if (groupKind === "sellers") return ["T16", "T17", "T18", "T1", "T3", "T8", "T9", "T10"];
   if (groupKind === "deals")   return ["T17", "T16", "T18", "T2", "T3", "T4", "T9"];
@@ -750,8 +741,6 @@ function autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, mo
   const seen = new Set();
   return pool.filter(id => { if (seen.has(id)) return false; seen.add(id); return true; });
 }
-
-/* ═══ AutoPromo v2 — templates T1–T20 ═══ */
 
 const AUTO_FOOTER = (v) => [
   "━━━━━━━━━━━━━━",
@@ -1118,7 +1107,6 @@ async function autoPromoCountTodaySends(groupId) {
   return snap.size;
 }
 
-/* Templates already sent to this group today. */
 async function autoPromoTemplatesUsedToday(groupId) {
   const used = new Set();
   try {
@@ -1135,7 +1123,6 @@ async function autoPromoTemplatesUsedToday(groupId) {
   return used;
 }
 
-/* Products already sent to this group today. */
 async function autoPromoProductsUsedToday(groupId) {
   const used = new Set();
   try {
@@ -1199,25 +1186,7 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
   return autoPromoPickRandom(top, 1)[0].p;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   OVERRIDES — admin edits applied on top of the deterministic plan.
-   Stored in Firestore: marketingOverrides/{date}_{time}_{productId}
-   Shape:
-     {
-       date: "YYYY-MM-DD",
-       slot: "HH:MM",
-       originalProductId: "abc" | null,
-       productId: "xyz",       // optional swap
-       productName: "...",
-       imageUrl: "https://...",
-       caption: "...",         // optional caption override
-       time: "HH:MM",          // optional time override
-       skipped: true|false,
-       savedAt: Timestamp,
-       savedBy: uid,
-     }
-   ═══════════════════════════════════════════════════════════════ */
-
+/* ─── Overrides ─── */
 async function loadOverridesForDate(dateStr) {
   const map = new Map();
   if (!dateStr) return map;
@@ -1227,7 +1196,6 @@ async function loadOverridesForDate(dateStr) {
       .get();
     snap.forEach(d => {
       const x = d.data() || {};
-      // Key format: "HH:MM|originalProductId-or-noplan"
       const key = `${x.slot || ""}|${x.originalProductId || "noplan"}`;
       map.set(key, x);
     });
@@ -1237,17 +1205,14 @@ async function loadOverridesForDate(dateStr) {
   return map;
 }
 
-/* Apply an override on top of a generated slot in-place. */
 function applyOverride(slot, overrides) {
   if (!slot || !slot.time) return slot;
 
-  // Try exact match first, then fall back to time-only match
   const productId = slot.productId || "noplan";
   const key = `${slot.time}|${productId}`;
   let ov = overrides.get(key);
 
   if (!ov) {
-    // Fallback: match by time only (handles product drift)
     for (const [k, v] of overrides.entries()) {
       const [ovTime] = k.split("|");
       if (ovTime === slot.time) { ov = v; break; }
@@ -1270,9 +1235,6 @@ function applyOverride(slot, overrides) {
   };
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   AUTO-PROMO TICK (LIVE SCHEDULER) — with override awareness
-   ═══════════════════════════════════════════════════════════════ */
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
   autoPromoRunning = true;
@@ -1326,7 +1288,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     const bypassCap = !!(forceGroupIds || forceProductId);
     const perGroupPerDay = Math.min(AUTO_PROMO_MAX_PER_GROUP_PER_DAY, Math.max(1, Number(settings.perGroupPerDay) || 5));
 
-    /* NEW: load today's overrides once so every group uses them */
     const todayEAT = autoPromoNowEAT().toISOString().slice(0, 10);
     const overrides = await loadOverridesForDate(todayEAT);
 
@@ -1358,7 +1319,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       const usedTodayProducts  = await autoPromoProductsUsedToday(group.id);
 
       const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
-      let templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
+      const templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
 
       let product = await autoPromoPickProduct({
         group,
@@ -1375,7 +1336,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       let imageUrl = product.images?.[0] || null;
       let slotTime = `${String(hourEAT).padStart(2, "0")}:00`;
 
-      /* NEW: apply an override if the admin has one for this slot */
       if (overrides.size > 0) {
         const generatedSlot = {
           time: slotTime,
@@ -1395,7 +1355,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           if (overridden.caption) caption = overridden.caption;
           if (overridden.imageUrl) imageUrl = overridden.imageUrl;
           if (overridden.productId && overridden.productId !== product.id) {
-            // Reload the overridden product so we have its full doc
             const swappedSnap = await db.collection("products").doc(overridden.productId).get();
             if (swappedSnap.exists) {
               product = { id: swappedSnap.id, ...swappedSnap.data() };
@@ -1487,13 +1446,7 @@ function autoPromoStartScheduler({ SCAN_MS = 15 * 60 * 1000 } = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   END AutoPromo inline block
-   ═══════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════
-   ═══ OCCASION ENGINE — INLINED ═══
-   Full-year ~90-occasion library + date resolver + scheduler.
-   Sensitive occasions block promo content automatically.
+   Occasion Engine
    ═══════════════════════════════════════════════════════════════ */
 
 const OCCASION_LIBRARY = [
@@ -1859,14 +1812,9 @@ function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
   return () => { if (occasionTickTimer) clearTimeout(occasionTickTimer); };
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   END Occasion Engine inline block
-   ═══════════════════════════════════════════════════════════════ */
-
 // ============================
-// WhatsApp templates
+// WhatsApp message templates (store/buyer/seller)
 // ============================
-
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -2095,26 +2043,14 @@ function welcomeSubscriberWhatsApp({ name }) {
 // Inventory movement logger
 // ============================
 async function logInventoryMovement({
-  productId,
-  sellerId,
-  delta,
-  reason,
-  channel = null,
-  orderId = null,
-  note = "",
-  createdBy = "system",
+  productId, sellerId, delta, reason,
+  channel = null, orderId = null, note = "", createdBy = "system",
 }) {
   if (!productId || !sellerId || typeof delta !== "number" || delta === 0) return null;
   try {
     const ref = await db.collection("inventoryMovements").add({
-      productId,
-      sellerId,
-      delta,
-      reason,
-      channel,
-      orderId,
-      note: note || "",
-      createdBy,
+      productId, sellerId, delta, reason, channel, orderId,
+      note: note || "", createdBy,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     return ref.id;
@@ -2252,9 +2188,6 @@ const emailBodyText = (text) => `
 const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
-// ============================
-// Order confirmation email
-// ============================
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
     console.log("📧 Order confirmation →", userEmail);
@@ -2320,9 +2253,6 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   }
 };
 
-// ============================
-// Real estate email
-// ============================
 const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   try {
     console.log("🏠 Real estate receipt →", userEmail);
@@ -2375,11 +2305,9 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
 
     if (ok) {
       await db.collection("realEstateEmails").add({
-        orderId, userEmail,
-        displayId,
+        orderId, userEmail, displayId,
         propertyTitle: data.propertyTitle || null,
-        amount,
-        mpesaReference: mpesaRef,
+        amount, mpesaReference: mpesaRef,
         type: "real_estate_confirmation",
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
@@ -2391,9 +2319,6 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   }
 };
 
-// ============================
-// Moving confirmation email
-// ============================
 const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   try {
     console.log("🚚 Moving confirmation →", userEmail);
@@ -2469,19 +2394,10 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   }
 };
 
-// ============================
-// Real Estates — welcome email
-// ============================
 const sendRealEstateWelcomeEmail = async ({
-  userEmail,
-  userName,
-  roleLabel,
-  roleDesc = "",
-  rolePerks = [],
-  isSwitch = false,
-  previousRoleLabel = null,
-  ctaLabel = "Open MarketMix Real Estates",
-  ctaUrl = REAL_ESTATE_APP_URL,
+  userEmail, userName, roleLabel, roleDesc = "", rolePerks = [],
+  isSwitch = false, previousRoleLabel = null,
+  ctaLabel = "Open MarketMix Real Estates", ctaUrl = REAL_ESTATE_APP_URL,
   emailType = "bookings",
 }) => {
   try {
@@ -2529,11 +2445,7 @@ const sendRealEstateWelcomeEmail = async ({
         ? `You're now a ${roleLabel} on MarketMix Real Estates`
         : `Welcome to MarketMix Real Estates — here's what you can do as a ${roleLabel}`,
       eyebrow: `MarketMix Real Estates · ${roleLabel}`,
-      title,
-      subtitle,
-      bodyHtml,
-      ctaLabel,
-      ctaUrl,
+      title, subtitle, bodyHtml, ctaLabel, ctaUrl,
       footerNote: "Questions? Reply to this email and our team will help.",
     });
 
@@ -2544,9 +2456,7 @@ const sendRealEstateWelcomeEmail = async ({
     const ok = await sendEmail(userEmail, subject, html, emailType);
     if (ok) {
       await reDb.collection("welcomeEmails").add({
-        userEmail,
-        roleLabel,
-        isSwitch,
+        userEmail, roleLabel, isSwitch,
         previousRoleLabel: previousRoleLabel || null,
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
@@ -2558,9 +2468,6 @@ const sendRealEstateWelcomeEmail = async ({
   }
 };
 
-// ============================
-// PIN recovery
-// ============================
 const generateReplacementCode = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -2618,9 +2525,6 @@ const markCodeAsUsed = async (userId) => {
   } catch (e) { return false; }
 };
 
-// ============================
-// Subscription helpers
-// ============================
 const validateSubscriptionPayment = (data) => {
   const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data || {};
   if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
@@ -2646,26 +2550,13 @@ const createSubscriptionRecord = async (s, invoiceId) => {
   return ref.id;
 };
 
-const getSubscriptionPaymentStatus = async (invoiceId) => {
-  const snap = await db.collection("subscriptions")
-    .where("invoiceId", "==", invoiceId).limit(1).get();
-  if (snap.empty) return { success: false, message: "Subscription not found" };
-  const s = snap.docs[0].data();
-  return { success: true, data: {
-    paymentStatus: s.paymentStatus || "pending",
-    mpesaReference: s.mpesaReference,
-    status: s.status,
-  }};
-};
-
 const activateSellerSubscription = async (s, mpesaReference) => {
   const { orderId, planId, sellerId, sellerEmail } = s;
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + 30);
 
   await db.collection("subscriptions").doc(orderId).update({
-    status: "active", paymentStatus: "paid",
-    mpesaReference,
+    status: "active", paymentStatus: "paid", mpesaReference,
     activatedAt: admin.firestore.FieldValue.serverTimestamp(),
     expiresAt,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2702,9 +2593,6 @@ const activateSellerSubscription = async (s, mpesaReference) => {
   return true;
 };
 
-// ============================
-// notifySellersOfNewOrder
-// ============================
 async function notifySellersOfNewOrder(orderId, orderData) {
   const sellerIds = Array.isArray(orderData?.involvedSellerIds) ? orderData.involvedSellerIds : [];
   if (!sellerIds.length) {
@@ -2726,10 +2614,7 @@ async function notifySellersOfNewOrder(orderId, orderData) {
       }
       const seller = sellerSnap.data() || {};
       const sellerPhone =
-        seller.phoneNumber ||
-        seller.phone ||
-        seller.sellerProfile?.phone ||
-        null;
+        seller.phoneNumber || seller.phone || seller.sellerProfile?.phone || null;
       if (!sellerPhone) {
         console.log(`⚠️ Seller ${sellerId} has no phone — skipping WhatsApp`);
         continue;
@@ -2742,11 +2627,7 @@ async function notifySellersOfNewOrder(orderId, orderData) {
       enqueueWhatsApp(
         sellerPhone,
         sellerNewOrderWhatsApp({
-          sellerName,
-          orderId,
-          buyerName,
-          sellerRevenue,
-          itemSummary,
+          sellerName, orderId, buyerName, sellerRevenue, itemSummary,
           itemCount: getSellerItems(orderData, sellerId).length,
         }),
         { kind: "seller-new-order", orderId, sellerId }
@@ -2777,9 +2658,6 @@ async function notifySellersOfNewOrder(orderId, orderData) {
   }
 }
 
-// ============================
-// Nudge scheduler
-// ============================
 const NUDGE_MAX = 4;
 const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const NUDGE_SCAN_MS = 15 * 60 * 1000;
@@ -2833,9 +2711,7 @@ async function runSellerNudgeScan() {
         }).catch(() => {});
         await db.collection("adminAlerts").add({
           type: "seller_nudge_exhausted",
-          orderId,
-          sellerIds,
-          nudgeCount,
+          orderId, sellerIds, nudgeCount,
           flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
         }).catch(() => {});
         console.log(`⚠️ Nudges exhausted for ${orderId} — flagged admin`);
@@ -2848,7 +2724,6 @@ async function runSellerNudgeScan() {
 
       for (const sellerId of sellerIds) {
         if (hiddenFrom.includes(sellerId)) continue;
-
         try {
           const sellerSnap = await db.collection("users").doc(sellerId).get();
           if (!sellerSnap.exists) continue;
@@ -2861,12 +2736,8 @@ async function runSellerNudgeScan() {
           enqueueWhatsApp(
             sellerPhone,
             sellerReminderWhatsApp({
-              sellerName,
-              orderId,
-              buyerName,
-              hoursSince,
-              nudgeNumber: nudgeCount + 1,
-              maxNudges: NUDGE_MAX,
+              sellerName, orderId, buyerName, hoursSince,
+              nudgeNumber: nudgeCount + 1, maxNudges: NUDGE_MAX,
             }),
             { kind: `seller-nudge-${nudgeCount + 1}`, orderId, sellerId }
           );
@@ -3065,11 +2936,8 @@ app.post("/api/seller/update-status", async (req, res) => {
     if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
 
     let decoded;
-    try {
-      decoded = await verifyAnyToken(idToken);
-    } catch {
-      return res.status(401).json({ success: false, message: "Invalid auth token" });
-    }
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
 
     const sellerId = decoded.uid;
 
@@ -3100,23 +2968,14 @@ app.post("/api/seller/update-status", async (req, res) => {
     console.log(`✅ Order ${orderId} status → ${newStatus} by seller ${sellerId}`);
 
     const buyerPhone =
-      order.phoneNumber ||
-      order.shippingDetails?.phoneNumber ||
-      order.buyerPhone ||
-      null;
+      order.phoneNumber || order.shippingDetails?.phoneNumber || order.buyerPhone || null;
 
     if (buyerPhone) {
       const customerName =
-        order.shippingDetails?.fullName ||
-        order.buyerName ||
-        "Customer";
+        order.shippingDetails?.fullName || order.buyerName || "Customer";
       enqueueWhatsApp(
         buyerPhone,
-        buyerStatusUpdateWhatsApp({
-          customerName,
-          orderId,
-          statusLabel: newStatus,
-        }),
+        buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel: newStatus }),
         { kind: "buyer-status-update", orderId, sellerId, status: newStatus }
       );
     } else {
@@ -3127,9 +2986,7 @@ app.post("/api/seller/update-status", async (req, res) => {
       try {
         await db.collection("adminAlerts").add({
           type: "seller_cancelled_order",
-          orderId,
-          cancelledBy: sellerId,
-          involvedSellerIds: involved,
+          orderId, cancelledBy: sellerId, involvedSellerIds: involved,
           flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       } catch (_) {}
@@ -3157,15 +3014,9 @@ app.post("/api/re/welcome", async (req, res) => {
     }
 
     const emailSent = await sendRealEstateWelcomeEmail({
-      userEmail: email,
-      userName: name,
-      roleLabel,
-      roleDesc,
+      userEmail: email, userName: name, roleLabel, roleDesc,
       rolePerks: Array.isArray(rolePerks) ? rolePerks : [],
-      isSwitch: !!isSwitch,
-      previousRoleLabel,
-      ctaLabel,
-      ctaUrl,
+      isSwitch: !!isSwitch, previousRoleLabel, ctaLabel, ctaUrl,
     });
 
     let whatsappQueued = false;
@@ -3214,19 +3065,14 @@ app.get("/api/whatsapp/groups", async (req, res) => {
     if (!r.ok) {
       console.error(`❌ WAHA /api/default/groups → ${r.status}: ${raw.slice(0, 300)}`);
       return res.status(r.status).json({
-        success: false,
-        message: "WAHA returned an error",
-        wahaStatus: r.status,
-        wahaBody: raw.slice(0, 500),
+        success: false, message: "WAHA returned an error",
+        wahaStatus: r.status, wahaBody: raw.slice(0, 500),
       });
     }
 
     let list = [];
-    if (Array.isArray(data)) {
-      list = data;
-    } else if (data && typeof data === "object") {
-      list = Object.values(data);
-    }
+    if (Array.isArray(data)) list = data;
+    else if (data && typeof data === "object") list = Object.values(data);
 
     const groups = list
       .filter((c) => c && (c.id || c.chatId) && String(c.id || c.chatId).endsWith("@g.us"))
@@ -3276,10 +3122,9 @@ app.post("/api/admin/auto-promo", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTO-PROMO PREVIEW — merged product + occasion timeline,
-   respects perGroupPerDay, activeHours, selectedGroupIds.
-   Deterministic per (date, slot, group) so refresh is stable.
-   NEW: applies marketingOverrides on top.
+   AUTO-PROMO PREVIEW — v2.4: one slot PER GROUP PER TIME
+   Deterministic per (date, group, hour) so refresh is stable.
+   Applies marketingOverrides on top.
    ═══════════════════════════════════════════════════════════════ */
 app.post("/api/admin/auto-promo/preview", async (req, res) => {
   try {
@@ -3319,7 +3164,6 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     const dow   = targetDate.getUTCDay();
     const year  = targetDate.getUTCFullYear();
 
-    /* NEW: load overrides for this date once */
     const overrides = await loadOverridesForDate(dateStr);
     console.log(`🤖 Preview: ${overrides.size} override(s) loaded for ${dateStr}`);
 
@@ -3386,53 +3230,62 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     const monthEnd = day >= 28;
 
     const autoSlots = [];
-    const usedProducts = new Set();
-    const usedTemplates = new Set();
 
-    for (const hour of autoSlotHours) {
-      const timeBucket = autoPromoTimeBucket(hour);
-      const kind = groups[0] ? autoPromoDetectGroupKind(groups[0].name) : "general";
-      const rng = autoPromoSeededRng(`${dateStr}|${hour}|${autoSlots.length}`);
+    for (const group of groups) {
+      const usedProducts = new Set();
+      const usedTemplates = new Set();
+      const kind = autoPromoDetectGroupKind(group.name);
 
-      const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
-      const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
-      usedTemplates.add(templateId);
+      for (const hour of autoSlotHours) {
+        const timeBucket = autoPromoTimeBucket(hour);
 
-      const available = products.filter(p => !usedProducts.has(p.id));
-      const pickFrom = available.length ? available : products;
-      if (!pickFrom.length) {
-        autoSlots.push({
+        const rng = autoPromoSeededRng(`${dateStr}|${group.id}|${hour}`);
+
+        const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
+        const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
+        usedTemplates.add(templateId);
+
+        const available = products.filter(p => !usedProducts.has(p.id));
+        const pickFrom = available.length ? available : products;
+        if (!pickFrom.length) {
+          autoSlots.push({
+            time: `${String(hour).padStart(2, "0")}:00`,
+            hourEAT: hour, timeBucket, templateId,
+            slotKind: "promo", skipped: true, reason: "no-products",
+            groupId: group.id,
+            groupName: group.name,
+            productName: null, imageUrl: null,
+            caption: "(no product available)",
+          });
+          continue;
+        }
+        const product = pickFrom[Math.floor(rng() * pickFrom.length)];
+        usedProducts.add(product.id);
+
+        const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
+        const caption = autoPromoFillTemplate(templateId, {
+          product,
+          campaign,
+          groupName: group.name,
+          productUrl,
+        });
+
+        let slot = {
           time: `${String(hour).padStart(2, "0")}:00`,
           hourEAT: hour, timeBucket, templateId,
-          slotKind: "promo", skipped: true, reason: "no-products",
-          productName: null, imageUrl: null,
-          caption: "(no product available)",
-        });
-        continue;
+          slotKind: "promo",
+          groupId: group.id,
+          groupName: group.name,
+          productId: product.id,
+          productName: product.name || "—",
+          imageUrl: product.images?.[0] || null,
+          caption,
+          skipped: false,
+        };
+
+        slot = applyOverride(slot, overrides);
+        autoSlots.push(slot);
       }
-      const product = pickFrom[Math.floor(rng() * pickFrom.length)];
-      usedProducts.add(product.id);
-
-      const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
-      const caption = autoPromoFillTemplate(templateId, {
-        product, campaign, groupName: groups[0]?.name || "MarketMix Family", productUrl,
-      });
-
-      let slot = {
-        time: `${String(hour).padStart(2, "0")}:00`,
-        hourEAT: hour, timeBucket, templateId,
-        slotKind: "promo",
-        productId: product.id,
-        productName: product.name || "—",
-        imageUrl: product.images?.[0] || null,
-        caption,
-        skipped: false,
-      };
-
-      /* NEW: apply override */
-      slot = applyOverride(slot, overrides);
-
-      autoSlots.push(slot);
     }
 
     const { dated, recurring } = resolveOccasionsForDate({
@@ -3442,29 +3295,37 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
     });
 
     const occasionSlots = [];
-    for (const occ of [...dated, ...recurring]) {
-      const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
-      if (!message) continue;
-      const isRecurring = !!occ.recurring;
-      const isSensitive = !!occ.sensitive;
-      const baseHour = isRecurring ? 3 : 9;
-      occasionSlots.push({
-        time: `${String(baseHour).padStart(2, "0")}:00`,
-        hourEAT: baseHour,
-        slotKind: isSensitive ? "non-promo" : "occasion",
-        templateId: null,
-        occasionKey: occ.key,
-        occasionName: occ.name,
-        sensitive: isSensitive,
-        productName: occ.name,
-        imageUrl: null,
-        caption: message,
-        skipped: false,
-      });
+    for (const group of groups) {
+      for (const occ of [...dated, ...recurring]) {
+        const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
+        if (!message) continue;
+        const isRecurring = !!occ.recurring;
+        const isSensitive = !!occ.sensitive;
+        const baseHour = isRecurring ? 3 : 9;
+        occasionSlots.push({
+          time: `${String(baseHour).padStart(2, "0")}:00`,
+          hourEAT: baseHour,
+          slotKind: isSensitive ? "non-promo" : "occasion",
+          templateId: null,
+          groupId: group.id,
+          groupName: group.name,
+          occasionKey: occ.key,
+          occasionName: occ.name,
+          sensitive: isSensitive,
+          productName: occ.name,
+          imageUrl: null,
+          caption: message,
+          skipped: false,
+        });
+      }
     }
 
     const slots = [...autoSlots, ...occasionSlots]
-      .sort((a, b) => a.time.localeCompare(b.time));
+      .sort((a, b) => {
+        const t = a.time.localeCompare(b.time);
+        if (t !== 0) return t;
+        return (a.groupName || "").localeCompare(b.groupName || "");
+      });
 
     return res.json({
       success: true,
@@ -3498,9 +3359,6 @@ app.post("/api/admin/auto-promo/run-now", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   OVERRIDES — admin edits applied on top of the deterministic plan
-   ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/marketing-overrides", async (req, res) => {
   try {
     const { date } = req.query;
@@ -3557,9 +3415,6 @@ app.delete("/api/admin/marketing-overrides", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   OCCASION ADMIN ENDPOINTS
-   ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/occasions", async (req, res) => {
   try {
     const settings = await occasionLoadSettings();
@@ -3567,9 +3422,7 @@ app.get("/api/admin/occasions", async (req, res) => {
     const todayDay = autoPromoDayEAT();
     const todayWeekday = autoPromoDowEAT();
     const today = resolveOccasionsForDate({
-      month: todayMonth,
-      day: todayDay,
-      weekday: todayWeekday,
+      month: todayMonth, day: todayDay, weekday: todayWeekday,
       movableDates: settings.movableDates || {},
       includeRecurring: true,
     });
@@ -3644,11 +3497,8 @@ app.post("/api/admin/occasions/preview", async (req, res) => {
     const buildPreviews = (list) => list.map(occ => {
       const message = buildOccasionMessage(occ, { shopLink: settings.siteUrl || WEBSITE_URL });
       return {
-        key: occ.key,
-        name: occ.name,
-        kind: occ.kind,
-        sensitive: !!occ.sensitive,
-        movable: !!occ.movable,
+        key: occ.key, name: occ.name, kind: occ.kind,
+        sensitive: !!occ.sensitive, movable: !!occ.movable,
         preview: message ? message.slice(0, 300) : null,
       };
     });
@@ -3788,8 +3638,7 @@ app.post("/api/admin/notify-user", async (req, res) => {
     if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
     const caller = callerDoc.data() || {};
     const isAdmin =
-      caller.role === "admin" ||
-      caller.userType === "admin" ||
+      caller.role === "admin" || caller.userType === "admin" ||
       (Array.isArray(caller.roles) && caller.roles.includes("admin"));
     if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
 
@@ -3797,9 +3646,8 @@ app.post("/api/admin/notify-user", async (req, res) => {
     let targetDb = "realestate";
 
     const reTarget = await reDb.collection("users").doc(userId).get();
-    if (reTarget.exists) {
-      target = reTarget.data();
-    } else {
+    if (reTarget.exists) target = reTarget.data();
+    else {
       const shopTarget = await db.collection("users").doc(userId).get();
       if (shopTarget.exists) { target = shopTarget.data(); targetDb = "shop"; }
     }
@@ -3865,8 +3713,7 @@ app.post("/api/driver/decision", async (req, res) => {
     if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
     const caller = callerDoc.data() || {};
     const isAdmin =
-      caller.role === "admin" ||
-      caller.userType === "admin" ||
+      caller.role === "admin" || caller.userType === "admin" ||
       (Array.isArray(caller.roles) && caller.roles.includes("admin"));
     if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
 
@@ -3978,17 +3825,12 @@ app.post("/api/whatsapp/notify", async (req, res) => {
       (typeof imageBase64 === "string" && imageBase64.trim()) ||
       null;
 
-    const imagePayload = incomingImage
-      ? buildWahaFilePayload(incomingImage, { filename })
-      : null;
+    const imagePayload = incomingImage ? buildWahaFilePayload(incomingImage, { filename }) : null;
 
     if (!imagePayload) {
       const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
       if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
-      return res.json({
-        success: true, queued: true, mode: "text",
-        phone: normalizeWaChatId(phone),
-      });
+      return res.json({ success: true, queued: true, mode: "text", phone: normalizeWaChatId(phone) });
     }
 
     const normalized = normalizeWaChatId(phone);
@@ -4286,10 +4128,8 @@ app.post("/api/intasend-callback", async (req, res) => {
 
     if (state === "COMPLETE" && !isWalletRef(api_ref)) {
       let userEmail =
-        orderData.userEmail ||
-        orderData.shippingDetails?.email ||
-        orderData.buyerEmail ||
-        orderData.email;
+        orderData.userEmail || orderData.shippingDetails?.email ||
+        orderData.buyerEmail || orderData.email;
 
       if (!userEmail && orderData.userId) {
         try {
@@ -4302,18 +4142,15 @@ app.post("/api/intasend-callback", async (req, res) => {
       }
 
       const payerPhone =
-        orderData.phoneNumber ||
-        orderData.shippingDetails?.phoneNumber ||
-        orderData.buyerPhone ||
-        null;
+        orderData.phoneNumber || orderData.shippingDetails?.phoneNumber ||
+        orderData.buyerPhone || null;
 
       const realEstate = isRealEstateOrder(api_ref, orderData);
       const moving = isMovingRef(api_ref) || orderData?.isMoving === true;
       const quicksale = isQuicksaleOrder(orderData) || isQuicksaleRef(api_ref);
 
       const customerName =
-        orderData.shippingDetails?.fullName ||
-        orderData.buyerName ||
+        orderData.shippingDetails?.fullName || orderData.buyerName ||
         (userEmail ? userEmail.split("@")[0] : "Customer");
 
       if (!quicksale) {
@@ -4397,10 +4234,7 @@ app.post("/api/intasend-callback", async (req, res) => {
             if (!sellerSnap.exists) continue;
             const seller = sellerSnap.data() || {};
             const sellerPhone = seller.phoneNumber || seller.phone || null;
-            if (!sellerPhone) {
-              console.log(`⚠️ Quicksale seller ${sellerId} has no phone — skipping WhatsApp`);
-              continue;
-            }
+            if (!sellerPhone) continue;
             const sellerName = seller.fullName || seller.shopName || seller.email?.split("@")[0] || "Seller";
 
             const sellerItems = getSellerItems(orderData, sellerId);
@@ -4412,9 +4246,7 @@ app.post("/api/intasend-callback", async (req, res) => {
             enqueueWhatsApp(
               sellerPhone,
               quicksaleSellerWhatsApp({
-                sellerName,
-                itemSummary,
-                amount: amountNum,
+                sellerName, itemSummary, amount: amountNum,
                 paymentReference: mpesa_reference || api_ref,
                 customerName,
                 customerPhone: payerPhone || "—",
@@ -4443,10 +4275,8 @@ app.post("/api/intasend-callback", async (req, res) => {
           enqueueWhatsApp(
             payerPhone,
             storeOrderConfirmedWhatsApp({
-              customerName,
-              orderId: api_ref,
-              paymentStatus: "Paid",
-              orderStatus: "Processing",
+              customerName, orderId: api_ref,
+              paymentStatus: "Paid", orderStatus: "Processing",
             }),
             { kind: "store-order-confirmed", api_ref }
           );
@@ -4770,8 +4600,7 @@ app.post("/api/update-stock", async (req, res) => {
 
     if (sellerId) {
       await logInventoryMovement({
-        productId, sellerId,
-        delta: -Math.abs(quantity),
+        productId, sellerId, delta: -Math.abs(quantity),
         reason, channel, orderId,
         note: `Stock ${oldQty} → ${oldQty - quantity}`,
         createdBy,
@@ -5033,19 +4862,16 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.3",
+      version: "v2.4",
       deterministicPreview: true,
       overrideAware: true,
+      perGroupPreview: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
     },
     occasions: {
-      endpoints: [
-        "/api/admin/occasions",
-        "/api/admin/occasions/preview",
-        "/api/admin/occasions/run-now",
-      ],
+      endpoints: ["/api/admin/occasions", "/api/admin/occasions/preview", "/api/admin/occasions/run-now"],
       firestoreSettingsDoc: "platformSettings/occasions",
       logCollection: "occasionLogs",
       totalOccasions: OCCASION_LIBRARY.length,
@@ -5055,42 +4881,25 @@ app.get("/_health", (req, res) => {
       version: "v1",
     },
     endpoints: [
-      "/api/whatsapp/notify",
-      "/api/whatsapp/groups",
-      "/api/whatsapp/welcome",
-      "/api/whatsapp/send-media",
-      "/api/admin/auto-promo",
-      "/api/admin/auto-promo/run-now",
-      "/api/admin/auto-promo/preview",
+      "/api/whatsapp/notify", "/api/whatsapp/groups", "/api/whatsapp/welcome", "/api/whatsapp/send-media",
+      "/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview",
       "/api/admin/marketing-overrides",
-      "/api/admin/occasions",
-      "/api/admin/occasions/preview",
-      "/api/admin/occasions/run-now",
-      "/api/service-request/notify",
-      "/api/moving/notify",
-      "/api/re/welcome",
-      "/api/stk-push",
-      "/api/store/seed",
-      "/api/real-estate/seed",
-      "/api/admin/notify-user",
-      "/api/driver/decision",
-      "/api/subscription-payment",
-      "/api/seller/withdraw",
-      "/api/seller/recover-pin",
-      "/api/seller/update-status",
-      "/api/ad-transaction/:paymentRef",
-      "/api/update-stock",
-      "/api/test-store-whatsapp",
-      "/api/test-seller-flow-whatsapp",
-      "/api/test-quicksale-whatsapp",
-      "/api/test-welcome-whatsapp",
-      "/api/test-whatsapp-notify-image",
-      "/_health",
+      "/api/admin/occasions", "/api/admin/occasions/preview", "/api/admin/occasions/run-now",
+      "/api/service-request/notify", "/api/moving/notify", "/api/re/welcome",
+      "/api/stk-push", "/api/store/seed", "/api/real-estate/seed",
+      "/api/admin/notify-user", "/api/driver/decision", "/api/subscription-payment",
+      "/api/seller/withdraw", "/api/seller/recover-pin", "/api/seller/update-status",
+      "/api/ad-transaction/:paymentRef", "/api/update-stock",
+      "/api/test-store-whatsapp", "/api/test-seller-flow-whatsapp", "/api/test-quicksale-whatsapp",
+      "/api/test-welcome-whatsapp", "/api/test-whatsapp-notify-image", "/_health",
     ],
     fixes: [
       "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
       "FIX #25 — GET/POST/DELETE /api/admin/marketing-overrides",
       "FIX #26 — preview response includes overridesApplied count",
+      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME; each slot uses its OWN group's name in the caption (was: all slots used groups[0].name)",
+      "FIX #28 — v2.4: preview slots include groupId + groupName so the UI can render per-group plans",
+      "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour) so each group gets its own deterministic product picks",
     ],
     uptime: process.uptime(),
   });
@@ -5202,7 +5011,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.3 (override-aware)`);
+  console.log(`🤖 AutoPromo: v2.4 (per-group preview)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
