@@ -1,5 +1,5 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.6 — minute-accurate AutoPromo scheduler + override time fix
+// v2.6.1 — AutoPromo idempotency guard fix + override-time-aware scheduler
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -550,7 +550,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (v2.6)
+   AutoPromo — INLINED (v2.6.1)
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -1213,7 +1213,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       return { error: "groups-fetch-failed", detail: e.message };
     }
 
-    // Dedupe groups by id — prevents double-sends if WAHA returns the same chat twice
+    // Dedupe groups by id
     const seenIds = new Set();
     groups = groups.filter(g => {
       if (seenIds.has(g.id)) return false;
@@ -1267,6 +1267,9 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       overridesApplied: 0,
     };
 
+    const currentHHMM = autoPromoHHMMEAT();
+    const currentHour = hourEAT;
+
     for (const group of groups) {
       if (!bypassCap) {
         const alreadySent = await autoPromoCountTodaySends(group.id);
@@ -1277,30 +1280,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       }
 
       const kind = autoPromoDetectGroupKind(group.name);
-
-      // ── Idempotency guard ──
-      //    (dateEAT, groupId, slotTimeEAT) fires at most once per day.
-      //    Force-run (bypassCap) skips this guard.
-      if (!bypassCap) {
-        const guardHHMM = autoPromoHHMMEAT();
-        try {
-          const guardSnap = await db.collection("autoPromoLogs")
-            .where("groupId", "==", group.id)
-            .where("dateEAT", "==", todayEAT)
-            .where("slotTimeEAT", "==", guardHHMM)
-            .where("status", "==", "sent")
-            .limit(1)
-            .get();
-          if (!guardSnap.empty) {
-            result.skippedGroups.push({ id: group.id, reason: `already-fired-${guardHHMM}` });
-            continue;
-          }
-        } catch (guardErr) {
-          // Logs written before v2.6 don't have dateEAT/slotTimeEAT — the query
-          // won't match them, which is fine. Swallow the error and proceed.
-          console.warn(`[idempotency] guard lookup for ${group.id}:`, guardErr.message);
-        }
-      }
 
       const usedTodayTemplates = await autoPromoTemplatesUsedToday(group.id);
       const usedTodayProducts  = await autoPromoProductsUsedToday(group.id);
@@ -1322,13 +1301,9 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       let caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
       let imageUrl = product.images?.[0] || null;
 
-      // ── Override matching (v2.6) ──
-      //    Effective time = ov.time || ov.slot.
-      //    Pass 1: exact HH:MM match against current tick time.
-      //    Pass 2: fall back to same-hour match.
-      const currentHHMM = autoPromoHHMMEAT();
-      const currentHour = hourEAT;
-
+      // ── Override matching ──
+      //    Pass 1: exact HH:MM (ov.time || ov.slot).
+      //    Pass 2: same-hour fallback (ov.time || ov.slot hour === current hour).
       let matchedOverride = null;
       let matchedKey = null;
 
@@ -1353,6 +1328,32 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
               break;
             }
           }
+        }
+      }
+
+      // ── v2.6.1 Idempotency guard ──
+      //    Keyed on the matched override's own slot time (not the tick time).
+      //    Only runs when an override matched, so free-form ticks always fire.
+      //    Force-run bypasses this so admins can re-fire on demand.
+      const overrideSlotKey = matchedOverride
+        ? String(matchedOverride.time || (matchedKey || "").split("|")[0] || "").trim()
+        : null;
+
+      if (overrideSlotKey && !bypassCap) {
+        try {
+          const guardSnap = await db.collection("autoPromoLogs")
+            .where("groupId", "==", group.id)
+            .where("dateEAT", "==", todayEAT)
+            .where("slotTimeEAT", "==", overrideSlotKey)
+            .where("status", "==", "sent")
+            .limit(1)
+            .get();
+          if (!guardSnap.empty) {
+            result.skippedGroups.push({ id: group.id, reason: `already-fired-${overrideSlotKey}` });
+            continue;
+          }
+        } catch (guardErr) {
+          console.warn(`[idempotency] guard lookup for ${group.id}:`, guardErr.message);
         }
       }
 
@@ -1567,10 +1568,6 @@ function fillOccasionTemplate(text, vars = {}) {
         : match;
     }
   );
-}
-
-function occasionDayKey(month, day) {
-  return month * 100 + day;
 }
 
 function resolveOccasionsForDate({
@@ -4889,7 +4886,7 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.6",
+      version: "v2.6.1",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
@@ -4898,6 +4895,7 @@ app.get("/_health", (req, res) => {
       minuteAccurateScheduler: true,
       idempotentPerSlot: true,
       overrideMatchesEditedTime: true,
+      guardKeyedOnOverrideTime: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -4939,8 +4937,9 @@ app.get("/_health", (req, res) => {
       "FIX #34 — v2.5: skipped overrides keep their slot in the preview (no layout drift)",
       "FIX #35 — v2.6: scheduler matches overrides on `time || slot` (honours admin-edited times)",
       "FIX #36 — v2.6: scheduler ticks every 60s (was 15m) so exact-minute slots fire on time",
-      "FIX #37 — v2.6: idempotency guard — each (dateEAT, groupId, slotTimeEAT) fires at most once",
-      "FIX #38 — v2.6: preview's 11:27 override now actually sends at 11:27",
+      "FIX #37 — v2.6.1: idempotency guard keyed on matched override's slot time, not tick time",
+      "FIX #38 — v2.6.1: free-form ticks no longer blocked by the override guard",
+      "FIX #39 — v2.6.1: overrides with edited times (e.g. 11:55) fire exactly at the next tick where their hour matches",
     ],
     uptime: process.uptime(),
   });
@@ -5052,7 +5051,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.6 (minute-accurate, override-time-aware)`);
+  console.log(`🤖 AutoPromo: v2.6.1 (minute-accurate, override-time-aware, guard-on-override-slot)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
