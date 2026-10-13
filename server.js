@@ -1,5 +1,5 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.6.3 — Admin overrides bypass the daily cap; override matching runs before cap check
+// v2.6.4 — Group-scoped overrides; adding a new group no longer inherits existing overrides
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -550,22 +550,15 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (v2.6.3)
+   AutoPromo — INLINED (v2.6.4)
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
 let autoPromoTickTimer = null;
 let autoPromoRunning = false;
 
-// ── Firebase Storage bucket used by the shop project ──
-// Must match what Studio.jsx uses when normalising images.
 const SHOP_FB_BUCKET = "my-campus-store-49b1d.appspot.com";
 
-/**
- * Image URL resolver — ported from Studio.jsx `normalizeImageUrl`.
- * Turns any string stored in `product.images[]` into an HTTPS URL the
- * WhatsApp sender can fetch.
- */
 function resolveProductImageUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   const url = raw.trim();
@@ -596,12 +589,6 @@ function isPlaceholderImageUrl(url) {
   return PLACEHOLDER_IMAGE_RX.test(String(url));
 }
 
-/**
- * From a product doc, pick the best image URL:
- *   1. First non-placeholder entry from product.images[]
- *   2. Otherwise the first entry
- *   3. Otherwise null
- */
 function productImageUrl(product) {
   if (!product) return null;
   const images = Array.isArray(product.images) ? product.images.filter(Boolean) : [];
@@ -1230,6 +1217,10 @@ function applyOverride(slot, overrides) {
 
   if (!ov) return slot;
 
+  // v2.6.4 — group-scoped: if the override pins a groupId and this slot's
+  // group doesn't match, do not apply it.
+  if (ov.groupId && ov.groupId !== slot.groupId) return slot;
+
   return {
     ...slot,
     productId: ov.productId || slot.productId,
@@ -1245,11 +1236,11 @@ function applyOverride(slot, overrides) {
 }
 
 /**
- * v2.6.3 — autoPromoRunTick
+ * v2.6.4 — autoPromoRunTick
  *
- * Key ordering:
- *   1. Override matching runs FIRST (before cap check).
- *   2. A pending override bypasses the daily cap.
+ * Ordering:
+ *   1. Override matching FIRST (before cap check). Group-scoped.
+ *   2. Pending override bypasses the daily cap.
  *   3. Override-pinned products skip the auto-pick.
  *   4. Override.imageUrl is placeholder-filtered.
  */
@@ -1337,18 +1328,22 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     for (const group of groups) {
       const kind = autoPromoDetectGroupKind(group.name);
 
-      // ── 1. Override matching FIRST ──
+      // ── 1. Override matching FIRST (group-scoped) ──
       let matchedOverride = null;
       let matchedKey = null;
 
       if (overrides.size > 0) {
+        const groupScoped = (ov) => !ov.groupId || ov.groupId === group.id;
+
         for (const [key, ov] of overrides.entries()) {
+          if (!groupScoped(ov)) continue;
           const [ovSlot] = key.split("|");
           const effective = String(ov.time || ovSlot || "").trim();
           if (effective === currentHHMM) { matchedOverride = ov; matchedKey = key; break; }
         }
         if (!matchedOverride) {
           for (const [key, ov] of overrides.entries()) {
+            if (!groupScoped(ov)) continue;
             const [ovSlot] = key.split("|");
             const effective = String(ov.time || ovSlot || "").trim();
             const ovHour = parseInt(effective.split(":")[0], 10);
@@ -3464,7 +3459,7 @@ app.get("/api/admin/marketing-overrides", async (req, res) => {
 
 app.post("/api/admin/marketing-overrides", async (req, res) => {
   try {
-    const { date, slot, originalProductId, productId, productName, imageUrl, caption, time, skipped } = req.body || {};
+    const { date, slot, originalProductId, productId, productName, imageUrl, caption, time, skipped, groupId } = req.body || {};
     if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
 
     const key = `${date}_${slot}_${originalProductId || "noplan"}`;
@@ -3475,6 +3470,7 @@ app.post("/api/admin/marketing-overrides", async (req, res) => {
       savedAt: admin.firestore.FieldValue.serverTimestamp(),
       savedBy: req.body?.uid || "admin",
     };
+    if (groupId !== undefined) payload.groupId = groupId;
     if (productId !== undefined) payload.productId = productId;
     if (productName !== undefined) payload.productName = productName;
     if (imageUrl !== undefined) payload.imageUrl = imageUrl;
@@ -4948,7 +4944,7 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.6.3",
+      version: "v2.6.4",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
@@ -4964,6 +4960,7 @@ app.get("/_health", (req, res) => {
       overrideBypassesCap: true,
       overridePinnedProductSkipsPick: true,
       overridePlaceholderFiltered: true,
+      groupScopedOverrides: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -5008,12 +5005,14 @@ app.get("/_health", (req, res) => {
       "FIX #37 — v2.6.1: idempotency guard keyed on override slot time",
       "FIX #38 — v2.6.1: free-form ticks no longer blocked by the override guard",
       "FIX #39 — v2.6.1: edited override times fire at the next matching tick",
-      "FIX #40 — v2.6.2: image resolved from product.images[] with placeholder filter; override.imageUrl wins if set",
+      "FIX #40 — v2.6.2: image resolved from product.images[] with placeholder filter",
       "FIX #41 — v2.6.2: gs:// and relative image paths converted to HTTPS Firebase download URLs",
-      "FIX #42 — v2.6.2: autoPromoLogs now records imageUrlSent for future audits",
-      "FIX #43 — v2.6.3: override matching moved before cap check; admin overrides bypass the daily cap",
-      "FIX #44 — v2.6.3: override-pinned products skip the auto-pick, so no 'no-product' bail",
-      "FIX #45 — v2.6.3: placeholder filter now applies to override.imageUrl too",
+      "FIX #42 — v2.6.2: autoPromoLogs records imageUrlSent for future audits",
+      "FIX #43 — v2.6.3: override matching moved before cap check; overrides bypass the daily cap",
+      "FIX #44 — v2.6.3: override-pinned products skip the auto-pick",
+      "FIX #45 — v2.6.3: placeholder filter applies to override.imageUrl too",
+      "FIX #46 — v2.6.4: overrides accept an optional groupId and are scoped to that group when present",
+      "FIX #47 — v2.6.4: adding a new group to selectedGroupIds no longer causes existing overrides to fire for it",
     ],
     uptime: process.uptime(),
   });
@@ -5125,7 +5124,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.6.3 (overrides bypass daily cap)`);
+  console.log(`🤖 AutoPromo: v2.6.4 (group-scoped overrides)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
