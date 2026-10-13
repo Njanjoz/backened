@@ -1,5 +1,5 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.6.4 — Group-scoped overrides; adding a new group no longer inherits existing overrides
+// v2.6.5 — Safety net: empty selectedGroupIds refuses to send (was: broadcast to all groups)
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -550,7 +550,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (v2.6.4)
+   AutoPromo — INLINED (v2.6.5)
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -1236,13 +1236,16 @@ function applyOverride(slot, overrides) {
 }
 
 /**
- * v2.6.4 — autoPromoRunTick
+ * v2.6.5 — autoPromoRunTick
  *
  * Ordering:
  *   1. Override matching FIRST (before cap check). Group-scoped.
  *   2. Pending override bypasses the daily cap.
  *   3. Override-pinned products skip the auto-pick.
  *   4. Override.imageUrl is placeholder-filtered.
+ *
+ * v2.6.5 adds: empty selectedGroupIds refuses to send instead of broadcasting
+ * to every WAHA group.
  */
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
@@ -1277,8 +1280,8 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     });
 
     const persistedIds = Array.isArray(settings.selectedGroupIds) ? settings.selectedGroupIds : [];
-    const effectiveIds =
-      Array.isArray(forceGroupIds) && forceGroupIds.length > 0 ? forceGroupIds : persistedIds;
+    const isForceRun = Array.isArray(forceGroupIds) && forceGroupIds.length > 0;
+    const effectiveIds = isForceRun ? forceGroupIds : persistedIds;
 
     if (effectiveIds.length > 0) {
       const allowed = new Set(effectiveIds);
@@ -1288,10 +1291,15 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       for (const id of missing) groups.push({ id, name: "(forced)" });
       console.log(
         `🤖 AutoPromo: filtered groups ${before} → ${groups.length} ` +
-        `(source: ${Array.isArray(forceGroupIds) && forceGroupIds.length ? "forceGroupIds" : "settings.selectedGroupIds"})`
+        `(source: ${isForceRun ? "forceGroupIds" : "settings.selectedGroupIds"})`
       );
     } else {
-      console.log(`🤖 AutoPromo: no group filter set — sending to all ${groups.length} groups`);
+      // ── Safety net (v2.6.5) ──
+      // Empty selection on a scheduled tick means "nothing to send" — NOT
+      // "send to every group WAHA returned". Previously this fell through
+      // to a full broadcast. Refuse instead.
+      console.warn("🤖 AutoPromo: selectedGroupIds is EMPTY — refusing to send to any group");
+      return { skipped: "no-selected-groups" };
     }
 
     if (!groups.length) return { skipped: "no-groups" };
@@ -4944,7 +4952,7 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.6.4",
+      version: "v2.6.5",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
@@ -4962,6 +4970,7 @@ app.get("/_health", (req, res) => {
       overridePlaceholderFiltered: true,
       groupScopedOverrides: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
+      emptySelectionRefusesSend: true,
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
     },
@@ -5013,6 +5022,8 @@ app.get("/_health", (req, res) => {
       "FIX #45 — v2.6.3: placeholder filter applies to override.imageUrl too",
       "FIX #46 — v2.6.4: overrides accept an optional groupId and are scoped to that group when present",
       "FIX #47 — v2.6.4: adding a new group to selectedGroupIds no longer causes existing overrides to fire for it",
+      "FIX #48 — v2.6.5: empty selectedGroupIds refuses to send instead of broadcasting to every WAHA group",
+      "FIX #49 — v2.6.5: run-now still works — forceGroupIds path is unaffected",
     ],
     uptime: process.uptime(),
   });
@@ -5124,7 +5135,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.6.4 (group-scoped overrides)`);
+  console.log(`🤖 AutoPromo: v2.6.5 (empty selection refuses send)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
