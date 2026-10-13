@@ -1,5 +1,5 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.6.1 — AutoPromo idempotency guard fix + override-time-aware scheduler
+// v2.6.2 — Image resolver ported from Studio.jsx + override-aware product image derivation
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -550,12 +550,78 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (v2.6.1)
+   AutoPromo — INLINED (v2.6.2)
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
 let autoPromoTickTimer = null;
 let autoPromoRunning = false;
+
+// ── Firebase Storage bucket used by the shop project ──
+// Must match what Studio.jsx uses when normalising images.
+const SHOP_FB_BUCKET = "my-campus-store-49b1d.appspot.com";
+
+/**
+ * Image URL resolver — ported from Studio.jsx `normalizeImageUrl`.
+ * Turns any string stored in `product.images[]` into an HTTPS URL the
+ * WhatsApp sender can fetch.
+ *
+ *   "https://..."                      → as-is
+ *   "gs://<bucket>/path/to.jpg"        → HTTPS Firebase Storage download URL
+ *   "products/…" "images/…" "product-images/…"  → HTTPS Firebase Storage download URL
+ *   anything else                      → returned verbatim (Studio does the same)
+ */
+function resolveProductImageUrl(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const url = raw.trim();
+  if (!url) return null;
+
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+
+  if (url.startsWith("gs://")) {
+    const path = url.replace(`gs://${SHOP_FB_BUCKET}/`, "");
+    return `https://firebasestorage.googleapis.com/v0/b/${SHOP_FB_BUCKET}/o/${encodeURIComponent(path)}?alt=media`;
+  }
+
+  if (
+    url.startsWith("products/") ||
+    url.startsWith("images/") ||
+    url.startsWith("product-images/")
+  ) {
+    return `https://firebasestorage.googleapis.com/v0/b/${SHOP_FB_BUCKET}/o/${encodeURIComponent(url)}?alt=media`;
+  }
+
+  return url;
+}
+
+/**
+ * From a product doc, pick the best image URL:
+ *   1. First non-placeholder entry from product.images[]
+ *   2. Otherwise the first entry
+ *   3. Otherwise null
+ * Then resolve it to a fetchable HTTPS URL.
+ */
+function productImageUrl(product) {
+  if (!product) return null;
+  const images = Array.isArray(product.images) ? product.images.filter(Boolean) : [];
+  if (!images.length) return null;
+
+  const PLACEHOLDER_PATTERNS = [
+    /copy[-_ ]?of[-_ ]?social[-_ ]?media/i,
+    /gemini[-_ ]?generated/i,
+    /placeholder/i,
+    /default[-_ ]?image/i,
+    /no[-_ ]?image/i,
+  ];
+  const looksPlaceholder = (u) => {
+    const s = String(u).toLowerCase();
+    return PLACEHOLDER_PATTERNS.some((rx) => rx.test(s));
+  };
+
+  const nonPlaceholder = images.find((u) => !looksPlaceholder(u));
+  const chosen = nonPlaceholder || images[0];
+  return resolveProductImageUrl(chosen);
+}
 
 function autoPromoNowEAT() {
   return new Date(Date.now() + 3 * 60 * 60 * 1000);
@@ -1299,7 +1365,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
       let productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
       let caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
-      let imageUrl = product.images?.[0] || null;
+      let imageUrl = productImageUrl(product);
 
       // ── Override matching ──
       //    Pass 1: exact HH:MM (ov.time || ov.slot).
@@ -1333,8 +1399,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
       // ── v2.6.1 Idempotency guard ──
       //    Keyed on the matched override's own slot time (not the tick time).
-      //    Only runs when an override matched, so free-form ticks always fire.
-      //    Force-run bypasses this so admins can re-fire on demand.
+      //    Only runs when an override matched; free-form ticks always fire.
       const overrideSlotKey = matchedOverride
         ? String(matchedOverride.time || (matchedKey || "").split("|")[0] || "").trim()
         : null;
@@ -1367,14 +1432,24 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           result.skippedGroups.push({ id: group.id, reason: "overridden-skipped" });
           continue;
         }
-        if (matchedOverride.caption) caption = matchedOverride.caption;
-        if (matchedOverride.imageUrl) imageUrl = matchedOverride.imageUrl;
+
+        // Product swap: if the override pins a different product, load it
+        // and re-derive imageUrl from that product's images via the resolver.
         if (matchedOverride.productId && matchedOverride.productId !== product.id) {
           const swappedSnap = await db.collection("products").doc(matchedOverride.productId).get();
           if (swappedSnap.exists) {
             product = { id: swappedSnap.id, ...swappedSnap.data() };
             productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
+            imageUrl = productImageUrl(product);
           }
+        }
+
+        if (matchedOverride.caption) caption = matchedOverride.caption;
+
+        // Override imageUrl wins, but runs through the resolver first so
+        // gs:// or relative paths get converted to fetchable HTTPS URLs.
+        if (matchedOverride.imageUrl) {
+          imageUrl = resolveProductImageUrl(matchedOverride.imageUrl) || imageUrl;
         }
       }
 
@@ -1404,6 +1479,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           groupName: group.name,
           productId: product.id,
           productName: product.name || null,
+          imageUrlSent: imageUrl || null,
           templateId,
           campaign: campaign?.name || null,
           status: "sent",
@@ -3295,7 +3371,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
           groupName: group.name,
           productId: product.id,
           productName: product.name || "—",
-          imageUrl: product.images?.[0] || null,
+          imageUrl: productImageUrl(product),
           caption,
           skipped: false,
         };
@@ -4886,7 +4962,7 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.6.1",
+      version: "v2.6.2",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
@@ -4896,6 +4972,9 @@ app.get("/_health", (req, res) => {
       idempotentPerSlot: true,
       overrideMatchesEditedTime: true,
       guardKeyedOnOverrideTime: true,
+      imageResolvedFromProduct: true,
+      placeholderImageFilter: true,
+      overrideImageWins: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -4927,19 +5006,22 @@ app.get("/_health", (req, res) => {
       "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
       "FIX #25 — GET/POST/DELETE /api/admin/marketing-overrides",
       "FIX #26 — preview response includes overridesApplied count",
-      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME; each slot uses its OWN group's name",
-      "FIX #28 — v2.4: preview slots include groupId + groupName so the UI can render per-group plans",
-      "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour) so each group gets its own deterministic product picks",
-      "FIX #30 — v2.5: applyOverride uses strict key matching only (no time-only fallback)",
-      "FIX #31 — v2.5: groups deduped by id in both preview and live scheduler",
-      "FIX #32 — v2.5: autoSlotHours sorted ascending for stable output",
-      "FIX #33 — v2.5: preview response includes expectedPromoSlots, promoSlotsReturned, occasionSlotsReturned, overridesLoaded, autoSlotHours",
-      "FIX #34 — v2.5: skipped overrides keep their slot in the preview (no layout drift)",
-      "FIX #35 — v2.6: scheduler matches overrides on `time || slot` (honours admin-edited times)",
-      "FIX #36 — v2.6: scheduler ticks every 60s (was 15m) so exact-minute slots fire on time",
-      "FIX #37 — v2.6.1: idempotency guard keyed on matched override's slot time, not tick time",
+      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME",
+      "FIX #28 — v2.4: preview slots include groupId + groupName",
+      "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour)",
+      "FIX #30 — v2.5: applyOverride strict key matching",
+      "FIX #31 — v2.5: groups deduped by id",
+      "FIX #32 — v2.5: autoSlotHours sorted ascending",
+      "FIX #33 — v2.5: preview diagnostics",
+      "FIX #34 — v2.5: skipped overrides keep their slot in preview",
+      "FIX #35 — v2.6: scheduler matches overrides on time||slot",
+      "FIX #36 — v2.6: scheduler ticks every 60s",
+      "FIX #37 — v2.6.1: idempotency guard keyed on override slot time",
       "FIX #38 — v2.6.1: free-form ticks no longer blocked by the override guard",
-      "FIX #39 — v2.6.1: overrides with edited times (e.g. 11:55) fire exactly at the next tick where their hour matches",
+      "FIX #39 — v2.6.1: edited override times fire at the next matching tick",
+      "FIX #40 — v2.6.2: image resolved from product.images[] with placeholder filter; override.imageUrl wins if set",
+      "FIX #41 — v2.6.2: gs:// and relative image paths converted to HTTPS Firebase download URLs",
+      "FIX #42 — v2.6.2: autoPromoLogs now records imageUrlSent for future audits",
     ],
     uptime: process.uptime(),
   });
@@ -5051,7 +5133,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.6.1 (minute-accurate, override-time-aware, guard-on-override-slot)`);
+  console.log(`🤖 AutoPromo: v2.6.2 (image resolver + placeholder filter)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
