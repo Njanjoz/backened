@@ -29,6 +29,8 @@
 //   • NEW (v2.4): Preview generates ONE slot PER GROUP PER TIME, with each
 //     slot's caption using its OWN group's name. Previously all slots shared
 //     the first group's name, which was misleading.
+//   • NEW (v2.5): Strict override matching (no time-only fallback), group
+//     dedupe, sorted slot hours, richer preview diagnostics.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -1210,14 +1212,7 @@ function applyOverride(slot, overrides) {
 
   const productId = slot.productId || "noplan";
   const key = `${slot.time}|${productId}`;
-  let ov = overrides.get(key);
-
-  if (!ov) {
-    for (const [k, v] of overrides.entries()) {
-      const [ovTime] = k.split("|");
-      if (ovTime === slot.time) { ov = v; break; }
-    }
-  }
+  const ov = overrides.get(key);
 
   if (!ov) return slot;
 
@@ -1258,6 +1253,14 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     } catch (e) {
       return { error: "groups-fetch-failed", detail: e.message };
     }
+
+    // Dedupe groups by id — prevents double-sends if WAHA returns the same chat twice
+    const seenIds = new Set();
+    groups = groups.filter(g => {
+      if (seenIds.has(g.id)) return false;
+      seenIds.add(g.id);
+      return true;
+    });
 
     const persistedIds = Array.isArray(settings.selectedGroupIds) ? settings.selectedGroupIds : [];
     const effectiveIds =
@@ -3144,6 +3147,14 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
       return sendServerError(res, e, "Could not fetch groups");
     }
 
+    // Dedupe groups by id
+    const seenIds = new Set();
+    groups = groups.filter(g => {
+      if (seenIds.has(g.id)) return false;
+      seenIds.add(g.id);
+      return true;
+    });
+
     const previewPersistedIds = Array.isArray(autoSettings.selectedGroupIds)
       ? autoSettings.selectedGroupIds
       : [];
@@ -3189,6 +3200,7 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         autoSlotHours.push(next);
       }
     }
+    autoSlotHours.sort((a, b) => a - b);
 
     const pSnap = await db.collection("products").get();
     const products = pSnap.docs
@@ -3327,14 +3339,21 @@ app.post("/api/admin/auto-promo/preview", async (req, res) => {
         return (a.groupName || "").localeCompare(b.groupName || "");
       });
 
+    const expectedPromoSlots = groups.length * autoSlotHours.length;
+
     return res.json({
       success: true,
       date: dateStr,
       campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
       groupCount: groups.length,
       perGroupPerDay,
+      autoSlotHours,
+      expectedPromoSlots,
+      promoSlotsReturned: autoSlots.length,
+      occasionSlotsReturned: occasionSlots.length,
       activeHours: autoSettings.activeHours || { start: 8, end: 21 },
-      overridesApplied: overrides.size,
+      overridesLoaded: overrides.size,
+      overridesApplied: autoSlots.filter(s => s.isOverridden).length,
       slots,
     });
   } catch (e) {
@@ -4862,10 +4881,12 @@ app.get("/_health", (req, res) => {
       logCollection: "autoPromoLogs",
       overridesCollection: "marketingOverrides",
       inlined: true,
-      version: "v2.4",
+      version: "v2.5",
       deterministicPreview: true,
       overrideAware: true,
       perGroupPreview: true,
+      strictOverrideMatching: true,
+      groupDedupe: true,
       groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -4897,9 +4918,14 @@ app.get("/_health", (req, res) => {
       "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
       "FIX #25 — GET/POST/DELETE /api/admin/marketing-overrides",
       "FIX #26 — preview response includes overridesApplied count",
-      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME; each slot uses its OWN group's name in the caption (was: all slots used groups[0].name)",
+      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME; each slot uses its OWN group's name",
       "FIX #28 — v2.4: preview slots include groupId + groupName so the UI can render per-group plans",
       "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour) so each group gets its own deterministic product picks",
+      "FIX #30 — v2.5: applyOverride uses strict key matching only (no time-only fallback that resurrected old perGroupPerDay layouts)",
+      "FIX #31 — v2.5: groups deduped by id in both preview and live scheduler",
+      "FIX #32 — v2.5: autoSlotHours sorted ascending for stable output",
+      "FIX #33 — v2.5: preview response includes expectedPromoSlots, promoSlotsReturned, occasionSlotsReturned, overridesLoaded, autoSlotHours",
+      "FIX #34 — v2.5: skipped overrides keep their slot in the preview (no layout drift)",
     ],
     uptime: process.uptime(),
   });
@@ -5011,7 +5037,7 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.4 (per-group preview)`);
+  console.log(`🤖 AutoPromo: v2.5 (per-group preview, strict overrides)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
