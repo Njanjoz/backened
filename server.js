@@ -1,11 +1,19 @@
 // server.js — MarketMix backend
-// v2.8.2 — Seller-scoped STOCK + already-subscribed ack + reply-chain sellerId
+// v2.9.0 — Token-based STOCK subscriptions + LID fallback escalation
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
 // Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
 // Real Estate auth + Real Estate Firestore.
+//
+// NEW in v2.9.0:
+//   • Receipts include a wa.me link with a short token (subscribeTokens/{token})
+//     so buyers can subscribe from a fresh chat even when WAHA NOWEB sends @lid.
+//   • Webhook accepts "STOCK <token>" (or "STOP <token>") and resolves identity.
+//   • LID fallback now escalates across 3 messages instead of one, with a
+//     shorter repeat cooldown, so confused buyers get progressively clearer help.
+//   • GET /api/admin/unresolved-lids for diagnostics.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -14,6 +22,7 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
+const crypto = require("crypto");
 const Buffer = require("buffer").Buffer;
 const fetch = require("node-fetch");
 
@@ -149,13 +158,14 @@ const ADMIN_PHONE = process.env.ADMIN_PHONE || "254115988107";
 const ORDERS_PHONE = process.env.ORDERS_PHONE || "254115988107";
 const APK_DOWNLOAD_URL = process.env.APK_DOWNLOAD_URL || `${WEBSITE_URL}/apk/MarketMix-Kenya.apk`;
 
+// Public WhatsApp business number buyers message to subscribe
+const WA_BUSINESS_NUMBER = process.env.WA_BUSINESS_NUMBER || ORDERS_PHONE;
+
 const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
 
 // ============================
 // Category slug (Option Y)
-// Derives a stable categoryId from a display string.
-// "Mobile Phones" -> "mobile-phones"; "Fashion" -> "fashion"
 // ============================
 function slugifyCategory(raw) {
   if (!raw) return null;
@@ -514,7 +524,6 @@ async function attemptWaSend(job) {
     }
     console.log(`📱 WhatsApp sent → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms)`);
 
-    // Capture WAHA's message ID for reply-chain resolution
     const sentMessageId = data?.key?.id || data?.id?.id || data?.id?._serialized || null;
     if (sentMessageId && typeof job.onSent === "function") {
       try {
@@ -615,7 +624,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED (v2.6.5)
+   AutoPromo — INLINED
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -2107,7 +2116,14 @@ function welcomeSubscriberWhatsApp({ name }) {
 
 // ============================
 // Offline receipt — the locked-in copy
+// v2.9.0: includes wa.me subscribe link with token.
 // ============================
+function buildSubscribeLink(phone, token) {
+  if (!token) return null;
+  const text = encodeURIComponent(`STOCK ${token}`);
+  return `https://wa.me/${WA_BUSINESS_NUMBER}?text=${text}`;
+}
+
 function offlineSaleBuyerWhatsApp({
   customerName, shopName, invoiceId, items, amount,
   paymentMethod, paymentStatus, dateStr, emoji,
@@ -2115,6 +2131,7 @@ function offlineSaleBuyerWhatsApp({
   receiptVariant = "new",   // "new" | "subscribed" | "opted-out"
   cashReceived = null,
   changeGiven = null,
+  subscribeLink = null,
 }) {
   const name = (customerName && String(customerName).trim()) || "there";
   const shop = (shopName && String(shopName).trim()) || "MarketMix seller";
@@ -2166,17 +2183,40 @@ function offlineSaleBuyerWhatsApp({
       `✅ You're subscribed — we'll let you know when new stock drops.`
     );
   } else if (receiptVariant === "opted-out") {
-    lines.push(
-      ``,
-      `You've turned off stock alerts. Reply *STOCK* anytime to turn them back on.`
-    );
+    if (subscribeLink) {
+      lines.push(
+        ``,
+        `You turned off stock alerts earlier.`,
+        ``,
+        `Want them back? Tap to turn them on again: 👇`,
+        subscribeLink
+      );
+    } else {
+      lines.push(
+        ``,
+        `You've turned off stock alerts. Reply *STOCK* anytime to turn them back on.`
+      );
+    }
   } else {
-    lines.push(
-      ``,
-      `${safeEmoji} *Want to know when new stock drops?*`,
-      ``,
-      `Reply *STOCK* and we'll notify you when fresh stock arrives at ${shop}. 👀🔥`
-    );
+    // "new" — first-time buyer, no subscription yet
+    if (subscribeLink) {
+      lines.push(
+        ``,
+        `${safeEmoji} *Want to know when new stock drops at ${shop}?*`,
+        ``,
+        `👉 Tap to get alerts:`,
+        subscribeLink,
+        ``,
+        `Or reply *STOCK* to this message.`
+      );
+    } else {
+      lines.push(
+        ``,
+        `${safeEmoji} *Want to know when new stock drops?*`,
+        ``,
+        `Reply *STOCK* and we'll notify you when fresh stock arrives at ${shop}. 👀🔥`
+      );
+    }
   }
 
   lines.push(
@@ -2189,7 +2229,6 @@ function offlineSaleBuyerWhatsApp({
 }
 
 function subscriptionConfirmedWhatsApp({ shopNamesByCategory }) {
-  // shopNamesByCategory: [{ shop, categories: [{ name, emoji, count }] }]
   const blocks = [];
   for (const entry of shopNamesByCategory) {
     const catLines = entry.categories.map(c => `${c.emoji} ${c.name}`).join(", ");
@@ -2992,12 +3031,11 @@ async function upsertBuyerSubscription({
     const snap = await ref.get();
 
     if (snap.exists) {
-      // Repeat purchase — atomic increment, preserve subscription state.
       await ref.set({
         purchaseCount: admin.firestore.FieldValue.increment(1),
         lastPurchasedAt: admin.firestore.FieldValue.serverTimestamp(),
         lastOrderId: orderId || null,
-        categoryName: categoryName || snap.data().categoryName || null, // refresh display name
+        categoryName: categoryName || snap.data().categoryName || null,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
     } else {
@@ -3058,9 +3096,6 @@ async function recordBuyerProfileTouch({ phone, name, amount }) {
   }
 }
 
-/**
- * Given a phone, return all subscriptions as objects.
- */
 async function loadBuyerSubscriptions(phone) {
   const snap = await db.collection("buyerSubscriptions")
     .where("phone", "==", phone)
@@ -3068,12 +3103,6 @@ async function loadBuyerSubscriptions(phone) {
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
-/**
- * When the buyer replies STOCK (or any subscribe keyword):
- *  - If we know which seller's receipt they replied to, scope to that seller.
- *  - Otherwise, activate across all their existing subs.
- *  - Send either a fresh "You're on the list!" or a quiet "already subscribed" ack.
- */
 async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerId = null, onConfirmationSent = null }) {
   const allSubs = await loadBuyerSubscriptions(phone);
   if (!allSubs.length) {
@@ -3081,7 +3110,6 @@ async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerI
     return { activated: 0, alreadySubscribed: false };
   }
 
-  // Scope: if we know the seller from the reply, restrict activation to them.
   const subs = receiptSellerId
     ? allSubs.filter(s => s.sellerId === receiptSellerId)
     : allSubs;
@@ -3094,10 +3122,8 @@ async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerI
   const now = admin.firestore.FieldValue.serverTimestamp();
   const toActivate = subs.filter(s => !s.subscribed || s.optedOut);
 
-  // "Already subscribed" = nothing to activate AND at least one active sub.
   const alreadySubscribed = toActivate.length === 0 && subs.some(s => s.subscribed && !s.optedOut);
 
-  // Batch activate all
   const BATCH_LIMIT = 450;
   for (let i = 0; i < toActivate.length; i += BATCH_LIMIT) {
     const batch = db.batch();
@@ -3114,7 +3140,6 @@ async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerI
     await batch.commit();
   }
 
-  // Message scope: seller-scoped when receiptSellerId is known, otherwise full list.
   const msgSellerIds = [...new Set((receiptSellerId ? subs : allSubs).map(s => s.sellerId))];
   const sellerNames = {};
   for (const sid of msgSellerIds) {
@@ -3195,9 +3220,148 @@ async function optOutAllSubscriptionsForPhone(phone) {
 }
 
 // ============================
+// SUBSCRIBE TOKENS (v2.9.0)
+// wa.me link carries a short token so buyers can subscribe from a fresh
+// chat even when WAHA NOWEB sends @lid without a phone.
+// ============================
+
+const SUBSCRIBE_TOKEN_TTL_DAYS = 90;
+const SUBSCRIBE_TOKEN_BYTES = 6; // 8 chars after base64url
+
+function generateSubscribeToken() {
+  const buf = crypto.randomBytes(SUBSCRIBE_TOKEN_BYTES);
+  return buf.toString("base64")
+    .replace(/\+/g, "")
+    .replace(/\//g, "")
+    .replace(/=/g, "")
+    .slice(0, 8);
+}
+
+/**
+ * Create (or reuse) a token for { phone, sellerId }. One token per phone.
+ * If a fresh token already exists for this phone we reuse it.
+ */
+async function getOrCreateSubscribeToken({ phone, sellerId = null, orderId = null }) {
+  if (!phone) return null;
+  try {
+    // Reuse recent token for this phone
+    const existing = await db.collection("subscribeTokens")
+      .where("phone", "==", phone)
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
+
+    if (!existing.empty) {
+      const d = existing.docs[0];
+      const data = d.data() || {};
+      const createdMs = data.createdAt?.toDate?.()?.getTime?.() || 0;
+      const ageDays = (Date.now() - createdMs) / (1000 * 60 * 60 * 24);
+      if (ageDays < SUBSCRIBE_TOKEN_TTL_DAYS) {
+        // Refresh last used
+        await d.ref.set({
+          lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
+          uses: admin.firestore.FieldValue.increment(1),
+        }, { merge: true }).catch(() => {});
+        return d.id;
+      }
+    }
+
+    // Create fresh
+    let token = generateSubscribeToken();
+    // Collision guard (unlikely but cheap)
+    for (let i = 0; i < 3; i++) {
+      const check = await db.collection("subscribeTokens").doc(token).get();
+      if (!check.exists) break;
+      token = generateSubscribeToken();
+    }
+
+    const expiresAt = new Date(Date.now() + SUBSCRIBE_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+    await db.collection("subscribeTokens").doc(token).set({
+      phone,
+      sellerId: sellerId || null,
+      orderId: orderId || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastUsedAt: null,
+      uses: 0,
+      expiresAt,
+    });
+
+    console.log(`🎟️ Subscribe token created: ${token} → ${phone}`);
+    return token;
+  } catch (e) {
+    console.error("getOrCreateSubscribeToken failed:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Resolve token → { phone, sellerId, orderId }.
+ * Returns null if missing or expired.
+ */
+async function resolveSubscribeToken(token) {
+  if (!token) return null;
+  try {
+    const ref = db.collection("subscribeTokens").doc(String(token).toUpperCase());
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+    const d = snap.data() || {};
+    if (d.expiresAt?.toDate?.() && d.expiresAt.toDate() < new Date()) {
+      console.log(`⏰ Subscribe token ${token} expired`);
+      return null;
+    }
+    await ref.set({
+      lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
+      uses: admin.firestore.FieldValue.increment(1),
+    }, { merge: true }).catch(() => {});
+    return { phone: d.phone, sellerId: d.sellerId || null, orderId: d.orderId || null };
+  } catch (e) {
+    console.error("resolveSubscribeToken failed:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Parse leading keyword + optional trailing token.
+ * Examples:
+ *   "STOCK"          → { keyword: "STOCK", token: null }
+ *   "STOCK AB12CD34" → { keyword: "STOCK", token: "AB12CD34" }
+ *   "STOP AB12CD34"  → { keyword: "STOP",  token: "AB12CD34" }
+ *   "  stop  "       → { keyword: "STOP",  token: null }
+ */
+function parseKeywordAndToken(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return { keyword: "", token: null };
+
+  // Normalize internal whitespace
+  const normalized = text.replace(/\s+/g, " ");
+  const upper = normalized.toUpperCase();
+
+  // Try longest keyword first (e.g. "STOP ALL" before "STOP")
+  const allKeywords = [...UNSUBSCRIBE_KEYWORDS, ...SUBSCRIBE_KEYWORDS]
+    .sort((a, b) => b.length - a.length);
+
+  for (const kw of allKeywords) {
+    if (upper === kw) return { keyword: kw, token: null };
+    if (upper.startsWith(kw + " ")) {
+      const rest = normalized.slice(kw.length).trim();
+      // Token is a single token: alphanumeric, 4-16 chars
+      const tokenMatch = /^([A-Za-z0-9]{4,16})$/.exec(rest);
+      if (tokenMatch) return { keyword: kw, token: tokenMatch[1].toUpperCase() };
+      // Anything else after keyword → treat whole thing as keyword, no token
+      return { keyword: kw, token: null };
+    }
+  }
+
+  return { keyword: upper, token: null };
+}
+
+// ============================
 // LID resolution (WAHA NOWEB sends @lid, not phone)
 // ============================
-const LID_FALLBACK_COOLDOWN_HOURS = 24;
+const LID_FALLBACK_COOLDOWN_HOURS = 24;   // first fallback
+const LID_FALLBACK_REPEAT_HOURS = 2;      // subsequent fallbacks for same LID
+const LID_FALLBACK_MAX_SENDS = 3;
 
 async function storeConfirmationMessageMap({ messageId, phone, sellerId, kind, orderId = null }) {
   if (!messageId || !phone) return false;
@@ -3221,10 +3385,6 @@ async function storeConfirmationMessageMap({ messageId, phone, sellerId, kind, o
   }
 }
 
-/**
- * Given a LID reply, look up the phone number via the message ID it was
- * replying to. Returns { phone, orderId, sellerId, kind } or null.
- */
 async function resolveLidViaReply({ replyToId }) {
   if (!replyToId) return null;
   try {
@@ -3245,11 +3405,13 @@ async function resolveLidViaReply({ replyToId }) {
 }
 
 /**
- * Send the friendly fallback teaching the buyer to swipe-reply their receipt.
- * Cooldown per LID so a spammer can't trigger repeat sends.
- * Only fires for subscribe keywords. Never fires for STOP.
+ * Subscribe fallback with escalation. Returns true if a message was queued.
+ * Attempt 1 → gentle "reply to your receipt"
+ * Attempt 2 → 3-step instructions
+ * Attempt 3 → last try, point to WhatsApp support
+ * After attempt 3 → silent log only (no more sends until cooldown)
  */
-async function maybeSendSubscribeFallback({ phoneRaw, text, reason }) {
+async function maybeSendSubscribeFallback({ phoneRaw, text, reason, token = null }) {
   if (!SUBSCRIBE_KEYWORDS.has(text)) return false;
   if (UNSUBSCRIBE_KEYWORDS.has(text)) return false;
   if (!phoneRaw || !String(phoneRaw).endsWith("@lid")) return false;
@@ -3257,34 +3419,81 @@ async function maybeSendSubscribeFallback({ phoneRaw, text, reason }) {
   try {
     const cooldownRef = db.collection("waFallbackCooldowns").doc(String(phoneRaw));
     const snap = await cooldownRef.get();
+    const data = snap.exists ? (snap.data() || {}) : {};
+    const sentCount = Number(data.sentCount || 0);
+
+    // Hard cap after 3 attempts
+    if (sentCount >= LID_FALLBACK_MAX_SENDS) {
+      console.log(`🔕 Fallback maxed for ${phoneRaw} (sent ${sentCount}x)`);
+      return false;
+    }
+
     if (snap.exists) {
-      const last = snap.data().lastSentAt?.toDate?.()?.getTime?.() || 0;
+      const last = data.lastSentAt?.toDate?.()?.getTime?.() || 0;
       const hoursSince = (Date.now() - last) / (1000 * 60 * 60);
-      if (hoursSince < LID_FALLBACK_COOLDOWN_HOURS) {
-        console.log(`🔕 Fallback suppressed for ${phoneRaw} (last sent ${hoursSince.toFixed(1)}h ago)`);
+      const minHours = sentCount >= 1 ? LID_FALLBACK_REPEAT_HOURS : LID_FALLBACK_COOLDOWN_HOURS;
+      if (hoursSince < minHours) {
+        console.log(`🔕 Fallback suppressed for ${phoneRaw} (last ${hoursSince.toFixed(1)}h ago, count=${sentCount})`);
         return false;
       }
     }
 
-    const msg = [
-      "Hey 😊❤️ Want to know when new stock arrives?",
-      "",
-      "Please open the receipt we sent you, press and hold that message, tap *Reply*, then type *STOCK* and send.",
-      "",
-      "That way, we'll know which shop's new arrivals to keep you updated on. 🛍️✨",
-      "",
-      "*MarketMix Kenya* 🇰🇪",
-      "Shop local, grow local.",
-    ].join("\n");
+    const attempt = sentCount + 1;
+    let msg;
 
-    enqueueWhatsApp(phoneRaw, msg, { kind: "subscribe-fallback", reason });
+    if (attempt === 1) {
+      msg = [
+        "Hey 😊❤️ Want to know when new stock arrives?",
+        "",
+        "Please open the receipt we sent you, press and hold that message, tap *Reply*, then type *STOCK* and send.",
+        "",
+        "That way, we'll know which shop's new arrivals to keep you updated on. 🛍️✨",
+        "",
+        "*MarketMix Kenya* 🇰🇪",
+        "Shop local, grow local.",
+      ].join("\n");
+    } else if (attempt === 2) {
+      msg = [
+        "We couldn't match your number to a receipt 😅",
+        "",
+        "Here's how to subscribe in 3 steps:",
+        "",
+        "1️⃣ Open your *WhatsApp chat with MarketMix Kenya*",
+        "2️⃣ Find your *last receipt message* (the one with your items)",
+        "3️⃣ *Press and hold* it → tap *Reply* → type *STOCK* → send",
+        "",
+        "A fresh message (like the one you just sent) doesn't carry the receipt info we need. 🙏",
+        "",
+        "*MarketMix Kenya* 🇰🇪",
+      ].join("\n");
+    } else {
+      msg = [
+        "We're still having trouble linking your number to a receipt 🥲",
+        "",
+        "This is a WhatsApp technical limit on our side — sorry!",
+        "",
+        `Please message our team directly and we'll set you up manually:`,
+        `👉 wa.me/${ORDERS_PHONE}`,
+        "",
+        "Include your most recent receipt number and we'll add you to the right shop's stock alerts. 💚",
+        "",
+        "*MarketMix Kenya* 🇰🇪",
+      ].join("\n");
+    }
+
+    enqueueWhatsApp(phoneRaw, msg, {
+      kind: `subscribe-fallback-${attempt}`,
+      reason,
+      token: token || null,
+    });
 
     await cooldownRef.set({
       lastSentAt: admin.firestore.FieldValue.serverTimestamp(),
-      reason: reason || null,
+      sentCount: admin.firestore.FieldValue.increment(1),
+      lastReason: reason || null,
     }, { merge: true });
 
-    console.log(`💬 Subscribe fallback sent → ${phoneRaw} (reason=${reason})`);
+    console.log(`💬 Subscribe fallback #${attempt} sent → ${phoneRaw} (reason=${reason})`);
     return true;
   } catch (e) {
     console.error("maybeSendSubscribeFallback failed:", e.message);
@@ -3334,35 +3543,47 @@ async function maybeSendStopFallback({ phoneRaw, text, reason }) {
 
 // ============================
 // WhatsApp Inbound Webhook
-// Handles STOCK, category keywords, and STOP.
+// v2.9.0: accepts "STOCK <token>" / "STOP <token>" from wa.me links
 // ============================
 app.post("/api/whatsapp/webhook", async (req, res) => {
-  // Always ACK immediately so WAHA doesn't retry
   res.json({ success: true });
 
   try {
     const body = req.body || {};
     const inner = body.payload || body;
     const rawFrom = inner.from || inner.chatId || inner.author || null;
-    const text = String(inner.body || inner.text || "").trim().toUpperCase();
+    const rawBody = String(inner.body || inner.text || "").trim();
     const fromMe = inner.fromMe === true;
     const replyToId = inner.replyTo?.id || null;
 
-    if (fromMe) return; // ignore our own outbound echoes
-    if (!rawFrom || !text) return;
-    if (String(rawFrom).endsWith("@g.us")) return; // ignore group chats
+    if (fromMe) return;
+    if (!rawFrom || !rawBody) return;
+    if (String(rawFrom).endsWith("@g.us")) return;
 
-    // ── LID resolution ──
-    // WAHA NOWEB sends "from" as "XXXXXXXX@lid" instead of a phone.
-    // Try to resolve to the real phone via the reply chain.
+    const { keyword, token } = parseKeywordAndToken(rawBody);
+
+    // ── Resolve identity ──────────────────────────────────────────────
+    // Priority:
+    //   1. Token in message → resolve phone + sellerId directly
+    //   2. Reply-chain to a mapped receipt → resolve phone + sellerId
+    //   3. Direct phone in `from` (non-@lid) → use as-is
     let phone = null;
     let receiptSellerId = null;
     let resolutionReason = "direct";
 
-    if (String(rawFrom).endsWith("@lid")) {
-      if (!replyToId) {
-        resolutionReason = "no-reply-chain";
+    if (token) {
+      const tok = await resolveSubscribeToken(token);
+      if (tok?.phone) {
+        phone = tok.phone;
+        receiptSellerId = tok.sellerId || null;
+        resolutionReason = "token";
       } else {
+        resolutionReason = "token-invalid";
+      }
+    }
+
+    if (!phone && String(rawFrom).endsWith("@lid")) {
+      if (replyToId) {
         const resolved = await resolveLidViaReply({ replyToId });
         if (resolved?.phone) {
           phone = resolved.phone;
@@ -3371,42 +3592,53 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         } else {
           resolutionReason = "reply-to-unknown";
         }
+      } else if (resolutionReason === "direct") {
+        resolutionReason = "no-reply-chain";
       }
-    } else {
+    }
+
+    if (!phone && !String(rawFrom).endsWith("@lid")) {
       phone = normalizePhoneForWa(String(rawFrom).replace(/@.*$/, ""));
     }
 
-    // Couldn't resolve → log + maybe send fallback, do NOT process
+    // ── Unresolved ────────────────────────────────────────────────────
     if (!phone) {
-      console.log(`⚠️ Unresolved inbound (${resolutionReason}): from=${rawFrom} replyToId=${replyToId || "—"} text="${text.slice(0, 40)}"`);
+      console.log(
+        `⚠️ Unresolved inbound (${resolutionReason}): from=${rawFrom} ` +
+        `replyToId=${replyToId || "—"} keyword="${keyword}" token=${token || "—"}`
+      );
       await db.collection("waUnresolvedLids").add({
         lid: rawFrom,
-        keyword: text,
+        keyword,
+        token: token || null,
         replyToId: replyToId || null,
         reason: resolutionReason,
         receivedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
 
-      if (SUBSCRIBE_KEYWORDS.has(text)) {
+      if (SUBSCRIBE_KEYWORDS.has(keyword)) {
         await maybeSendSubscribeFallback({
           phoneRaw: rawFrom,
-          text,
+          text: keyword,
           reason: resolutionReason,
+          token: token || null,
         });
-      } else if (UNSUBSCRIBE_KEYWORDS.has(text)) {
+      } else if (UNSUBSCRIBE_KEYWORDS.has(keyword)) {
         await maybeSendStopFallback({
           phoneRaw: rawFrom,
-          text,
+          text: keyword,
           reason: resolutionReason,
         });
       }
       return;
     }
 
-    console.log(`📨 Inbound WA: ${phone} → "${text.slice(0, 40)}" (via ${resolutionReason})`);
+    console.log(
+      `📨 Inbound WA: ${phone} → "${keyword}"${token ? ` (token ${token})` : ""} (via ${resolutionReason})`
+    );
 
-    // STOP first (more urgent)
-    if (UNSUBSCRIBE_KEYWORDS.has(text)) {
+    // ── STOP ──────────────────────────────────────────────────────────
+    if (UNSUBSCRIBE_KEYWORDS.has(keyword)) {
       const r = await optOutAllSubscriptionsForPhone(phone);
       enqueueWhatsApp(phone, optOutConfirmedWhatsApp(), {
         kind: "optout-confirmed",
@@ -3420,17 +3652,18 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         },
       });
       await db.collection("waInboundLogs").add({
-        phone, keyword: text, action: "optout", affected: r.optedOut,
-        rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+        phone, keyword, action: "optout", affected: r.optedOut,
+        rawFrom, token: token || null,
+        loggedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
       return;
     }
 
-    // Subscribe keyword
-    if (SUBSCRIBE_KEYWORDS.has(text)) {
+    // ── Subscribe keyword ────────────────────────────────────────────
+    if (SUBSCRIBE_KEYWORDS.has(keyword)) {
       const r = await activateAllSubscriptionsForPhone({
         phone,
-        keyword: text,
+        keyword,
         receiptSellerId,
         onConfirmationSent: async (confirmationMessageId) => {
           await storeConfirmationMessageMap({
@@ -3442,18 +3675,19 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         },
       });
       await db.collection("waInboundLogs").add({
-        phone, keyword: text,
+        phone, keyword,
         action: r.alreadySubscribed ? "already-subscribed" : "subscribe",
         affected: r.activated || 0,
         sellerScoped: !!receiptSellerId,
+        viaToken: !!token,
         rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
       return;
     }
 
-    // Unknown — log silently, no reply (avoid spam)
+    // Unknown — log silently
     await db.collection("waInboundLogs").add({
-      phone, keyword: text, action: "unknown",
+      phone, keyword, action: "unknown",
       rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
     }).catch(() => {});
   } catch (e) {
@@ -3463,8 +3697,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
 // ============================
 // Stock Drop Notification
-// Called by seller when they add a new product, or by admin.
-// Body: { productId, sellerId? }
 // ============================
 app.post("/api/promo/stock-drop", async (req, res) => {
   try {
@@ -3482,7 +3714,6 @@ app.post("/api/promo/stock-drop", async (req, res) => {
       return res.status(400).json({ success: false, message: "Product missing sellerId or category" });
     }
 
-    // Seller shop name
     let shopName = "MarketMix seller";
     try {
       const s = await db.collection("users").doc(sellerId).get();
@@ -3492,7 +3723,6 @@ app.post("/api/promo/stock-drop", async (req, res) => {
       }
     } catch {}
 
-    // Find all buyers subscribed to (sellerId, categoryId)
     const subsSnap = await db.collection("buyerSubscriptions")
       .where("sellerId", "==", sellerId)
       .where("categoryId", "==", categoryId)
@@ -3515,7 +3745,7 @@ app.post("/api/promo/stock-drop", async (req, res) => {
       const sub = d.data() || {};
       if (sub.optedOut) continue;
 
-      const buyerName = sub.buyerName || null; // not stored yet, fine
+      const buyerName = sub.buyerName || null;
       const msg = [
         `${emoji} *New stock just dropped!*`,
         ``,
@@ -3546,7 +3776,6 @@ app.post("/api/promo/stock-drop", async (req, res) => {
       }, { merge: true }).catch(() => {});
 
       sent++;
-      // Pace to avoid WAHA throttling
       await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
     }
 
@@ -3573,7 +3802,6 @@ app.post("/api/promo/stock-drop", async (req, res) => {
 // Seller-facing customer endpoints
 // ============================
 
-// GET /api/seller/customers?sellerId=xxx
 app.get("/api/seller/customers", async (req, res) => {
   try {
     const { sellerId, limit = 200, categoryId = null, subscribedOnly = null } = req.query || {};
@@ -3589,7 +3817,6 @@ app.get("/api/seller/customers", async (req, res) => {
     if (categoryId) subs = subs.filter(s => s.categoryId === categoryId);
     if (subscribedOnly === "true") subs = subs.filter(s => s.subscribed && !s.optedOut);
 
-    // Group by phone
     const byPhone = new Map();
     for (const s of subs) {
       if (!byPhone.has(s.phone)) {
@@ -3625,7 +3852,6 @@ app.get("/api/seller/customers", async (req, res) => {
   }
 });
 
-// POST /api/seller/customers/:phone/note
 app.post("/api/seller/customers/:phone/note", async (req, res) => {
   try {
     const phone = req.params.phone;
@@ -3643,8 +3869,6 @@ app.post("/api/seller/customers/:phone/note", async (req, res) => {
   }
 });
 
-// POST /api/seller/customers/:phone/manual-optout  { sellerId }
-// Allows seller to manually opt a customer out from THEIR store's notifications only.
 app.post("/api/seller/customers/:phone/manual-optout", async (req, res) => {
   try {
     const phone = req.params.phone;
@@ -4368,7 +4592,7 @@ app.post("/api/moving/notify", async (req, res) => {
 
 // ============================
 // Offline Sale Notify
-// Fires receipt (once) + creates buyer subscriptions per (sellerId, categoryId).
+// v2.9.0: creates token and includes wa.me link in receipt
 // ============================
 app.post("/api/offline-sale/notify", async (req, res) => {
   try {
@@ -4379,7 +4603,6 @@ app.post("/api/offline-sale/notify", async (req, res) => {
     if (!orderSnap.exists) return res.status(404).json({ success: false, message: "Order not found" });
     const order = orderSnap.data() || {};
 
-    // Guard against duplicate receipt sends
     if (order.receiptSentAt) {
       return res.json({ success: true, skipped: "receipt-already-sent" });
     }
@@ -4387,15 +4610,14 @@ app.post("/api/offline-sale/notify", async (req, res) => {
     const phone = order.buyerPhoneNormalized || normalizePhoneForWa(order.buyerPhone);
     const items = Array.isArray(order.items) ? order.items : [];
 
-    // ── 1. Build subscriptions (grouped by seller + category) ──
+    // Build subscriptions grouped by seller + category
     let subscriptionsCreated = 0;
-    const tuples = new Map(); // `${sellerId}::${categoryId}` → { sellerId, categoryId, categoryName, items[] }
+    const tuples = new Map();
 
     for (const it of items) {
       const sellerId = it.sellerId;
       if (!sellerId) continue;
 
-      // Fetch authoritative category from product if item doesn't carry it
       let categoryRaw = it.category || null;
       let categoryId = slugifyCategory(categoryRaw);
       if (!categoryId && it.productId) {
@@ -4438,10 +4660,9 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       });
     }
 
-    // ── 2. Build & send receipt ──
     const sellerId = (order.involvedSellerIds || [])[0] || null;
 
-    // ── Determine receipt variant from buyer's state with this seller ──
+    // Determine receipt variant
     let receiptVariant = "new";
     if (phone && sellerId) {
       try {
@@ -4475,7 +4696,13 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       } catch {}
     }
 
-    // Pick emoji from the top-priority category in the order
+    // Create subscribe token for this buyer
+    let subscribeLink = null;
+    if (phone && subscriptionsCreated > 0 && receiptVariant !== "subscribed") {
+      const token = await getOrCreateSubscribeToken({ phone, sellerId, orderId });
+      if (token) subscribeLink = buildSubscribeLink(phone, token);
+    }
+
     const emojiPriority = ["sneakers", "footwear", "shoes", "clothing", "fashion", "electronics", "mobile-phones", "beauty", "accessories", "bags", "home", "food", "books", "toys", "sports", "jewelry"];
     let emoji = "🛍️";
     const categoryIds = [...tuples.values()].map(t => t.categoryId);
@@ -4505,6 +4732,7 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       receiptVariant,
       cashReceived: order.cashReceived != null ? Number(order.cashReceived) : null,
       changeGiven: order.changeGiven != null ? Number(order.changeGiven) : null,
+      subscribeLink,
     });
 
     let whatsappQueued = false;
@@ -4537,11 +4765,11 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       });
     }
 
-    // Mark receipt as sent on the order
     await db.collection("orders").doc(orderId).set({
       receiptSentAt: admin.firestore.FieldValue.serverTimestamp(),
       receiptSentTo: phone || null,
       receiptSubscriptionsCreated: subscriptionsCreated,
+      receiptSubscribeLink: subscribeLink || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
@@ -4552,6 +4780,7 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       hasPhone: !!phone,
       shopName,
       emoji,
+      subscribeLink,
     });
   } catch (e) {
     console.error("❌ /api/offline-sale/notify failed:", e);
@@ -4560,7 +4789,7 @@ app.post("/api/offline-sale/notify", async (req, res) => {
 });
 
 // ============================
-// IntaSend callback (unchanged behavior + receipt-once)
+// IntaSend callback
 // ============================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
@@ -5210,19 +5439,26 @@ app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
       paymentMethod = "Cash",
       cashReceived = null,
       changeGiven = null,
+      includeSubscribeLink = true,
     } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, message: "phone required" });
 
     const dateStr = new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" });
+    let subscribeLink = null;
+    if (includeSubscribeLink && receiptVariant !== "subscribed") {
+      const token = await getOrCreateSubscribeToken({ phone });
+      if (token) subscribeLink = buildSubscribeLink(phone, token);
+    }
     const msg = offlineSaleBuyerWhatsApp({
       customerName, shopName, invoiceId, items, amount,
       paymentMethod, paymentStatus: "paid", dateStr, emoji, hasSubscriptions,
       receiptVariant,
       cashReceived: cashReceived != null ? Number(cashReceived) : null,
       changeGiven: changeGiven != null ? Number(changeGiven) : null,
+      subscribeLink,
     });
     const queued = enqueueWhatsApp(phone, msg, { kind: "test-offline-receipt" });
-    return res.json({ success: queued, queued, preview: msg });
+    return res.json({ success: queued, queued, subscribeLink, preview: msg });
   } catch (e) {
     return sendServerError(res, e, "Test offline WhatsApp failed");
   }
@@ -5244,12 +5480,71 @@ app.post("/api/test-subscription-confirm-whatsapp", async (req, res) => {
 });
 
 // ============================
+// v2.9.0 Diagnostics
+// ============================
+
+// Inspect unresolved LIDs + fallback cooldowns
+app.get("/api/admin/unresolved-lids", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const unresolved = await db.collection("waUnresolvedLids")
+      .orderBy("receivedAt", "desc").limit(limit).get().catch(() => ({ docs: [] }));
+    const cooldowns = await db.collection("waFallbackCooldowns")
+      .orderBy("lastSentAt", "desc").limit(limit).get().catch(() => ({ docs: [] }));
+    const stopCooldowns = await db.collection("waStopFallbackCooldowns")
+      .orderBy("lastSentAt", "desc").limit(limit).get().catch(() => ({ docs: [] }));
+    return res.json({
+      success: true,
+      unresolved: unresolved.docs.map(d => ({ id: d.id, ...d.data() })),
+      cooldowns: cooldowns.docs.map(d => ({ id: d.id, ...d.data() })),
+      stopCooldowns: stopCooldowns.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load unresolved LIDs");
+  }
+});
+
+// Lookup a subscribe token (for support)
+app.get("/api/admin/subscribe-tokens/:token", async (req, res) => {
+  try {
+    const { token } = req.params || {};
+    if (!token) return res.status(400).json({ success: false, message: "token required" });
+    const ref = db.collection("subscribeTokens").doc(String(token).toUpperCase());
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true, token: snap.id, data: snap.data() });
+  } catch (e) {
+    return sendServerError(res, e, "Token lookup failed");
+  }
+});
+
+// Manually mint a token for a buyer (support use)
+app.post("/api/admin/subscribe-tokens", async (req, res) => {
+  try {
+    const { phone, sellerId = null } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    const normalized = normalizePhoneForWa(phone);
+    if (!normalized) return res.status(400).json({ success: false, message: "Invalid phone" });
+    const token = await getOrCreateSubscribeToken({ phone: normalized, sellerId });
+    if (!token) return res.status(500).json({ success: false, message: "Could not mint token" });
+    return res.json({
+      success: true,
+      token,
+      phone: normalized,
+      subscribeLink: buildSubscribeLink(normalized, token),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not mint token");
+  }
+});
+
+// ============================
 // HEALTH
 // ============================
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.8.2",
+    version: "v2.9.0",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
@@ -5259,6 +5554,7 @@ app.get("/_health", (req, res) => {
       products: PRODUCTS_URL,
       whatsappGroup: WHATSAPP_GROUP_URL,
       sellerDashboard: SELLER_DASHBOARD_URL,
+      waBusinessNumber: WA_BUSINESS_NUMBER,
     },
     whatsappQueue: waQueue.length,
     buyerSubscriptions: {
@@ -5270,13 +5566,25 @@ app.get("/_health", (req, res) => {
       unsubscribeKeywords: [...UNSUBSCRIBE_KEYWORDS],
       sellerScopedActivation: true,
       alreadySubscribedAck: true,
+      tokenSystem: {
+        enabled: true,
+        collection: "subscribeTokens",
+        ttlDays: SUBSCRIBE_TOKEN_TTL_DAYS,
+        tokenLength: 8,
+        waLinkFormat: `https://wa.me/${WA_BUSINESS_NUMBER}?text=STOCK%20<token>`,
+        parseFormat: '"STOCK <token>" or "STOP <token>"',
+      },
       lidResolution: {
         enabled: true,
         messageMapCollection: "whatsappMessageMap",
         unresolvedLogCollection: "waUnresolvedLids",
         stockFallbackCollection: "waFallbackCooldowns",
         stopFallbackCollection: "waStopFallbackCooldowns",
-        fallbackCooldownHours: 24,
+        fallbackSchedule: {
+          firstSendHours: LID_FALLBACK_COOLDOWN_HOURS,
+          repeatHours: LID_FALLBACK_REPEAT_HOURS,
+          maxSends: LID_FALLBACK_MAX_SENDS,
+        },
         replyChainReturnsSellerId: true,
       },
       endpoints: [
@@ -5288,6 +5596,9 @@ app.get("/_health", (req, res) => {
         "POST /api/offline-sale/notify",
         "POST /api/test-offline-sale-whatsapp",
         "POST /api/test-subscription-confirm-whatsapp",
+        "GET  /api/admin/unresolved-lids",
+        "GET  /api/admin/subscribe-tokens/:token",
+        "POST /api/admin/subscribe-tokens",
       ],
     },
     endpoints: [
@@ -5296,6 +5607,7 @@ app.get("/_health", (req, res) => {
       "/api/admin/auto-promo", "/api/admin/auto-promo/run-now",
       "/api/admin/marketing-overrides",
       "/api/admin/occasions", "/api/admin/occasions/run-now",
+      "/api/admin/unresolved-lids", "/api/admin/subscribe-tokens",
       "/api/service-request/notify", "/api/moving/notify", "/api/re/welcome",
       "/api/stk-push", "/api/store/seed", "/api/real-estate/seed",
       "/api/offline-sale/notify",
@@ -5363,13 +5675,15 @@ occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 // Server start
 // ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.8.2`);
+  console.log(`🚀 Server on port ${PORT} — v2.9.0`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
-  console.log(`🔗 LID resolution: ✅ (reply-chain → whatsappMessageMap, returns sellerId)`);
-  console.log(`🎯 Seller-scoped STOCK activation: ✅`);
+  console.log(`🎟️ Subscribe tokens: ✅ (wa.me link + reply-chain both work)`);
+  console.log(`💬 LID fallback: ✅ (3 escalating messages, 2h repeat cooldown)`);
+  console.log(`🎯 Seller-scoped STOCK: ✅`);
   console.log(`📨 Webhook: POST /api/whatsapp/webhook`);
+  console.log(`🔧 Diagnostics: GET /api/admin/unresolved-lids`);
 });
 
 const shutdown = () => {
