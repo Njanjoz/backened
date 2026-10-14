@@ -1,5 +1,5 @@
 // server.js — MarketMix backend
-// v2.8.0 — Buyer subscription engine (seller + category scoped)
+// v2.8.1 — Receipt variants + STOP fallback + STOP→STOCK fix
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -2110,7 +2110,9 @@ function welcomeSubscriberWhatsApp({ name }) {
 // ============================
 function offlineSaleBuyerWhatsApp({
   customerName, shopName, invoiceId, items, amount,
-  paymentMethod, paymentStatus, dateStr, emoji, hasSubscriptions,
+  paymentMethod, paymentStatus, dateStr, emoji,
+  hasSubscriptions,
+  receiptVariant = "new",   // "new" | "subscribed" | "opted-out"
 }) {
   const name = (customerName && String(customerName).trim()) || "there";
   const shop = (shopName && String(shopName).trim()) || "MarketMix seller";
@@ -2141,18 +2143,28 @@ function offlineSaleBuyerWhatsApp({
     `💰 *Total paid: KES ${amt}*`,
   ];
 
-  if (hasSubscriptions) {
+  if (!hasSubscriptions) {
+    lines.push(
+      ``,
+      `Thank you for supporting a local business! ❤️`,
+      `Keep this message as your proof of purchase.`
+    );
+  } else if (receiptVariant === "subscribed") {
+    lines.push(
+      ``,
+      `✅ You're subscribed — we'll let you know when new stock drops.`
+    );
+  } else if (receiptVariant === "opted-out") {
+    lines.push(
+      ``,
+      `You've turned off stock alerts. Reply *STOCK* anytime to turn them back on.`
+    );
+  } else {
     lines.push(
       ``,
       `${safeEmoji} *Want to know when new stock drops?*`,
       ``,
       `Reply *STOCK* and we'll notify you when fresh stock arrives at ${shop}. 👀🔥`
-    );
-  } else {
-    lines.push(
-      ``,
-      `Thank you for supporting a local business! ❤️`,
-      `Keep this message as your proof of purchase.`
     );
   }
 
@@ -3040,7 +3052,7 @@ async function activateAllSubscriptionsForPhone({ phone, keyword }) {
   }
 
   const now = admin.firestore.FieldValue.serverTimestamp();
-  const toActivate = subs.filter(s => !s.subscribed && !s.optedOut);
+  const toActivate = subs.filter(s => !s.subscribed || s.optedOut);
 
   // Batch activate all
   const BATCH_LIMIT = 450;
@@ -3171,14 +3183,14 @@ async function maybeSendSubscribeFallback({ phoneRaw, text, reason }) {
     }
 
     const msg = [
-      "Hey! 👋🏽 We noticed you'd like to hear when new stock drops! 🛍️🔥",
+      "Hey 😊❤️ Want to know when new stock arrives?",
       "",
-      "To connect you to the right shop, please open your MarketMix receipt, swipe/reply directly to that exact message, and type *STOCK*.",
+      "Please open the receipt we sent you, press and hold that message, tap *Reply*, then type *STOCK* and send.",
       "",
-      "That way, we'll know which shop's new arrivals to notify you about. ❤️",
+      "That way, we'll know which shop's new arrivals to keep you updated on. 🛍️✨",
       "",
-      "*MarketMix Kenya*",
-      "Shop local, grow local. 🇰🇪",
+      "*MarketMix Kenya* 🇰🇪",
+      "Shop local, grow local.",
     ].join("\n");
 
     enqueueWhatsApp(phoneRaw, msg, { kind: "subscribe-fallback", reason });
@@ -3196,7 +3208,45 @@ async function maybeSendSubscribeFallback({ phoneRaw, text, reason }) {
   }
 }
 
-// ============================
+async function maybeSendStopFallback({ phoneRaw, text, reason }) {
+  if (!UNSUBSCRIBE_KEYWORDS.has(text)) return false;
+  if (!phoneRaw || !String(phoneRaw).endsWith("@lid")) return false;
+
+  try {
+    const cooldownRef = db.collection("waStopFallbackCooldowns").doc(String(phoneRaw));
+    const snap = await cooldownRef.get();
+    if (snap.exists) {
+      const last = snap.data().lastSentAt?.toDate?.()?.getTime?.() || 0;
+      const hoursSince = (Date.now() - last) / (1000 * 60 * 60);
+      if (hoursSince < LID_FALLBACK_COOLDOWN_HOURS) {
+        console.log(`🔕 STOP fallback suppressed for ${phoneRaw} (last sent ${hoursSince.toFixed(1)}h ago)`);
+        return false;
+      }
+    }
+
+    const msg = [
+      "Hey ❤️ To stop stock notifications, please open the receipt we sent you, press and hold that message, tap *Reply*, then type *STOP* and send.",
+      "",
+      "This helps us identify the right shop's notifications to turn off. 😊",
+      "",
+      "*MarketMix Kenya* 🇰🇪",
+      "Shop local, grow local.",
+    ].join("\n");
+
+    enqueueWhatsApp(phoneRaw, msg, { kind: "stop-fallback", reason });
+
+    await cooldownRef.set({
+      lastSentAt: admin.firestore.FieldValue.serverTimestamp(),
+      reason: reason || null,
+    }, { merge: true });
+
+    console.log(`💬 STOP fallback sent → ${phoneRaw} (reason=${reason})`);
+    return true;
+  } catch (e) {
+    console.error("maybeSendStopFallback failed:", e.message);
+    return false;
+  }
+}// ============================
 // WhatsApp Inbound Webhook
 // Handles STOCK, category keywords, and STOP.
 // ============================
@@ -3249,11 +3299,19 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         receivedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
 
-      await maybeSendSubscribeFallback({
-        phoneRaw: rawFrom,
-        text,
-        reason: resolutionReason,
-      });
+      if (SUBSCRIBE_KEYWORDS.has(text)) {
+        await maybeSendSubscribeFallback({
+          phoneRaw: rawFrom,
+          text,
+          reason: resolutionReason,
+        });
+      } else if (UNSUBSCRIBE_KEYWORDS.has(text)) {
+        await maybeSendStopFallback({
+          phoneRaw: rawFrom,
+          text,
+          reason: resolutionReason,
+        });
+      }
       return;
     }
 
@@ -4270,6 +4328,30 @@ app.post("/api/offline-sale/notify", async (req, res) => {
 
     // ── 2. Build & send receipt ──
     const sellerId = (order.involvedSellerIds || [])[0] || null;
+
+    // ── Determine receipt variant from buyer's state with this seller ──
+    let receiptVariant = "new";
+    if (phone && sellerId) {
+      try {
+        const subsSnap = await db.collection("buyerSubscriptions")
+          .where("phone", "==", phone)
+          .where("sellerId", "==", sellerId)
+          .get();
+
+        if (!subsSnap.empty) {
+          const subs = subsSnap.docs.map(d => d.data());
+          const anySubscribed = subs.some(s => s.subscribed && !s.optedOut);
+          const anyOptedOut = subs.some(s => s.optedOut);
+
+          if (anySubscribed) receiptVariant = "subscribed";
+          else if (anyOptedOut) receiptVariant = "opted-out";
+          else receiptVariant = "new";
+        }
+      } catch (e) {
+        console.warn("receipt variant lookup failed, defaulting to 'new':", e.message);
+      }
+    }
+
     let shopName = "MarketMix seller";
     if (sellerId) {
       try {
@@ -4308,6 +4390,7 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       dateStr,
       emoji,
       hasSubscriptions: subscriptionsCreated > 0,
+      receiptVariant,
     });
 
     let whatsappQueued = false;
@@ -5009,6 +5092,7 @@ app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
       items = [{ name: "Nike Air Force 1", quantity: 1 }, { name: "White Cap", quantity: 2 }],
       emoji = "👟",
       hasSubscriptions = true,
+      receiptVariant = "new",
     } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, message: "phone required" });
 
@@ -5016,6 +5100,7 @@ app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
     const msg = offlineSaleBuyerWhatsApp({
       customerName, shopName, invoiceId, items, amount,
       paymentMethod: "Cash", paymentStatus: "paid", dateStr, emoji, hasSubscriptions,
+      receiptVariant,
     });
     const queued = enqueueWhatsApp(phone, msg, { kind: "test-offline-receipt" });
     return res.json({ success: queued, queued, preview: msg });
@@ -5045,7 +5130,7 @@ app.post("/api/test-subscription-confirm-whatsapp", async (req, res) => {
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.8.0",
+    version: "v2.8.1",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
@@ -5068,7 +5153,8 @@ app.get("/_health", (req, res) => {
         enabled: true,
         messageMapCollection: "whatsappMessageMap",
         unresolvedLogCollection: "waUnresolvedLids",
-        fallbackCooldownCollection: "waFallbackCooldowns",
+        stockFallbackCollection: "waFallbackCooldowns",
+        stopFallbackCollection: "waStopFallbackCooldowns",
         fallbackCooldownHours: 24,
       },
       endpoints: [
@@ -5155,7 +5241,7 @@ occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 // Server start
 // ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.8.0`);
+  console.log(`🚀 Server on port ${PORT} — v2.8.1`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
