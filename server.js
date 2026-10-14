@@ -414,6 +414,7 @@ function enqueueWhatsApp(phoneNumber, message, meta = {}) {
     kind: "text",
     message,
     meta,
+    onSent: typeof meta.onSent === "function" ? meta.onSent : null,
     attempts: 0,
     enqueuedAt: Date.now(),
   });
@@ -512,6 +513,16 @@ async function attemptWaSend(job) {
       return false;
     }
     console.log(`📱 WhatsApp sent → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms)`);
+
+    // Capture WAHA's message ID for reply-chain resolution
+    const sentMessageId = data?.key?.id || data?.id?.id || data?.id?._serialized || null;
+    if (sentMessageId && typeof job.onSent === "function") {
+      try {
+        await job.onSent(sentMessageId, job);
+      } catch (cbErr) {
+        console.error("⚠️ onSent callback failed:", cbErr.message);
+      }
+    }
     return true;
   } catch (e) {
     const isAbort = e.name === "AbortError";
@@ -3115,6 +3126,77 @@ async function optOutAllSubscriptionsForPhone(phone) {
 }
 
 // ============================
+// LID resolution (WAHA NOWEB sends @lid, not phone)
+// ============================
+const LID_FALLBACK_COOLDOWN_HOURS = 24;
+
+/**
+ * Given a LID reply, look up the phone number via the message ID it was
+ * replying to. Returns { phone, orderId } or null.
+ */
+async function resolveLidViaReply({ replyToId }) {
+  if (!replyToId) return null;
+  try {
+    const snap = await db.collection("whatsappMessageMap").doc(replyToId).get();
+    if (!snap.exists) return null;
+    const d = snap.data() || {};
+    if (!d.phone) return null;
+    return { phone: d.phone, orderId: d.orderId || null, kind: d.kind || null };
+  } catch (e) {
+    console.error("resolveLidViaReply failed:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Send the friendly fallback teaching the buyer to swipe-reply their receipt.
+ * Cooldown per LID so a spammer can't trigger repeat sends.
+ * Only fires for subscribe keywords. Never fires for STOP.
+ */
+async function maybeSendSubscribeFallback({ phoneRaw, text, reason }) {
+  if (!SUBSCRIBE_KEYWORDS.has(text)) return false;
+  if (UNSUBSCRIBE_KEYWORDS.has(text)) return false;
+  if (!phoneRaw || !String(phoneRaw).endsWith("@lid")) return false;
+
+  try {
+    const cooldownRef = db.collection("waFallbackCooldowns").doc(String(phoneRaw));
+    const snap = await cooldownRef.get();
+    if (snap.exists) {
+      const last = snap.data().lastSentAt?.toDate?.()?.getTime?.() || 0;
+      const hoursSince = (Date.now() - last) / (1000 * 60 * 60);
+      if (hoursSince < LID_FALLBACK_COOLDOWN_HOURS) {
+        console.log(`🔕 Fallback suppressed for ${phoneRaw} (last sent ${hoursSince.toFixed(1)}h ago)`);
+        return false;
+      }
+    }
+
+    const msg = [
+      "Hey! 👋🏽 We noticed you'd like to hear when new stock drops! 🛍️🔥",
+      "",
+      "To connect you to the right shop, please open your MarketMix receipt, swipe/reply directly to that exact message, and type *STOCK*.",
+      "",
+      "That way, we'll know which shop's new arrivals to notify you about. ❤️",
+      "",
+      "*MarketMix Kenya*",
+      "Shop local, grow local. 🇰🇪",
+    ].join("\n");
+
+    enqueueWhatsApp(phoneRaw, msg, { kind: "subscribe-fallback", reason });
+
+    await cooldownRef.set({
+      lastSentAt: admin.firestore.FieldValue.serverTimestamp(),
+      reason: reason || null,
+    }, { merge: true });
+
+    console.log(`💬 Subscribe fallback sent → ${phoneRaw} (reason=${reason})`);
+    return true;
+  } catch (e) {
+    console.error("maybeSendSubscribeFallback failed:", e.message);
+    return false;
+  }
+}
+
+// ============================
 // WhatsApp Inbound Webhook
 // Handles STOCK, category keywords, and STOP.
 // ============================
@@ -3128,15 +3210,54 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     const rawFrom = inner.from || inner.chatId || inner.author || null;
     const text = String(inner.body || inner.text || "").trim().toUpperCase();
     const fromMe = inner.fromMe === true;
+    const replyToId = inner.replyTo?.id || null;
 
     if (fromMe) return; // ignore our own outbound echoes
     if (!rawFrom || !text) return;
     if (String(rawFrom).endsWith("@g.us")) return; // ignore group chats
 
-    const phone = normalizePhoneForWa(String(rawFrom).replace(/@.*$/, ""));
-    if (!phone) return;
+    // ── LID resolution ──
+    // WAHA NOWEB sends "from" as "XXXXXXXX@lid" instead of a phone.
+    // Try to resolve to the real phone via the reply chain.
+    let phone = null;
+    let resolutionReason = "direct";
 
-    console.log(`📨 Inbound WA: ${phone} → "${text.slice(0, 40)}"`);
+    if (String(rawFrom).endsWith("@lid")) {
+      if (!replyToId) {
+        resolutionReason = "no-reply-chain";
+      } else {
+        const resolved = await resolveLidViaReply({ replyToId });
+        if (resolved?.phone) {
+          phone = resolved.phone;
+          resolutionReason = "reply-to-map";
+        } else {
+          resolutionReason = "reply-to-unknown";
+        }
+      }
+    } else {
+      phone = normalizePhoneForWa(String(rawFrom).replace(/@.*$/, ""));
+    }
+
+    // Couldn't resolve → log + maybe send fallback, do NOT process
+    if (!phone) {
+      console.log(`⚠️ Unresolved inbound (${resolutionReason}): from=${rawFrom} replyToId=${replyToId || "—"} text="${text.slice(0, 40)}"`);
+      await db.collection("waUnresolvedLids").add({
+        lid: rawFrom,
+        keyword: text,
+        replyToId: replyToId || null,
+        reason: resolutionReason,
+        receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      await maybeSendSubscribeFallback({
+        phoneRaw: rawFrom,
+        text,
+        reason: resolutionReason,
+      });
+      return;
+    }
+
+    console.log(`📨 Inbound WA: ${phone} → "${text.slice(0, 40)}" (via ${resolutionReason})`);
 
     // STOP first (more urgent)
     if (UNSUBSCRIBE_KEYWORDS.has(text)) {
@@ -4196,6 +4317,26 @@ app.post("/api/offline-sale/notify", async (req, res) => {
         orderId,
         sellerId,
         subscriptionsCreated,
+        onSent: async (messageId) => {
+          if (!messageId) return;
+          try {
+            await db.collection("whatsappMessageMap").doc(messageId).set({
+              messageId,
+              phone,
+              orderId,
+              kind: "offline-receipt",
+              sellerId: sellerId || null,
+              sentAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await db.collection("orders").doc(orderId).set({
+              receiptWhatsAppMessageId: messageId,
+              receiptWhatsAppSentAt: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+            console.log(`🔗 Mapped receipt ${messageId} → ${phone} (order ${orderId})`);
+          } catch (e) {
+            console.error("❌ Failed to store whatsappMessageMap:", e.message);
+          }
+        },
       });
     }
 
@@ -4923,6 +5064,13 @@ app.get("/_health", (req, res) => {
       categoryIdMode: "slug-from-category-string",
       subscribeKeywords: [...SUBSCRIBE_KEYWORDS],
       unsubscribeKeywords: [...UNSUBSCRIBE_KEYWORDS],
+      lidResolution: {
+        enabled: true,
+        messageMapCollection: "whatsappMessageMap",
+        unresolvedLogCollection: "waUnresolvedLids",
+        fallbackCooldownCollection: "waFallbackCooldowns",
+        fallbackCooldownHours: 24,
+      },
       endpoints: [
         "POST /api/whatsapp/webhook",
         "POST /api/promo/stock-drop",
@@ -5011,6 +5159,7 @@ const server = app.listen(PORT, () => {
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
+  console.log(`🔗 LID resolution: ✅ (reply-chain → whatsappMessageMap)`);
   console.log(`📨 Webhook: POST /api/whatsapp/webhook`);
 });
 
