@@ -2220,7 +2220,7 @@ function optOutConfirmedWhatsApp() {
     ``,
     `You'll still get receipts and order updates for future purchases.`,
     ``,
-    `If you change your mind, just reply *STOCK* anytime.`,
+    `If you change your mind later, reply *STOCK* to this message or any of our receipts.`,
     ``,
     `*MarketMix Kenya*`,
   ].join("\n");
@@ -3063,7 +3063,7 @@ async function loadBuyerSubscriptions(phone) {
  *  - Otherwise, activate across all their existing subs.
  *  - Send either a fresh "You're on the list!" or a quiet "already subscribed" ack.
  */
-async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerId = null }) {
+async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerId = null, onConfirmationSent = null }) {
   const allSubs = await loadBuyerSubscriptions(phone);
   if (!allSubs.length) {
     console.log(`🚫 ${phone} replied "${keyword}" but has no purchases on file`);
@@ -3135,6 +3135,15 @@ async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerI
   enqueueWhatsApp(phone, msg, {
     kind: alreadySubscribed ? "subscription-already-active" : "subscription-confirmed",
     keyword,
+    onSent: typeof onConfirmationSent === "function"
+      ? async (confirmationMessageId) => {
+          try {
+            await onConfirmationSent(confirmationMessageId);
+          } catch (e) {
+            console.error("onConfirmationSent callback failed:", e.message);
+          }
+        }
+      : null,
   });
 
   if (alreadySubscribed) {
@@ -3178,6 +3187,28 @@ async function optOutAllSubscriptionsForPhone(phone) {
 // LID resolution (WAHA NOWEB sends @lid, not phone)
 // ============================
 const LID_FALLBACK_COOLDOWN_HOURS = 24;
+
+async function storeConfirmationMessageMap({ messageId, phone, sellerId, kind, orderId = null }) {
+  if (!messageId || !phone) return false;
+  try {
+    const ref = db.collection("whatsappMessageMap").doc(messageId);
+    const snap = await ref.get();
+    if (snap.exists) return false;
+    await ref.set({
+      messageId,
+      phone,
+      orderId: orderId || null,
+      sellerId: sellerId || null,
+      kind: kind || "confirmation",
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`🔗 Mapped ${kind} ${messageId} → ${phone}${sellerId ? ` (seller ${sellerId})` : ""}`);
+    return true;
+  } catch (e) {
+    console.error("storeConfirmationMessageMap failed:", e.message);
+    return false;
+  }
+}
 
 /**
  * Given a LID reply, look up the phone number via the message ID it was
@@ -3366,7 +3397,17 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     // STOP first (more urgent)
     if (UNSUBSCRIBE_KEYWORDS.has(text)) {
       const r = await optOutAllSubscriptionsForPhone(phone);
-      enqueueWhatsApp(phone, optOutConfirmedWhatsApp(), { kind: "optout-confirmed" });
+      enqueueWhatsApp(phone, optOutConfirmedWhatsApp(), {
+        kind: "optout-confirmed",
+        onSent: async (confirmationMessageId) => {
+          await storeConfirmationMessageMap({
+            messageId: confirmationMessageId,
+            phone,
+            sellerId: receiptSellerId || null,
+            kind: "optout-confirmed",
+          });
+        },
+      });
       await db.collection("waInboundLogs").add({
         phone, keyword: text, action: "optout", affected: r.optedOut,
         rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -3380,6 +3421,14 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         phone,
         keyword: text,
         receiptSellerId,
+        onConfirmationSent: async (confirmationMessageId) => {
+          await storeConfirmationMessageMap({
+            messageId: confirmationMessageId,
+            phone,
+            sellerId: receiptSellerId || null,
+            kind: "subscription-confirmed",
+          });
+        },
       });
       await db.collection("waInboundLogs").add({
         phone, keyword: text,
