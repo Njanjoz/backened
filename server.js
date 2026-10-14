@@ -1,5 +1,5 @@
 // server.js — MarketMix backend
-// v2.8.1 — Receipt variants + STOP fallback + STOP→STOCK fix
+// v2.8.2 — Seller-scoped STOCK + already-subscribed ack + reply-chain sellerId
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -2196,6 +2196,24 @@ function subscriptionConfirmedWhatsApp({ shopNamesByCategory }) {
   ].join("\n");
 }
 
+function alreadySubscribedWhatsApp({ shopNamesByCategory }) {
+  const blocks = [];
+  for (const entry of shopNamesByCategory) {
+    const catLines = entry.categories.map(c => `${c.emoji} ${c.name}`).join(", ");
+    blocks.push(`• ${entry.shop} — ${catLines}`);
+  }
+  return [
+    `You're already on the list ✅`,
+    ``,
+    `You'll hear about new stock from:`,
+    ...blocks,
+    ``,
+    `Reply *STOP* anytime to stop.`,
+    ``,
+    `*MarketMix Kenya* ❤️`,
+  ].join("\n");
+}
+
 function optOutConfirmedWhatsApp() {
   return [
     `Got it — you won't receive any more stock notifications from us.`,
@@ -3041,18 +3059,32 @@ async function loadBuyerSubscriptions(phone) {
 
 /**
  * When the buyer replies STOCK (or any subscribe keyword):
- *  - Flip subscribed=true on ALL their existing subs
- *  - Send one confirmation grouped by seller
+ *  - If we know which seller's receipt they replied to, scope to that seller.
+ *  - Otherwise, activate across all their existing subs.
+ *  - Send either a fresh "You're on the list!" or a quiet "already subscribed" ack.
  */
-async function activateAllSubscriptionsForPhone({ phone, keyword }) {
-  const subs = await loadBuyerSubscriptions(phone);
-  if (!subs.length) {
+async function activateAllSubscriptionsForPhone({ phone, keyword, receiptSellerId = null }) {
+  const allSubs = await loadBuyerSubscriptions(phone);
+  if (!allSubs.length) {
     console.log(`🚫 ${phone} replied "${keyword}" but has no purchases on file`);
-    return { activated: 0 };
+    return { activated: 0, alreadySubscribed: false };
+  }
+
+  // Scope: if we know the seller from the reply, restrict activation to them.
+  const subs = receiptSellerId
+    ? allSubs.filter(s => s.sellerId === receiptSellerId)
+    : allSubs;
+
+  if (!subs.length) {
+    console.log(`🚫 ${phone} replied "${keyword}" but has no purchases with seller ${receiptSellerId}`);
+    return { activated: 0, alreadySubscribed: false };
   }
 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const toActivate = subs.filter(s => !s.subscribed || s.optedOut);
+
+  // "Already subscribed" = nothing to activate AND at least one active sub.
+  const alreadySubscribed = toActivate.length === 0 && subs.some(s => s.subscribed && !s.optedOut);
 
   // Batch activate all
   const BATCH_LIMIT = 450;
@@ -3071,26 +3103,21 @@ async function activateAllSubscriptionsForPhone({ phone, keyword }) {
     await batch.commit();
   }
 
-  // Build confirmation message grouped by seller
-  const sellerIds = [...new Set(toActivate.map(s => s.sellerId))];
+  // Message scope: seller-scoped when receiptSellerId is known, otherwise full list.
+  const msgSellerIds = [...new Set((receiptSellerId ? subs : allSubs).map(s => s.sellerId))];
   const sellerNames = {};
-  for (const sid of sellerIds) {
+  for (const sid of msgSellerIds) {
     try {
       const sSnap = await db.collection("users").doc(sid).get();
-      if (sSnap.exists) {
-        const d = sSnap.data() || {};
-        sellerNames[sid] = d.shopName || d.fullName || "MarketMix seller";
-      } else {
-        sellerNames[sid] = "MarketMix seller";
-      }
-    } catch {
-      sellerNames[sid] = "MarketMix seller";
-    }
+      sellerNames[sid] = sSnap.exists
+        ? (sSnap.data().shopName || sSnap.data().fullName || "MarketMix seller")
+        : "MarketMix seller";
+    } catch { sellerNames[sid] = "MarketMix seller"; }
   }
 
-  // Group by seller, then list categories
   const grouped = {};
-  for (const s of toActivate) {
+  const subsForMessage = receiptSellerId ? subs : allSubs;
+  for (const s of subsForMessage) {
     const sid = s.sellerId;
     if (!grouped[sid]) grouped[sid] = { shop: sellerNames[sid], categories: [] };
     grouped[sid].categories.push({
@@ -3101,11 +3128,21 @@ async function activateAllSubscriptionsForPhone({ phone, keyword }) {
   }
 
   const payload = Object.values(grouped);
-  const msg = subscriptionConfirmedWhatsApp({ shopNamesByCategory: payload });
-  enqueueWhatsApp(phone, msg, { kind: "subscription-confirmed", keyword });
+  const msg = alreadySubscribed
+    ? alreadySubscribedWhatsApp({ shopNamesByCategory: payload })
+    : subscriptionConfirmedWhatsApp({ shopNamesByCategory: payload });
 
-  console.log(`✅ Activated ${toActivate.length} subscription(s) for ${phone} via "${keyword}"`);
-  return { activated: toActivate.length, grouped: payload };
+  enqueueWhatsApp(phone, msg, {
+    kind: alreadySubscribed ? "subscription-already-active" : "subscription-confirmed",
+    keyword,
+  });
+
+  if (alreadySubscribed) {
+    console.log(`✅ ${phone} already subscribed (${keyword}) — quiet ack sent`);
+  } else {
+    console.log(`✅ Activated ${toActivate.length} subscription(s) for ${phone} via "${keyword}"`);
+  }
+  return { activated: toActivate.length, alreadySubscribed, grouped: payload };
 }
 
 async function optOutAllSubscriptionsForPhone(phone) {
@@ -3144,7 +3181,7 @@ const LID_FALLBACK_COOLDOWN_HOURS = 24;
 
 /**
  * Given a LID reply, look up the phone number via the message ID it was
- * replying to. Returns { phone, orderId } or null.
+ * replying to. Returns { phone, orderId, sellerId, kind } or null.
  */
 async function resolveLidViaReply({ replyToId }) {
   if (!replyToId) return null;
@@ -3153,7 +3190,12 @@ async function resolveLidViaReply({ replyToId }) {
     if (!snap.exists) return null;
     const d = snap.data() || {};
     if (!d.phone) return null;
-    return { phone: d.phone, orderId: d.orderId || null, kind: d.kind || null };
+    return {
+      phone: d.phone,
+      orderId: d.orderId || null,
+      sellerId: d.sellerId || null,
+      kind: d.kind || null,
+    };
   } catch (e) {
     console.error("resolveLidViaReply failed:", e.message);
     return null;
@@ -3246,7 +3288,9 @@ async function maybeSendStopFallback({ phoneRaw, text, reason }) {
     console.error("maybeSendStopFallback failed:", e.message);
     return false;
   }
-}// ============================
+}
+
+// ============================
 // WhatsApp Inbound Webhook
 // Handles STOCK, category keywords, and STOP.
 // ============================
@@ -3270,6 +3314,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     // WAHA NOWEB sends "from" as "XXXXXXXX@lid" instead of a phone.
     // Try to resolve to the real phone via the reply chain.
     let phone = null;
+    let receiptSellerId = null;
     let resolutionReason = "direct";
 
     if (String(rawFrom).endsWith("@lid")) {
@@ -3279,6 +3324,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         const resolved = await resolveLidViaReply({ replyToId });
         if (resolved?.phone) {
           phone = resolved.phone;
+          receiptSellerId = resolved.sellerId || null;
           resolutionReason = "reply-to-map";
         } else {
           resolutionReason = "reply-to-unknown";
@@ -3330,10 +3376,16 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
     // Subscribe keyword
     if (SUBSCRIBE_KEYWORDS.has(text)) {
-      const r = await activateAllSubscriptionsForPhone({ phone, keyword: text });
+      const r = await activateAllSubscriptionsForPhone({
+        phone,
+        keyword: text,
+        receiptSellerId,
+      });
       await db.collection("waInboundLogs").add({
-        phone, keyword: text, action: "subscribe",
+        phone, keyword: text,
+        action: r.alreadySubscribed ? "already-subscribed" : "subscribe",
         affected: r.activated || 0,
+        sellerScoped: !!receiptSellerId,
         rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
       return;
@@ -5130,7 +5182,7 @@ app.post("/api/test-subscription-confirm-whatsapp", async (req, res) => {
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.8.1",
+    version: "v2.8.2",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
@@ -5149,6 +5201,8 @@ app.get("/_health", (req, res) => {
       categoryIdMode: "slug-from-category-string",
       subscribeKeywords: [...SUBSCRIBE_KEYWORDS],
       unsubscribeKeywords: [...UNSUBSCRIBE_KEYWORDS],
+      sellerScopedActivation: true,
+      alreadySubscribedAck: true,
       lidResolution: {
         enabled: true,
         messageMapCollection: "whatsappMessageMap",
@@ -5156,6 +5210,7 @@ app.get("/_health", (req, res) => {
         stockFallbackCollection: "waFallbackCooldowns",
         stopFallbackCollection: "waStopFallbackCooldowns",
         fallbackCooldownHours: 24,
+        replyChainReturnsSellerId: true,
       },
       endpoints: [
         "POST /api/whatsapp/webhook",
@@ -5241,11 +5296,12 @@ occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 // Server start
 // ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.8.1`);
+  console.log(`🚀 Server on port ${PORT} — v2.8.2`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
   console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
-  console.log(`🔗 LID resolution: ✅ (reply-chain → whatsappMessageMap)`);
+  console.log(`🔗 LID resolution: ✅ (reply-chain → whatsappMessageMap, returns sellerId)`);
+  console.log(`🎯 Seller-scoped STOCK activation: ✅`);
   console.log(`📨 Webhook: POST /api/whatsapp/webhook`);
 });
 
