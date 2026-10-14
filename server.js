@@ -1,13 +1,11 @@
-// server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.7.0 — Buyer Profiles + Offline Sale WhatsApp + Category Drops
+// server.js — MarketMix backend
+// v2.8.0 — Buyer subscription engine (seller + category scoped)
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
 // WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
-// Uses only existing env vars.
-// Emails can optionally mirror to WhatsApp by passing a phone number.
 // Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
-// Real Estate auth + Real Estate Firestore (users, properties, transport, etc).
+// Real Estate auth + Real Estate Firestore.
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -16,7 +14,7 @@ const IntaSend = require("intasend-node");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const http = require("http");
-const Buffer = require('buffer').Buffer;
+const Buffer = require("buffer").Buffer;
 const fetch = require("node-fetch");
 
 dotenv.config();
@@ -153,6 +151,62 @@ const APK_DOWNLOAD_URL = process.env.APK_DOWNLOAD_URL || `${WEBSITE_URL}/apk/Mar
 
 const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
+
+// ============================
+// Category slug (Option Y)
+// Derives a stable categoryId from a display string.
+// "Mobile Phones" -> "mobile-phones"; "Fashion" -> "fashion"
+// ============================
+function slugifyCategory(raw) {
+  if (!raw) return null;
+  return String(raw)
+    .trim()
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+const CATEGORY_EMOJI = {
+  sneakers: "👟", shoes: "👟", footwear: "👟",
+  clothing: "👕", clothes: "👕", fashion: "👕", apparel: "👕",
+  electronics: "📱", "mobile-phones": "📱", phones: "📱", gadgets: "📱",
+  beauty: "💄", cosmetics: "💄", skincare: "💄",
+  accessories: "👜", bags: "👜", handbags: "👜",
+  home: "🏠", "home-garden": "🏠", kitchen: "🏠",
+  food: "🍽️", beverages: "🍽️", drinks: "🍽️",
+  books: "📚", stationery: "📚",
+  toys: "🧸", kids: "🧸", baby: "🧸",
+  sports: "⚽", fitness: "⚽",
+  jewelry: "💍", watches: "⌚",
+};
+function categoryEmoji(categoryId) {
+  if (!categoryId) return "🛍️";
+  return CATEGORY_EMOJI[categoryId] || "🛍️";
+}
+
+// ============================
+// Subscription keyword map
+// ============================
+const SUBSCRIBE_KEYWORDS = new Set([
+  "STOCK", "YES", "SUBSCRIBE",
+  "SNEAKERS", "SHOES", "SHOE", "FOOTWEAR",
+  "CLOTHES", "CLOTHING", "FASHION", "APPAREL",
+  "ELECTRONICS", "ELECTRONIC", "PHONES", "PHONE", "GADGETS",
+  "BEAUTY", "COSMETICS", "SKINCARE",
+  "ACCESSORIES", "ACCESSORY", "BAGS", "BAG",
+  "HOME", "KITCHEN", "GARDEN",
+  "FOOD", "BEVERAGES", "DRINKS",
+  "BOOKS", "STATIONERY",
+  "TOYS", "KIDS", "BABY",
+  "SPORTS", "FITNESS",
+  "JEWELRY", "WATCHES",
+]);
+const UNSUBSCRIBE_KEYWORDS = new Set([
+  "STOP", "STOP ALL", "UNSUBSCRIBE", "OPT OUT", "OPTOUT", "CANCEL",
+]);
 
 // ============================
 // Brevo
@@ -1052,18 +1106,6 @@ function autoPromoFillTemplate(templateId, ctx) {
   return fn(vars);
 }
 
-function autoPromoFmtProduct(p) {
-  const name = p.name || "Special pick";
-  const price = Number(p.price || 0);
-  const desc = String(p.description || "").replace(/\s+/g, " ").trim().slice(0, 140);
-  const lines = [`🛍️ *${name.toUpperCase()}*`];
-  if (price > 0) lines.push(`💰 KES ${price.toLocaleString("en-KE")}`);
-  if (p.brand) lines.push(`🏷️ ${p.brand}`);
-  if (p.category) lines.push(`📦 ${p.category}`);
-  if (desc) { lines.push(""); lines.push(desc + (String(p.description || "").length > 140 ? "…" : "")); }
-  return { text: lines.join("\n") };
-}
-
 function autoPromoPickRandom(arr, n = 1) {
   const copy = [...arr];
   const out = [];
@@ -1610,12 +1652,7 @@ function fillOccasionTemplate(text, vars = {}) {
 }
 
 function resolveOccasionsForDate({
-  month,
-  day,
-  weekday = null,
-  movableDates = {},
-  includeRecurring = false,
-  year = null,
+  month, day, weekday = null, movableDates = {}, includeRecurring = false, year = null,
 } = {}) {
   const fixed = [];
   const recurring = [];
@@ -1627,20 +1664,14 @@ function resolveOccasionsForDate({
       }
       continue;
     }
-
     if (occ.movable) {
       const resolved = movableDates[occ.key];
       if (!resolved) continue;
       if (year && resolved.year && resolved.year !== year) continue;
-      if (resolved.month === month && resolved.day === day) {
-        fixed.push(occ);
-      }
+      if (resolved.month === month && resolved.day === day) fixed.push(occ);
       continue;
     }
-
-    if (occ.month === month && occ.day === day) {
-      fixed.push(occ);
-    }
+    if (occ.month === month && occ.day === day) fixed.push(occ);
   }
 
   return { dated: fixed, recurring };
@@ -1866,8 +1897,9 @@ function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
 }
 
 // ============================
-// WhatsApp message templates (store/buyer/seller)
+// WhatsApp message templates
 // ============================
+
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -1884,11 +1916,6 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
     ``,
     `🛍️ *Explore more products:*`,
     PRODUCTS_URL,
-    ``,
-    `👥 *Join our WhatsApp group for deals & new drops:*`,
-    WHATSAPP_GROUP_URL,
-    ``,
-    `Happy shopping!`,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
@@ -1909,20 +1936,12 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
     `💳 *Payment:* ${pay}`,
     `🚚 *Order status:* ${status}`,
     ``,
-    `We're getting things ready for you!`,
-    ``,
     `📦 *Track your order:*`,
     receiptUrl,
     ``,
-    `💬 Need help? Just reply to this message.`,
-    ``,
     `Thanks for shopping with us, ${name}. We appreciate you! ❤️`,
     ``,
-    `👥 *Join our WhatsApp group for deals & new drops:*`,
-    WHATSAPP_GROUP_URL,
-    ``,
     `*MarketMix Kenya*`,
-    `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
@@ -1953,13 +1972,7 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
     `📦 *Track your order:*`,
     receiptUrl,
     ``,
-    `💬 Questions? Just reply to this message.`,
-    ``,
-    `👥 *Join our WhatsApp group for deals & new drops:*`,
-    WHATSAPP_GROUP_URL,
-    ``,
     `*MarketMix Kenya*`,
-    `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
@@ -1972,7 +1985,7 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
   return [
     `Hey ${name}! 👋`,
     ``,
-    `Good news — your payment has landed safely. 🎉`,
+    `Payment confirmed — your purchase is locked in. 🎉`,
     ``,
     `🛍️ *Item:* ${summary}`,
     `💰 *Amount paid:* KES ${amt}`,
@@ -1980,15 +1993,6 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
     `🏪 *Seller:* ${shop}`,
     ``,
     `Thanks for shopping with MarketMix Kenya! ❤️`,
-    `The seller has been notified and your purchase is confirmed.`,
-    ``,
-    `🛍️ *Explore more products:*`,
-    PRODUCTS_URL,
-    ``,
-    `💬 Questions? Just reply to this message.`,
-    ``,
-    `👥 *Join our WhatsApp group for deals & new drops:*`,
-    WHATSAPP_GROUP_URL,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
@@ -2086,44 +2090,99 @@ function welcomeSubscriberWhatsApp({ name }) {
     `🛍️ *Explore what's live now:*`,
     WEBSITE_URL,
     ``,
-    `Thanks for joining us! ❤️`,
-    ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
-/**
- * Offline sale buyer receipt — sent when a seller records a walk-in sale with a phone.
- */
-function offlineSaleBuyerWhatsApp({ customerName, itemSummary, amount, invoiceId, sellerShop, categories }) {
-  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "there";
+// ============================
+// Offline receipt — the locked-in copy
+// ============================
+function offlineSaleBuyerWhatsApp({
+  customerName, shopName, invoiceId, items, amount,
+  paymentMethod, paymentStatus, dateStr, emoji, hasSubscriptions,
+}) {
+  const name = (customerName && String(customerName).trim()) || "there";
+  const shop = (shopName && String(shopName).trim()) || "MarketMix seller";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
-  const cats = Array.isArray(categories) ? categories.filter(Boolean) : [];
-  const catLine = cats.length ? `🏷️ ${cats.join(" · ")}` : null;
-  const topCat = cats[0] || "items";
+  const safeEmoji = emoji || "🛍️";
+
+  const itemsLines = (Array.isArray(items) ? items : [])
+    .map(i => `• ${i.name} × ${i.quantity}`)
+    .join("\n") || "• (no items)";
+
+  const paymentLine = paymentStatus === "paid"
+    ? `💳 Payment: ${paymentMethod || "Cash"} — Paid in full ✅`
+    : `💳 Payment: ${paymentMethod || "—"} — ${paymentStatus || "pending"}`;
+
+  const lines = [
+    `Hey ${name}! 👋🏽 Thanks for shopping at ${shop} ❤️`,
+    ``,
+    `🧾 *YOUR RECEIPT*`,
+    ``,
+    `Receipt No: ${invoiceId || "—"}`,
+    `🏪 Shop: ${shop}`,
+    `📅 Date: ${dateStr || "—"}`,
+    paymentLine,
+    ``,
+    `🛍️ *Items purchased*`,
+    itemsLines,
+    ``,
+    `💰 *Total paid: KES ${amt}*`,
+  ];
+
+  if (hasSubscriptions) {
+    lines.push(
+      ``,
+      `${safeEmoji} *Want to know when new stock drops?*`,
+      ``,
+      `Reply *STOCK* and we'll notify you when fresh stock arrives at ${shop}. 👀🔥`
+    );
+  } else {
+    lines.push(
+      ``,
+      `Thank you for supporting a local business! ❤️`,
+      `Keep this message as your proof of purchase.`
+    );
+  }
+
+  lines.push(
+    ``,
+    `*MarketMix Kenya*`,
+    `Shop local, grow local. 🇰🇪`
+  );
+
+  return lines.join("\n");
+}
+
+function subscriptionConfirmedWhatsApp({ shopNamesByCategory }) {
+  // shopNamesByCategory: [{ shop, categories: [{ name, emoji, count }] }]
+  const blocks = [];
+  for (const entry of shopNamesByCategory) {
+    const catLines = entry.categories.map(c => `${c.emoji} ${c.name}`).join(", ");
+    blocks.push(`• ${entry.shop} — ${catLines}`);
+  }
   return [
-    `Hey ${name}! 👋`,
+    `You're on the list! 🎉`,
     ``,
-    `Thanks for shopping with us — here's your receipt. 🧾`,
+    `We'll ping you when new stock drops:`,
+    ...blocks,
     ``,
-    `🧾 *Receipt:* ${invoiceId || "—"}`,
-    `🏪 *Shop:* ${sellerShop || "MarketMix seller"}`,
-    `🛍️ *Items:* ${itemSummary || "—"}`,
-    catLine,
-    `💰 *Total:* KES ${amt}`,
+    `Reply *STOP* anytime to stop.`,
     ``,
-    `We've noted your interest in *${topCat}* — we'll let you know when new ones drop.`,
+    `*MarketMix Kenya* ❤️`,
+  ].join("\n");
+}
+
+function optOutConfirmedWhatsApp() {
+  return [
+    `Got it — you won't receive any more stock notifications from us.`,
     ``,
-    `🛍️ *Browse more:*`,
-    PRODUCTS_URL,
+    `You'll still get receipts and order updates for future purchases.`,
     ``,
-    `👥 *Join our WhatsApp group for deals & new drops:*`,
-    WHATSAPP_GROUP_URL,
+    `If you change your mind, just reply *STOCK* anytime.`,
     ``,
-    `Reply *STOP* to opt out of future promos.`,
-    ``,
-    `*MarketMix Kenya — Shop smart. Shop easy.*`,
-  ].filter(Boolean).join("\n");
+    `*MarketMix Kenya*`,
+  ].join("\n");
 }
 
 // ============================
@@ -2144,66 +2203,6 @@ async function logInventoryMovement({
   } catch (err) {
     console.error("❌ logInventoryMovement failed:", err.message, { productId, delta, reason });
     return null;
-  }
-}
-
-// ============================
-// Buyer Profiles (customers)
-// ============================
-async function updateBuyerProfile({
-  phone, name, items, categories, amount, sellerId, channel = "offline",
-}) {
-  if (!phone) return false;
-  try {
-    const ref = db.collection("buyerProfiles").doc(phone);
-    const snap = await ref.get();
-
-    const base = snap.exists ? snap.data() : {
-      phone,
-      firstOrderAt: admin.firestore.FieldValue.serverTimestamp(),
-      totalOrders: 0,
-      totalSpent: 0,
-      categories: {},
-      categoryKeys: [],
-      tags: [],
-      note: "",
-      optedOut: false,
-      sellers: [],
-      channels: [],
-    };
-
-    const cats = { ...(base.categories || {}) };
-    for (const c of (categories || [])) {
-      if (!c) continue;
-      const key = String(c).trim();
-      if (!key) continue;
-      cats[key] = (cats[key] || 0) + 1;
-    }
-    const categoryKeys = Object.keys(cats);
-    const topCategory = categoryKeys.sort((a, b) => cats[b] - cats[a])[0] || null;
-
-    const sellers = Array.from(new Set([...(base.sellers || []), sellerId].filter(Boolean)));
-    const channels = Array.from(new Set([...(base.channels || []), channel].filter(Boolean)));
-
-    await ref.set({
-      ...base,
-      phone,
-      name: name || base.name || null,
-      totalOrders: (base.totalOrders || 0) + 1,
-      totalSpent: (base.totalSpent || 0) + (Number(amount) || 0),
-      categories: cats,
-      categoryKeys,
-      topCategory,
-      sellers,
-      channels,
-      lastOrderAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return true;
-  } catch (e) {
-    console.error("updateBuyerProfile failed:", e.message);
-    return false;
   }
 }
 
@@ -2918,6 +2917,465 @@ async function runSellerNudgeScan() {
 })();
 
 // ============================
+// ═══════════════════════════════════════════════════
+// BUYER SUBSCRIPTIONS  (phone → sellerId → categoryId)
+// ═══════════════════════════════════════════════════
+// ============================
+
+function buyerSubscriptionId(phone, sellerId, categoryId) {
+  return `${phone}_${sellerId}_${categoryId}`;
+}
+
+/**
+ * Upsert one subscription per (phone, sellerId, categoryId).
+ * Repeat purchases bump `purchaseCount` atomically, never reset subscribed/optedOut.
+ */
+async function upsertBuyerSubscription({
+  phone, sellerId, categoryId, categoryName, orderId, purchasedAt,
+}) {
+  if (!phone || !sellerId || !categoryId) return false;
+  try {
+    const id = buyerSubscriptionId(phone, sellerId, categoryId);
+    const ref = db.collection("buyerSubscriptions").doc(id);
+    const snap = await ref.get();
+
+    if (snap.exists) {
+      // Repeat purchase — atomic increment, preserve subscription state.
+      await ref.set({
+        purchaseCount: admin.firestore.FieldValue.increment(1),
+        lastPurchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastOrderId: orderId || null,
+        categoryName: categoryName || snap.data().categoryName || null, // refresh display name
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } else {
+      await ref.set({
+        phone,
+        sellerId,
+        categoryId,
+        categoryName: categoryName || null,
+        subscribed: false,
+        subscribedAt: null,
+        subscribedVia: null,
+        purchaseCount: 1,
+        firstPurchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastPurchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastOrderId: orderId || null,
+        optedOut: false,
+        optedOutAt: null,
+        lastNotifiedAt: null,
+        notifyCount: 0,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+    return true;
+  } catch (e) {
+    console.error("upsertBuyerSubscription failed:", e.message);
+    return false;
+  }
+}
+
+async function recordBuyerProfileTouch({ phone, name, amount }) {
+  if (!phone) return;
+  try {
+    const ref = db.collection("buyerProfiles").doc(phone);
+    const snap = await ref.get();
+    if (snap.exists) {
+      await ref.set({
+        name: name || snap.data().name || null,
+        totalOrders: admin.firestore.FieldValue.increment(1),
+        totalSpent: admin.firestore.FieldValue.increment(Number(amount) || 0),
+        lastOrderAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } else {
+      await ref.set({
+        phone,
+        name: name || null,
+        totalOrders: 1,
+        totalSpent: Number(amount) || 0,
+        firstOrderAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastOrderAt: admin.firestore.FieldValue.serverTimestamp(),
+        receiptSentAt: null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } catch (e) {
+    console.error("recordBuyerProfileTouch failed:", e.message);
+  }
+}
+
+/**
+ * Given a phone, return all subscriptions as objects.
+ */
+async function loadBuyerSubscriptions(phone) {
+  const snap = await db.collection("buyerSubscriptions")
+    .where("phone", "==", phone)
+    .get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+/**
+ * When the buyer replies STOCK (or any subscribe keyword):
+ *  - Flip subscribed=true on ALL their existing subs
+ *  - Send one confirmation grouped by seller
+ */
+async function activateAllSubscriptionsForPhone({ phone, keyword }) {
+  const subs = await loadBuyerSubscriptions(phone);
+  if (!subs.length) {
+    console.log(`🚫 ${phone} replied "${keyword}" but has no purchases on file`);
+    return { activated: 0 };
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const toActivate = subs.filter(s => !s.subscribed && !s.optedOut);
+
+  // Batch activate all
+  const BATCH_LIMIT = 450;
+  for (let i = 0; i < toActivate.length; i += BATCH_LIMIT) {
+    const batch = db.batch();
+    for (const s of toActivate.slice(i, i + BATCH_LIMIT)) {
+      batch.set(db.collection("buyerSubscriptions").doc(s.id), {
+        subscribed: true,
+        subscribedAt: now,
+        subscribedVia: keyword || "STOCK",
+        optedOut: false,
+        optedOutAt: null,
+        updatedAt: now,
+      }, { merge: true });
+    }
+    await batch.commit();
+  }
+
+  // Build confirmation message grouped by seller
+  const sellerIds = [...new Set(toActivate.map(s => s.sellerId))];
+  const sellerNames = {};
+  for (const sid of sellerIds) {
+    try {
+      const sSnap = await db.collection("users").doc(sid).get();
+      if (sSnap.exists) {
+        const d = sSnap.data() || {};
+        sellerNames[sid] = d.shopName || d.fullName || "MarketMix seller";
+      } else {
+        sellerNames[sid] = "MarketMix seller";
+      }
+    } catch {
+      sellerNames[sid] = "MarketMix seller";
+    }
+  }
+
+  // Group by seller, then list categories
+  const grouped = {};
+  for (const s of toActivate) {
+    const sid = s.sellerId;
+    if (!grouped[sid]) grouped[sid] = { shop: sellerNames[sid], categories: [] };
+    grouped[sid].categories.push({
+      name: s.categoryName || s.categoryId,
+      emoji: categoryEmoji(s.categoryId),
+      count: s.purchaseCount || 1,
+    });
+  }
+
+  const payload = Object.values(grouped);
+  const msg = subscriptionConfirmedWhatsApp({ shopNamesByCategory: payload });
+  enqueueWhatsApp(phone, msg, { kind: "subscription-confirmed", keyword });
+
+  console.log(`✅ Activated ${toActivate.length} subscription(s) for ${phone} via "${keyword}"`);
+  return { activated: toActivate.length, grouped: payload };
+}
+
+async function optOutAllSubscriptionsForPhone(phone) {
+  const subs = await loadBuyerSubscriptions(phone);
+  if (!subs.length) return { optedOut: 0 };
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const active = subs.filter(s => !s.optedOut);
+
+  const BATCH_LIMIT = 450;
+  for (let i = 0; i < active.length; i += BATCH_LIMIT) {
+    const batch = db.batch();
+    for (const s of active.slice(i, i + BATCH_LIMIT)) {
+      batch.set(db.collection("buyerSubscriptions").doc(s.id), {
+        optedOut: true,
+        optedOutAt: now,
+        updatedAt: now,
+      }, { merge: true });
+    }
+    await batch.commit();
+  }
+
+  await db.collection("optOutLogs").add({
+    phone,
+    count: active.length,
+    loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }).catch(() => {});
+
+  console.log(`🚫 Opted out ${active.length} subscription(s) for ${phone}`);
+  return { optedOut: active.length };
+}
+
+// ============================
+// WhatsApp Inbound Webhook
+// Handles STOCK, category keywords, and STOP.
+// ============================
+app.post("/api/whatsapp/webhook", async (req, res) => {
+  // Always ACK immediately so WAHA doesn't retry
+  res.json({ success: true });
+
+  try {
+    const body = req.body || {};
+    const inner = body.payload || body;
+    const rawFrom = inner.from || inner.chatId || inner.author || null;
+    const text = String(inner.body || inner.text || "").trim().toUpperCase();
+    const fromMe = inner.fromMe === true;
+
+    if (fromMe) return; // ignore our own outbound echoes
+    if (!rawFrom || !text) return;
+    if (String(rawFrom).endsWith("@g.us")) return; // ignore group chats
+
+    const phone = normalizePhoneForWa(String(rawFrom).replace(/@.*$/, ""));
+    if (!phone) return;
+
+    console.log(`📨 Inbound WA: ${phone} → "${text.slice(0, 40)}"`);
+
+    // STOP first (more urgent)
+    if (UNSUBSCRIBE_KEYWORDS.has(text)) {
+      const r = await optOutAllSubscriptionsForPhone(phone);
+      enqueueWhatsApp(phone, optOutConfirmedWhatsApp(), { kind: "optout-confirmed" });
+      await db.collection("waInboundLogs").add({
+        phone, keyword: text, action: "optout", affected: r.optedOut,
+        rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+      return;
+    }
+
+    // Subscribe keyword
+    if (SUBSCRIBE_KEYWORDS.has(text)) {
+      const r = await activateAllSubscriptionsForPhone({ phone, keyword: text });
+      await db.collection("waInboundLogs").add({
+        phone, keyword: text, action: "subscribe",
+        affected: r.activated || 0,
+        rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+      return;
+    }
+
+    // Unknown — log silently, no reply (avoid spam)
+    await db.collection("waInboundLogs").add({
+      phone, keyword: text, action: "unknown",
+      rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+  } catch (e) {
+    console.error("❌ /api/whatsapp/webhook error:", e.message);
+  }
+});
+
+// ============================
+// Stock Drop Notification
+// Called by seller when they add a new product, or by admin.
+// Body: { productId, sellerId? }
+// ============================
+app.post("/api/promo/stock-drop", async (req, res) => {
+  try {
+    const { productId, sellerId: sellerOverride, maxRecipients = 200 } = req.body || {};
+    if (!productId) return res.status(400).json({ success: false, message: "productId required" });
+
+    const pSnap = await db.collection("products").doc(productId).get();
+    if (!pSnap.exists) return res.status(404).json({ success: false, message: "Product not found" });
+    const product = pSnap.data() || {};
+
+    const sellerId = sellerOverride || product.sellerId;
+    const categoryRaw = product.category;
+    const categoryId = slugifyCategory(categoryRaw);
+    if (!sellerId || !categoryId) {
+      return res.status(400).json({ success: false, message: "Product missing sellerId or category" });
+    }
+
+    // Seller shop name
+    let shopName = "MarketMix seller";
+    try {
+      const s = await db.collection("users").doc(sellerId).get();
+      if (s.exists) {
+        const d = s.data() || {};
+        shopName = d.shopName || d.fullName || shopName;
+      }
+    } catch {}
+
+    // Find all buyers subscribed to (sellerId, categoryId)
+    const subsSnap = await db.collection("buyerSubscriptions")
+      .where("sellerId", "==", sellerId)
+      .where("categoryId", "==", categoryId)
+      .where("subscribed", "==", true)
+      .limit(Math.min(Number(maxRecipients) || 200, 500))
+      .get();
+
+    if (subsSnap.empty) {
+      return res.json({ success: true, matched: 0, sent: 0, categoryId, shopName });
+    }
+
+    const emoji = categoryEmoji(categoryId);
+    const productUrl = `${WEBSITE_URL}/product/${product.slug || productId}`;
+    const priceFmt = Number(product.price || 0).toLocaleString("en-KE");
+
+    let sent = 0;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    for (const d of subsSnap.docs) {
+      const sub = d.data() || {};
+      if (sub.optedOut) continue;
+
+      const buyerName = sub.buyerName || null; // not stored yet, fine
+      const msg = [
+        `${emoji} *New stock just dropped!*`,
+        ``,
+        `Hi${buyerName ? ` ${buyerName}` : ""}! You asked to hear about new stock from ${shopName}:`,
+        ``,
+        `🛍️ *${product.name || "New item"}*`,
+        `💰 KES ${priceFmt}`,
+        product.description ? `\n${String(product.description).replace(/\s+/g, " ").trim().slice(0, 160)}` : null,
+        ``,
+        `👉 ${productUrl}`,
+        ``,
+        `Reply *STOP* to stop hearing from ${shopName}.`,
+        ``,
+        `*MarketMix Kenya*`,
+      ].filter(Boolean).join("\n");
+
+      enqueueWhatsApp(sub.phone, msg, {
+        kind: "stock-drop",
+        sellerId,
+        categoryId,
+        productId,
+      });
+
+      await d.ref.set({
+        lastNotifiedAt: now,
+        notifyCount: admin.firestore.FieldValue.increment(1),
+        updatedAt: now,
+      }, { merge: true }).catch(() => {});
+
+      sent++;
+      // Pace to avoid WAHA throttling
+      await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
+    }
+
+    await db.collection("stockDropLogs").add({
+      productId,
+      productName: product.name || null,
+      sellerId,
+      categoryId,
+      categoryRaw: categoryRaw || null,
+      shopName,
+      matched: subsSnap.size,
+      sent,
+      loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    console.log(`📣 Stock drop → ${sent} buyer(s) notified (${shopName} · ${categoryId})`);
+    return res.json({ success: true, matched: subsSnap.size, sent, categoryId, shopName });
+  } catch (e) {
+    return sendServerError(res, e, "Stock drop failed");
+  }
+});
+
+// ============================
+// Seller-facing customer endpoints
+// ============================
+
+// GET /api/seller/customers?sellerId=xxx
+app.get("/api/seller/customers", async (req, res) => {
+  try {
+    const { sellerId, limit = 200, categoryId = null, subscribedOnly = null } = req.query || {};
+    if (!sellerId) return res.status(400).json({ success: false, message: "sellerId required" });
+
+    let q = db.collection("buyerSubscriptions")
+      .where("sellerId", "==", sellerId)
+      .limit(Math.min(Number(limit) || 200, 500));
+
+    const snap = await q.get();
+    let subs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    if (categoryId) subs = subs.filter(s => s.categoryId === categoryId);
+    if (subscribedOnly === "true") subs = subs.filter(s => s.subscribed && !s.optedOut);
+
+    // Group by phone
+    const byPhone = new Map();
+    for (const s of subs) {
+      if (!byPhone.has(s.phone)) {
+        byPhone.set(s.phone, {
+          phone: s.phone,
+          buyerName: s.buyerName || null,
+          totalOrders: 0,
+          totalSpent: 0,
+          subscriptions: [],
+          lastActivityAt: null,
+        });
+      }
+      const c = byPhone.get(s.phone);
+      c.subscriptions.push({
+        categoryId: s.categoryId,
+        categoryName: s.categoryName || s.categoryId,
+        subscribed: !!s.subscribed,
+        optedOut: !!s.optedOut,
+        purchaseCount: s.purchaseCount || 0,
+        lastPurchasedAt: s.lastPurchasedAt || null,
+      });
+      c.totalOrders += Number(s.purchaseCount || 0);
+      const ts = s.lastPurchasedAt?.toDate?.()?.getTime?.() || 0;
+      if (!c.lastActivityAt || ts > c.lastActivityAt) c.lastActivityAt = ts;
+    }
+
+    const customers = [...byPhone.values()];
+    customers.sort((a, b) => (b.lastActivityAt || 0) - (a.lastActivityAt || 0));
+
+    return res.json({ success: true, count: customers.length, customers });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load customers");
+  }
+});
+
+// POST /api/seller/customers/:phone/note
+app.post("/api/seller/customers/:phone/note", async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const { note, sellerId } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    await db.collection("buyerProfiles").doc(phone).set({
+      note: String(note || "").slice(0, 1000),
+      noteUpdatedBy: sellerId || null,
+      noteUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return res.json({ success: true });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save note");
+  }
+});
+
+// POST /api/seller/customers/:phone/manual-optout  { sellerId }
+// Allows seller to manually opt a customer out from THEIR store's notifications only.
+app.post("/api/seller/customers/:phone/manual-optout", async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const { sellerId } = req.body || {};
+    if (!phone || !sellerId) return res.status(400).json({ success: false, message: "phone and sellerId required" });
+    const snap = await db.collection("buyerSubscriptions")
+      .where("phone", "==", phone)
+      .where("sellerId", "==", sellerId)
+      .get();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const batch = db.batch();
+    snap.docs.forEach(d => batch.set(d.ref, {
+      optedOut: true, optedOutAt: now, updatedAt: now,
+    }, { merge: true }));
+    await batch.commit();
+    return res.json({ success: true, affected: snap.size });
+  } catch (e) {
+    return sendServerError(res, e, "Manual opt-out failed");
+  }
+});
+
+// ============================
 // ROUTES
 // ============================
 
@@ -3184,9 +3642,6 @@ app.post("/api/re/welcome", async (req, res) => {
           : `You can switch your account type anytime from your Profile page.`,
         ``,
         `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
-        ``,
-        `👥 *Join our WhatsApp group:*`,
-        WHATSAPP_GROUP_URL,
       ].filter(Boolean);
 
       whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
@@ -3265,238 +3720,6 @@ app.post("/api/admin/auto-promo", async (req, res) => {
     return res.json({ success: true, settings });
   } catch (e) {
     return sendServerError(res, e, "Could not save auto-promo settings");
-  }
-});
-
-app.post("/api/admin/auto-promo/preview", async (req, res) => {
-  try {
-    const { date = null, groupIds = null } = req.body || {};
-    const autoSettings = await autoPromoLoadSettings();
-    const occSettings  = await occasionLoadSettings();
-
-    let groups = [];
-    try {
-      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
-      const data = await r.json().catch(() => ({}));
-      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-      groups = list
-        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
-        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
-    } catch (e) {
-      return sendServerError(res, e, "Could not fetch groups");
-    }
-
-    const seenIds = new Set();
-    groups = groups.filter(g => {
-      if (seenIds.has(g.id)) return false;
-      seenIds.add(g.id);
-      return true;
-    });
-
-    const previewPersistedIds = Array.isArray(autoSettings.selectedGroupIds)
-      ? autoSettings.selectedGroupIds
-      : [];
-    const previewEffectiveIds =
-      Array.isArray(groupIds) && groupIds.length > 0
-        ? groupIds
-        : previewPersistedIds;
-    if (previewEffectiveIds.length > 0) {
-      const allowed = new Set(previewEffectiveIds);
-      groups = groups.filter(g => allowed.has(g.id));
-      console.log(`🤖 Preview: filtered to ${groups.length} group(s) (source: ${Array.isArray(groupIds) && groupIds.length ? "body" : "settings.selectedGroupIds"})`);
-    }
-
-    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const dateStr = targetDate.toISOString().slice(0, 10);
-    const month = targetDate.getUTCMonth() + 1;
-    const day   = targetDate.getUTCDate();
-    const dow   = targetDate.getUTCDay();
-    const year  = targetDate.getUTCFullYear();
-
-    const overrides = await loadOverridesForDate(dateStr);
-    console.log(`🤖 Preview: ${overrides.size} override(s) loaded for ${dateStr}`);
-
-    const perGroupPerDay = Math.min(
-      AUTO_PROMO_MAX_PER_GROUP_PER_DAY,
-      Math.max(1, Number(autoSettings.perGroupPerDay) || 4)
-    );
-    const { start: hourStart, end: hourEnd } = autoSettings.activeHours || { start: 8, end: 21 };
-
-    const hourPool = [];
-    for (let h = hourStart; h < hourEnd; h++) hourPool.push(h);
-
-    const autoSlotHours = [];
-    if (hourPool.length && perGroupPerDay > 0) {
-      const step = hourPool.length / perGroupPerDay;
-      for (let i = 0; i < perGroupPerDay; i++) {
-        const idx = Math.min(hourPool.length - 1, Math.floor(i * step));
-        if (!autoSlotHours.includes(hourPool[idx])) autoSlotHours.push(hourPool[idx]);
-      }
-      while (autoSlotHours.length < perGroupPerDay) {
-        const next = hourPool.find(h => !autoSlotHours.includes(h));
-        if (next === undefined) break;
-        autoSlotHours.push(next);
-      }
-    }
-    autoSlotHours.sort((a, b) => a - b);
-
-    const pSnap = await db.collection("products").get();
-    const products = pSnap.docs
-      .map(d => ({ id: d.id, ...d.data() }))
-      .filter(p => {
-        const qty = Number(p.quantity) || 0;
-        const variantStock = Array.isArray(p.variants)
-          ? p.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0)
-          : 0;
-        return (qty > 0 || variantStock > 0) && p.isPublished !== false;
-      });
-
-    const nowKey = month * 100 + day;
-    let campaign = null;
-    for (const c of AUTO_PROMO_CAMPAIGNS) {
-      const startKey = c.startMonth * 100 + c.startDay;
-      const endKey   = c.endMonth   * 100 + c.endDay;
-      const evtKey   = c.eventMonth * 100 + c.eventDay;
-      let inRange = false;
-      if (startKey <= endKey) inRange = nowKey >= startKey && nowKey <= endKey;
-      else                    inRange = nowKey >= startKey || nowKey <= endKey;
-      if (inRange) {
-        const evtMonth = Math.floor(evtKey / 100);
-        const nowMonth = Math.floor(nowKey / 100);
-        const daysToEvent = nowKey <= evtKey
-          ? (evtMonth - nowMonth) * 30 + (c.eventDay - day)
-          : -1;
-        campaign = { ...c, daysToEvent };
-        break;
-      }
-    }
-
-    const dayBucket = dow === 1 ? "monday"
-      : (dow === 2 || dow === 3) ? "midweek"
-      : dow === 4 ? "almost_friday"
-      : dow === 5 ? "friday"
-      : dow === 6 ? "saturday" : "sunday";
-    const payday   = day >= 25 || day <= 5;
-    const monthEnd = day >= 28;
-
-    const autoSlots = [];
-
-    for (const group of groups) {
-      const usedProducts = new Set();
-      const usedTemplates = new Set();
-      const kind = autoPromoDetectGroupKind(group.name);
-
-      for (const hour of autoSlotHours) {
-        const timeBucket = autoPromoTimeBucket(hour);
-
-        const rng = autoPromoSeededRng(`${dateStr}|${group.id}|${hour}`);
-
-        const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
-        const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
-        usedTemplates.add(templateId);
-
-        const available = products.filter(p => !usedProducts.has(p.id));
-        const pickFrom = available.length ? available : products;
-        if (!pickFrom.length) {
-          autoSlots.push({
-            time: `${String(hour).padStart(2, "0")}:00`,
-            hourEAT: hour, timeBucket, templateId,
-            slotKind: "promo", skipped: true, reason: "no-products",
-            groupId: group.id,
-            groupName: group.name,
-            productName: null, imageUrl: null,
-            caption: "(no product available)",
-          });
-          continue;
-        }
-        const product = pickFrom[Math.floor(rng() * pickFrom.length)];
-        usedProducts.add(product.id);
-
-        const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
-        const caption = autoPromoFillTemplate(templateId, {
-          product,
-          campaign,
-          groupName: group.name,
-          productUrl,
-        });
-
-        let slot = {
-          time: `${String(hour).padStart(2, "0")}:00`,
-          hourEAT: hour, timeBucket, templateId,
-          slotKind: "promo",
-          groupId: group.id,
-          groupName: group.name,
-          productId: product.id,
-          productName: product.name || "—",
-          imageUrl: productImageUrl(product),
-          caption,
-          skipped: false,
-        };
-
-        slot = applyOverride(slot, overrides);
-        autoSlots.push(slot);
-      }
-    }
-
-    const { dated, recurring } = resolveOccasionsForDate({
-      month, day, weekday: dow, year,
-      movableDates: occSettings.movableDates || {},
-      includeRecurring: !!occSettings.sendRecurring,
-    });
-
-    const occasionSlots = [];
-    for (const group of groups) {
-      for (const occ of [...dated, ...recurring]) {
-        const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
-        if (!message) continue;
-        const isRecurring = !!occ.recurring;
-        const isSensitive = !!occ.sensitive;
-        const baseHour = isRecurring ? 3 : 9;
-        occasionSlots.push({
-          time: `${String(baseHour).padStart(2, "0")}:00`,
-          hourEAT: baseHour,
-          slotKind: isSensitive ? "non-promo" : "occasion",
-          templateId: null,
-          groupId: group.id,
-          groupName: group.name,
-          occasionKey: occ.key,
-          occasionName: occ.name,
-          sensitive: isSensitive,
-          productName: occ.name,
-          imageUrl: null,
-          caption: message,
-          skipped: false,
-        });
-      }
-    }
-
-    const slots = [...autoSlots, ...occasionSlots]
-      .sort((a, b) => {
-        const t = a.time.localeCompare(b.time);
-        if (t !== 0) return t;
-        return (a.groupName || "").localeCompare(b.groupName || "");
-      });
-
-    const expectedPromoSlots = groups.length * autoSlotHours.length;
-
-    return res.json({
-      success: true,
-      date: dateStr,
-      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
-      groupCount: groups.length,
-      perGroupPerDay,
-      autoSlotHours,
-      expectedPromoSlots,
-      promoSlotsReturned: autoSlots.length,
-      occasionSlotsReturned: occasionSlots.length,
-      activeHours: autoSettings.activeHours || { start: 8, end: 21 },
-      overridesLoaded: overrides.size,
-      overridesApplied: autoSlots.filter(s => s.isOverridden).length,
-      slots,
-    });
-  } catch (e) {
-    console.error("❌ /api/admin/auto-promo/preview failed:", e);
-    return sendServerError(res, e, "Preview failed");
   }
 });
 
@@ -3619,61 +3842,6 @@ app.post("/api/admin/occasions", async (req, res) => {
   }
 });
 
-app.post("/api/admin/occasions/preview", async (req, res) => {
-  try {
-    const { date = null, groupIds = null, includeRecurring = true } = req.body || {};
-    const settings = await occasionLoadSettings();
-
-    let groups = [];
-    try {
-      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
-      const data = await r.json().catch(() => ({}));
-      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
-      groups = list
-        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
-        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
-    } catch (e) {
-      return sendServerError(res, e, "Could not fetch groups");
-    }
-    if (Array.isArray(groupIds) && groupIds.length > 0) {
-      const allowed = new Set(groupIds);
-      groups = groups.filter(g => allowed.has(g.id));
-    }
-
-    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const month = targetDate.getUTCMonth() + 1;
-    const day = targetDate.getUTCDate();
-    const weekday = targetDate.getUTCDay();
-    const year = targetDate.getUTCFullYear();
-
-    const { dated, recurring } = resolveOccasionsForDate({
-      month, day, weekday, year,
-      movableDates: settings.movableDates || {},
-      includeRecurring: !!includeRecurring,
-    });
-
-    const buildPreviews = (list) => list.map(occ => {
-      const message = buildOccasionMessage(occ, { shopLink: settings.siteUrl || WEBSITE_URL });
-      return {
-        key: occ.key, name: occ.name, kind: occ.kind,
-        sensitive: !!occ.sensitive, movable: !!occ.movable,
-        preview: message ? message.slice(0, 300) : null,
-      };
-    });
-
-    return res.json({
-      success: true,
-      date: targetDate.toISOString().slice(0, 10),
-      groupCount: groups.length,
-      dated: buildPreviews(dated),
-      recurring: buildPreviews(recurring),
-    });
-  } catch (e) {
-    console.error("❌ /api/admin/occasions/preview failed:", e);
-    return sendServerError(res, e, "Occasion preview failed");
-  }
-});
-
 app.post("/api/admin/occasions/run-now", async (req, res) => {
   try {
     const settings = await occasionLoadSettings();
@@ -3689,279 +3857,6 @@ app.post("/api/admin/occasions/run-now", async (req, res) => {
     return res.json({ success: true, result });
   } catch (e) {
     return sendServerError(res, e, "Occasion run-now failed");
-  }
-});
-
-app.post("/api/whatsapp/send-media", async (req, res) => {
-  try {
-    const {
-      recipients = [], message = "", mediaUrl = null,
-      mediaType = "image", filename = null, pace = "safe", dryRun = false,
-    } = req.body || {};
-
-    if (!Array.isArray(recipients) || recipients.length === 0) {
-      return res.status(400).json({ success: false, message: "recipients[] required" });
-    }
-    if (!message && !mediaUrl) {
-      return res.status(400).json({ success: false, message: "message or mediaUrl required" });
-    }
-    if (recipients.length > 300) {
-      return res.status(400).json({ success: false, message: "Max 300 recipients per batch" });
-    }
-
-    const PACE = {
-      safe:   { base: 6000, jitter: 0.35 },
-      normal: { base: 4000, jitter: 0.30 },
-      fast:   { base: 2500, jitter: 0.25 },
-    };
-    const { base, jitter } = PACE[pace] || PACE.safe;
-    const delay = () => base + Math.floor(base * jitter * (Math.random() * 2 - 1));
-
-    const results = [];
-    const startedAt = Date.now();
-
-    for (let i = 0; i < recipients.length; i++) {
-      const r = recipients[i] || {};
-      const phone = r.phone;
-      const name = r.name || null;
-      const text = personalizeBulkMessage(message, { name });
-
-      if (dryRun) {
-        results.push({ phone, name, status: "validated", message: text.slice(0, 120) + (text.length > 120 ? "…" : "") });
-        continue;
-      }
-
-      try {
-        if (mediaUrl) {
-          const sender = mediaType === "file" ? wahaSendFile : wahaSendImage;
-          await sender({
-            phone,
-            ...(mediaType === "file" ? { fileUrl: mediaUrl } : { imageUrl: mediaUrl }),
-            caption: text, filename,
-          });
-        } else {
-          enqueueWhatsApp(phone, text, { kind: "bulk-text" });
-        }
-        results.push({ phone, name, status: "sent" });
-        console.log(`📤 Bulk ${i + 1}/${recipients.length} → ${phone}`);
-      } catch (e) {
-        results.push({ phone, name, status: "failed", error: e.message || "send failed" });
-        console.error(`❌ Bulk fail → ${phone}:`, e.message);
-      }
-
-      if (i < recipients.length - 1) {
-        await new Promise((resolve) => setTimeout(resolve, delay()));
-      }
-    }
-
-    const sent = results.filter((x) => x.status === "sent").length;
-    const failed = results.filter((x) => x.status === "failed").length;
-
-    await reDb.collection("bulkWhatsAppLogs").add({
-      total: recipients.length, sent, failed, pace,
-      mediaType: mediaUrl ? mediaType : "text",
-      mediaUrl: mediaUrl || null,
-      messagePreview: String(message).slice(0, 300),
-      durationMs: Date.now() - startedAt,
-      results,
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-    }).catch(() => {});
-
-    return res.json({
-      success: true, total: recipients.length, sent, failed,
-      dryRun: !!dryRun, durationMs: Date.now() - startedAt, results,
-    });
-  } catch (e) {
-    console.error("❌ /api/whatsapp/send-media failed:", e);
-    return sendServerError(res, e, "Bulk WhatsApp send failed");
-  }
-});
-
-app.post("/api/admin/notify-user", async (req, res) => {
-  try {
-    const { userId, phone, email, title = "MarketMix update", message, kind = "admin-notify" } = req.body || {};
-    if (!userId || !message) {
-      return res.status(400).json({ success: false, message: "userId and message required" });
-    }
-
-    const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
-
-    let decoded;
-    try { decoded = await verifyAnyToken(idToken); }
-    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
-
-    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
-    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
-    const caller = callerDoc.data() || {};
-    const isAdmin =
-      caller.role === "admin" || caller.userType === "admin" ||
-      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
-    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
-
-    let target = null;
-    let targetDb = "realestate";
-
-    const reTarget = await reDb.collection("users").doc(userId).get();
-    if (reTarget.exists) target = reTarget.data();
-    else {
-      const shopTarget = await db.collection("users").doc(userId).get();
-      if (shopTarget.exists) { target = shopTarget.data(); targetDb = "shop"; }
-    }
-
-    if (!target) return res.status(404).json({ success: false, message: "User not found" });
-
-    const resolvedPhone = phone || target.phoneNumber || target.phone || target.driverProfile?.phone || null;
-    const resolvedEmail = email || target.email || null;
-
-    let whatsappQueued = false;
-    let emailSent = false;
-
-    if (resolvedPhone) {
-      whatsappQueued = enqueueWhatsApp(
-        resolvedPhone,
-        `🛍️ MarketMix Kenya\n${title}\n\n${message}`,
-        { kind, userId, sourceDb: targetDb }
-      );
-    }
-
-    if (resolvedEmail) {
-      const html = marketMixEmailShell({
-        preheader: title, eyebrow: "MarketMix Kenya", title,
-        subtitle: "Update from MarketMix",
-        bodyHtml: emailBodyText(message),
-        footerNote: "If this wasn't expected, reply to this email and we'll help.",
-      });
-      emailSent = await sendEmail(resolvedEmail, title, html, "sales");
-    }
-
-    try {
-      await reDb.collection("adminNotifications").add({
-        userId, phone: resolvedPhone || null, email: resolvedEmail || null,
-        title, message, kind, whatsappQueued, emailSent,
-        sentBy: decoded.uid,
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    } catch (_) {}
-
-    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!resolvedPhone, hasEmail: !!resolvedEmail });
-  } catch (e) {
-    console.error("❌ Admin notify-user failed:", e);
-    return sendServerError(res, e, "Admin notify failed");
-  }
-});
-
-app.post("/api/driver/decision", async (req, res) => {
-  try {
-    const { userId, decision, reason = "" } = req.body || {};
-    if (!userId || !["approve", "reject"].includes(decision)) {
-      return res.status(400).json({ success: false, message: "userId and decision (approve|reject) required" });
-    }
-
-    const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
-
-    let decoded;
-    try { decoded = await verifyAnyToken(idToken); }
-    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
-
-    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
-    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
-    const caller = callerDoc.data() || {};
-    const isAdmin =
-      caller.role === "admin" || caller.userType === "admin" ||
-      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
-    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
-
-    const userRef = reDb.collection("users").doc(userId);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) return res.status(404).json({ success: false, message: "Driver not found" });
-    const driver = userSnap.data() || {};
-    const profile = driver.driverProfile || {};
-    const approved = decision === "approve";
-
-    await userRef.update({
-      driverApproved: approved,
-      driverStatus: approved ? "approved" : "rejected",
-      driverRejectionReason: approved ? "" : (reason || "Not specified"),
-      driverReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
-      driverReviewedBy: decoded.uid,
-      roles: approved
-        ? Array.from(new Set([...(Array.isArray(driver.roles) ? driver.roles : []), "driver"]))
-        : (Array.isArray(driver.roles) ? driver.roles : []).filter(r => r !== "driver"),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    const driverEmail = driver.email || "";
-    const driverPhone = profile.phone || driver.phone || driver.phoneNumber || "";
-    const driverName = driver.name || (driverEmail ? driverEmail.split("@")[0] : "Driver");
-
-    if (approved) {
-      if (driverEmail) {
-        const html = marketMixEmailShell({
-          preheader: "Your driver account is approved",
-          eyebrow: "MarketMix Moving",
-          title: "You're approved to drive",
-          subtitle: `Welcome aboard, ${driverName}. Your driver account is active.`,
-          bodyHtml: `
-            ${emailBodyText("You can now accept move requests on MarketMix and start earning.")}
-            ${emailSectionLabel("Your driver details")}
-            ${emailInfoCard([
-              ["Vehicle", profile.vehicleId || "—"],
-              ["Plate", profile.plate || "—"],
-              ["License", profile.licenseNumber || "—"],
-              ["Phone", driverPhone || "—"],
-            ])}
-            ${emailBodyText("Open the driver dashboard to see live offers and manage trips.")}
-          `,
-          ctaLabel: "Open driver dashboard",
-          ctaUrl: DRIVER_DASHBOARD_URL,
-          footerNote: "Questions? Reply to this email and we'll help.",
-        });
-        sendEmail(driverEmail, "You're approved · MarketMix Moving", html, "moving")
-          .catch(e => console.error("Driver approve email error:", e));
-      }
-      if (driverPhone) {
-        enqueueWhatsApp(driverPhone,
-          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: ${DRIVER_DASHBOARD_URL}`,
-          { kind: "driver-approved", userId }
-        );
-      }
-    } else {
-      if (driverEmail) {
-        const html = marketMixEmailShell({
-          preheader: "Driver application update",
-          eyebrow: "MarketMix Moving",
-          title: "Driver application not approved",
-          subtitle: `Hello ${driverName}, we couldn't approve your driver account at this time.`,
-          bodyHtml: `
-            ${emailBodyText("You can update your details and resubmit at any time.")}
-            ${emailSectionLabel("Reason")}
-            ${emailInfoCard([["Reason", reason || "Not specified"]])}
-            ${emailBodyText("If you believe this is a mistake, reply to this email and we'll review again.")}
-          `,
-          ctaLabel: "Update my details",
-          ctaUrl: DRIVER_ONBOARD_URL,
-          footerNote: "MarketMix Kenya · support@marketmix.site",
-        });
-        sendEmail(driverEmail, "Update on your driver application · MarketMix Moving", html, "moving")
-          .catch(e => console.error("Driver reject email error:", e));
-      }
-      if (driverPhone) {
-        enqueueWhatsApp(driverPhone,
-          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at ${DRIVER_ONBOARD_URL}`,
-          { kind: "driver-rejected", userId }
-        );
-      }
-    }
-
-    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"} (by admin ${decoded.uid})`);
-    return res.json({ success: true, decision, userId });
-  } catch (e) {
-    console.error("❌ Driver decision failed:", e);
-    return sendServerError(res, e, "Driver decision failed");
   }
 });
 
@@ -4180,315 +4075,155 @@ app.post("/api/moving/notify", async (req, res) => {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════
-   Offline Sale + Buyer Profile Routes
-   ═══════════════════════════════════════════════════════════════ */
-
+// ============================
+// Offline Sale Notify
+// Fires receipt (once) + creates buyer subscriptions per (sellerId, categoryId).
+// ============================
 app.post("/api/offline-sale/notify", async (req, res) => {
   try {
     const { orderId } = req.body || {};
     if (!orderId) return res.status(400).json({ success: false, message: "orderId required" });
 
-    const snap = await db.collection("orders").doc(orderId).get();
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Order not found" });
-    const order = snap.data();
+    const orderSnap = await db.collection("orders").doc(orderId).get();
+    if (!orderSnap.exists) return res.status(404).json({ success: false, message: "Order not found" });
+    const order = orderSnap.data() || {};
+
+    // Guard against duplicate receipt sends
+    if (order.receiptSentAt) {
+      return res.json({ success: true, skipped: "receipt-already-sent" });
+    }
 
     const phone = order.buyerPhoneNormalized || normalizePhoneForWa(order.buyerPhone);
     const items = Array.isArray(order.items) ? order.items : [];
-    const itemSummary = items.slice(0, 3).map(i => `${i.name} x${i.quantity}`).join(", ")
-      + (items.length > 3 ? ` +${items.length - 3} more` : "");
 
-    const cats = new Set();
+    // ── 1. Build subscriptions (grouped by seller + category) ──
+    let subscriptionsCreated = 0;
+    const tuples = new Map(); // `${sellerId}::${categoryId}` → { sellerId, categoryId, categoryName, items[] }
+
     for (const it of items) {
-      if (it.category) { cats.add(it.category); continue; }
-      if (it.productId) {
-        const p = await db.collection("products").doc(it.productId).get();
-        if (p.exists && p.data().category) cats.add(p.data().category);
-      }
-    }
-    const categories = [...cats];
+      const sellerId = it.sellerId;
+      if (!sellerId) continue;
 
-    const sellerId = (order.involvedSellerIds || [])[0] || null;
-    let sellerShop = null;
-    if (sellerId) {
-      const s = await db.collection("users").doc(sellerId).get();
-      if (s.exists) sellerShop = s.data().shopName || s.data().fullName || null;
+      // Fetch authoritative category from product if item doesn't carry it
+      let categoryRaw = it.category || null;
+      let categoryId = slugifyCategory(categoryRaw);
+      if (!categoryId && it.productId) {
+        try {
+          const pSnap = await db.collection("products").doc(it.productId).get();
+          if (pSnap.exists) {
+            const p = pSnap.data() || {};
+            categoryRaw = p.category || null;
+            categoryId = slugifyCategory(categoryRaw);
+          }
+        } catch {}
+      }
+      if (!categoryId) {
+        categoryId = "uncategorized";
+        categoryRaw = categoryRaw || "Uncategorized";
+      }
+
+      const key = `${sellerId}::${categoryId}`;
+      if (!tuples.has(key)) {
+        tuples.set(key, { sellerId, categoryId, categoryName: categoryRaw || categoryId, items: [] });
+      }
+      tuples.get(key).items.push(it);
     }
+
+    if (phone) {
+      for (const t of tuples.values()) {
+        const ok = await upsertBuyerSubscription({
+          phone,
+          sellerId: t.sellerId,
+          categoryId: t.categoryId,
+          categoryName: t.categoryName,
+          orderId,
+        });
+        if (ok) subscriptionsCreated++;
+      }
+      await recordBuyerProfileTouch({
+        phone,
+        name: order.buyerName,
+        amount: order.total || order.totalAmount || 0,
+      });
+    }
+
+    // ── 2. Build & send receipt ──
+    const sellerId = (order.involvedSellerIds || [])[0] || null;
+    let shopName = "MarketMix seller";
+    if (sellerId) {
+      try {
+        const s = await db.collection("users").doc(sellerId).get();
+        if (s.exists) {
+          const d = s.data() || {};
+          shopName = d.shopName || d.fullName || shopName;
+        }
+      } catch {}
+    }
+
+    // Pick emoji from the top-priority category in the order
+    const emojiPriority = ["sneakers", "footwear", "shoes", "clothing", "fashion", "electronics", "mobile-phones", "beauty", "accessories", "bags", "home", "food", "books", "toys", "sports", "jewelry"];
+    let emoji = "🛍️";
+    const categoryIds = [...tuples.values()].map(t => t.categoryId);
+    for (const p of emojiPriority) {
+      if (categoryIds.includes(p)) { emoji = categoryEmoji(p); break; }
+    }
+
+    const dateStr = new Date().toLocaleString("en-KE", {
+      timeZone: "Africa/Nairobi",
+      day: "2-digit", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+
+    const receiptItems = items.map(it => ({ name: it.name, quantity: it.quantity }));
+
+    const message = offlineSaleBuyerWhatsApp({
+      customerName: order.buyerName,
+      shopName,
+      invoiceId: order.invoiceId || orderId,
+      items: receiptItems,
+      amount: order.total || order.totalAmount || 0,
+      paymentMethod: order.paymentMethod || "Cash",
+      paymentStatus: order.paymentStatus || "paid",
+      dateStr,
+      emoji,
+      hasSubscriptions: subscriptionsCreated > 0,
+    });
 
     let whatsappQueued = false;
     if (phone) {
-      whatsappQueued = enqueueWhatsApp(
-        phone,
-        offlineSaleBuyerWhatsApp({
-          customerName: order.buyerName,
-          itemSummary,
-          amount: order.total || order.totalAmount,
-          invoiceId: order.invoiceId,
-          sellerShop,
-          categories,
-        }),
-        { kind: "offline-sale-buyer", orderId, sellerId }
-      );
-    }
-
-    let profileUpdated = false;
-    if (phone) {
-      profileUpdated = await updateBuyerProfile({
-        phone,
-        name: order.buyerName,
-        items,
-        categories,
-        amount: order.total || order.totalAmount || 0,
+      whatsappQueued = enqueueWhatsApp(phone, message, {
+        kind: "offline-receipt",
+        orderId,
         sellerId,
-        channel: "offline",
+        subscriptionsCreated,
       });
-
-      await db.collection("buyerProfiles").doc(phone)
-        .collection("orders").doc(orderId).set({
-          orderId,
-          invoiceId: order.invoiceId || null,
-          total: order.total || order.totalAmount || 0,
-          items: items.map(i => ({
-            name: i.name,
-            quantity: i.quantity,
-            price: i.price,
-            category: i.category || null,
-          })),
-          channel: "offline",
-          sellerId,
-          sellerShop,
-          recordedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }).catch(() => {});
     }
 
-    return res.json({ success: true, whatsappQueued, profileUpdated, hasPhone: !!phone });
+    // Mark receipt as sent on the order
+    await db.collection("orders").doc(orderId).set({
+      receiptSentAt: admin.firestore.FieldValue.serverTimestamp(),
+      receiptSentTo: phone || null,
+      receiptSubscriptionsCreated: subscriptionsCreated,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({
+      success: true,
+      whatsappQueued,
+      subscriptionsCreated,
+      hasPhone: !!phone,
+      shopName,
+      emoji,
+    });
   } catch (e) {
+    console.error("❌ /api/offline-sale/notify failed:", e);
     return sendServerError(res, e, "Offline sale notify failed");
   }
 });
 
-app.get("/api/seller/customers", async (req, res) => {
-  try {
-    const { sellerId, limit = 200, category = null } = req.query || {};
-    if (!sellerId) return res.status(400).json({ success: false, message: "sellerId required" });
-
-    const snap = await db.collection("buyerProfiles")
-      .where("sellers", "array-contains", sellerId)
-      .limit(Math.min(Number(limit) || 200, 500))
-      .get();
-
-    let customers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    if (category) {
-      customers = customers.filter(c =>
-        Array.isArray(c.categoryKeys) && c.categoryKeys.includes(category)
-      );
-    }
-
-    customers.sort((a, b) => {
-      const at = a.lastOrderAt?.toDate?.()?.getTime?.() || 0;
-      const bt = b.lastOrderAt?.toDate?.()?.getTime?.() || 0;
-      return bt - at;
-    });
-
-    return res.json({ success: true, count: customers.length, customers });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load customers");
-  }
-});
-
-app.get("/api/seller/customers/:phone/orders", async (req, res) => {
-  try {
-    const phone = req.params.phone;
-    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-
-    const snap = await db.collection("buyerProfiles").doc(phone)
-      .collection("orders")
-      .orderBy("recordedAt", "desc")
-      .limit(50)
-      .get();
-
-    return res.json({
-      success: true,
-      count: snap.size,
-      orders: snap.docs.map(d => ({ id: d.id, ...d.data() })),
-    });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load buyer orders");
-  }
-});
-
-app.post("/api/seller/customers/:phone", async (req, res) => {
-  try {
-    const phone = req.params.phone;
-    const { note, tags, optedOut, sellerId } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-
-    const patch = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-    if (typeof note === "string") patch.note = note.slice(0, 1000);
-    if (Array.isArray(tags)) patch.tags = tags.slice(0, 20).map(t => String(t).slice(0, 40));
-    if (typeof optedOut === "boolean") patch.optedOut = optedOut;
-    if (sellerId) patch.lastEditedBy = sellerId;
-
-    await db.collection("buyerProfiles").doc(phone).set(patch, { merge: true });
-
-    const snap = await db.collection("buyerProfiles").doc(phone).get();
-    return res.json({ success: true, customer: { id: snap.id, ...snap.data() } });
-  } catch (e) {
-    return sendServerError(res, e, "Could not update customer");
-  }
-});
-
-app.post("/api/seller/customers/:phone/send-promo", async (req, res) => {
-  try {
-    const phone = req.params.phone;
-    const { message, productId, sellerId } = req.body || {};
-    if (!phone || !message) {
-      return res.status(400).json({ success: false, message: "phone and message required" });
-    }
-
-    const profileSnap = await db.collection("buyerProfiles").doc(phone).get();
-    if (profileSnap.exists && profileSnap.data().optedOut) {
-      return res.status(400).json({ success: false, message: "Customer has opted out" });
-    }
-
-    let body = message;
-    if (productId) {
-      const pSnap = await db.collection("products").doc(productId).get();
-      if (pSnap.exists) {
-        const p = pSnap.data();
-        const url = `${WEBSITE_URL}/product/${p.slug || productId}`;
-        body = [
-          message,
-          "",
-          `🛍️ *${p.name}*`,
-          `💰 KES ${Number(p.price || 0).toLocaleString("en-KE")}`,
-          `👉 ${url}`,
-        ].join("\n");
-      }
-    }
-
-    const queued = enqueueWhatsApp(phone, body, {
-      kind: "manual-customer-promo",
-      sellerId: sellerId || null,
-      productId: productId || null,
-    });
-
-    await db.collection("promoLogs").add({
-      buyerPhone: phone,
-      sellerId: sellerId || null,
-      productId: productId || null,
-      channel: "manual",
-      messagePreview: String(message).slice(0, 200),
-      status: queued ? "queued" : "failed",
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-    }).catch(() => {});
-
-    return res.json({ success: true, queued });
-  } catch (e) {
-    return sendServerError(res, e, "Promo send failed");
-  }
-});
-
-app.post("/api/promo/category-drop", async (req, res) => {
-  try {
-    const { productId, sellerId, customMessage, maxRecipients = 100 } = req.body || {};
-    if (!productId) return res.status(400).json({ success: false, message: "productId required" });
-
-    const pSnap = await db.collection("products").doc(productId).get();
-    if (!pSnap.exists) return res.status(404).json({ success: false, message: "Product not found" });
-    const product = pSnap.data();
-    const category = product.category;
-    if (!category) return res.status(400).json({ success: false, message: "Product has no category" });
-
-    const profilesSnap = await db.collection("buyerProfiles")
-      .where("categoryKeys", "array-contains", category)
-      .where("optedOut", "==", false)
-      .limit(Math.min(Number(maxRecipients) || 100, 300))
-      .get();
-
-    let sellerShop = "MarketMix seller";
-    const sid = sellerId || product.sellerId;
-    if (sid) {
-      const s = await db.collection("users").doc(sid).get();
-      if (s.exists) sellerShop = s.data().shopName || s.data().fullName || sellerShop;
-    }
-
-    const productUrl = `${WEBSITE_URL}/product/${product.slug || productId}`;
-    let sent = 0;
-
-    for (const d of profilesSnap.docs) {
-      const p = d.data();
-      const body = customMessage
-        ? personalizeBulkMessage(customMessage, { name: p.name })
-        : [
-            `Hey ${p.name || "there"}! 👋`,
-            ``,
-            `You usually buy *${category}* — new drop just landed at ${sellerShop}:`,
-            ``,
-            `🛍️ *${product.name}*`,
-            `💰 KES ${Number(product.price || 0).toLocaleString("en-KE")}`,
-            ``,
-            `👉 ${productUrl}`,
-            ``,
-            `Reply STOP to opt out.`,
-          ].join("\n");
-
-      enqueueWhatsApp(p.phone, body, {
-        kind: "category-drop",
-        productId,
-        category,
-        buyerPhone: p.phone,
-      });
-
-      await db.collection("promoLogs").add({
-        productId,
-        category,
-        sellerId: sid || null,
-        buyerPhone: p.phone,
-        channel: "category-drop",
-        status: "queued",
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      }).catch(() => {});
-
-      sent++;
-      await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));
-    }
-
-    return res.json({ success: true, matched: profilesSnap.size, sent, category, sellerShop });
-  } catch (e) {
-    return sendServerError(res, e, "Category drop failed");
-  }
-});
-
-app.post("/api/whatsapp/opt-out-webhook", async (req, res) => {
-  try {
-    const payload = req.body || {};
-    const from = payload?.from || payload?.chatId || payload?.author || null;
-    const text = String(payload?.body || payload?.text || "").trim().toUpperCase();
-
-    if (from && ["STOP", "STOP PROMOS", "UNSUBSCRIBE"].includes(text)) {
-      const phone = normalizePhoneForWa(String(from).replace(/@.*$/, ""));
-      if (phone) {
-        await db.collection("buyerProfiles").doc(phone).set({
-          optedOut: true,
-          optedOutAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        console.log(`🚫 Buyer ${phone} opted out`);
-      }
-    }
-    return res.json({ success: true });
-  } catch (e) {
-    console.error("opt-out webhook error:", e.message);
-    return res.json({ success: true });
-  }
-});
-
-/* ═══════════════════════════════════════════════════════════════
-   IntaSend callback
-   ═══════════════════════════════════════════════════════════════ */
-
+// ============================
+// IntaSend callback (unchanged behavior + receipt-once)
+// ============================
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -4660,7 +4395,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       if (realEstate) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
+            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}`,
             { kind: "re-buyer", api_ref }
           );
         }
@@ -4673,7 +4408,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       } else if (moving) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}`,
             { kind: "moving-paid", api_ref }
           );
         }
@@ -5122,211 +4857,54 @@ app.get("/api/test-email-auth", async (req, res) => {
   });
 });
 
-app.post("/api/test-proposal-email", async (req, res) => {
-  const testEmail = req.body?.email || "test@example.com";
-  const html = marketMixEmailShell({
-    preheader: "Test proposal email",
-    eyebrow: "MarketMix Kenya",
-    title: "Test Proposal Email",
-    subtitle: "This is a test from the proposal status system.",
-    bodyHtml: emailBodyText("If you received this, the pipeline is working."),
-  });
-  const ok = await sendEmail(testEmail, "Test Proposal Email", html, "sales");
-  res.json({ success: ok, to: testEmail });
-});
-
-app.post("/api/test-real-estate-email", async (req, res) => {
-  const testEmail = req.body?.email || "test@example.com";
-  const ref = "PROP_TEST_" + Date.now();
-  const ok = await sendRealEstatePaymentEmail({
-    propertyTitle: "Spacious Bedsitter - Kilimani",
-    propertyLocation: "Kilimani, Nairobi",
-    propertyType: "For Rent",
-    totalAmount: 4000,
-    mpesaReference: "UJ8NN93LWY",
-    buyerName: "Test Buyer",
-    landlordName: "Test Landlord",
-    landlordPhone: "254712345678",
-  }, testEmail, ref);
-  res.json({ success: ok, to: testEmail });
-});
-
-app.post("/api/test-moving-email", async (req, res) => {
-  const testEmail = req.body?.email || "test@example.com";
-  const ref = "MOVE_TEST_" + Date.now();
-  const ok = await sendMovingConfirmationEmail({
-    userName: "Test User",
-    pickupLabel: "Kilimani, Nairobi",
-    pickupCoordinates: { lat: -1.2921, lng: 36.8219 },
-    destinationLabel: "Westlands, Nairobi",
-    destinationTitle: "2 Bedroom Apartment",
-    destinationCoordinates: { lat: -1.2674, lng: 36.8109 },
-    vehicleLabel: "Pickup",
-    itemCount: 12,
-    items: { bed: 1, sofa: 1, box: 10 },
-    quotedPrice: 4500,
-    status: "REQUESTED",
-  }, testEmail, ref);
-  res.json({ success: ok, to: testEmail });
-});
-
-app.post("/api/test-store-whatsapp", async (req, res) => {
-  try {
-    const { phone, customerName = "Test Customer", amount = 2500, paymentReference = "TEST_REF_123", orderId = "TEST_ORDER_456" } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-
-    const queued1 = enqueueWhatsApp(
-      phone,
-      storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }),
-      { kind: "test-store-payment" }
-    );
-    const queued2 = enqueueWhatsApp(
-      phone,
-      storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus: "Paid", orderStatus: "Processing" }),
-      { kind: "test-store-order" }
-    );
-
-    return res.json({ success: queued1 && queued2, queued1, queued2 });
-  } catch (e) {
-    return sendServerError(res, e, "Test store WhatsApp failed");
-  }
-});
-
-app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
-  try {
-    const {
-      sellerPhone, buyerPhone,
-      sellerName = "Test Seller", buyerName = "Test Buyer",
-      orderId = "TEST_ORDER_789",
-      sellerRevenue = 3500,
-      itemSummary = "Sneakers x1, Cap x2",
-    } = req.body || {};
-
-    const results = {};
-
-    if (sellerPhone) {
-      results.newOrderQueued = enqueueWhatsApp(
-        sellerPhone,
-        sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount: 2 }),
-        { kind: "test-seller-new-order" }
-      );
-      results.reminderQueued = enqueueWhatsApp(
-        sellerPhone,
-        sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince: 6, nudgeNumber: 1, maxNudges: 4 }),
-        { kind: "test-seller-reminder" }
-      );
-    }
-
-    if (buyerPhone) {
-      results.statusUpdateQueued = enqueueWhatsApp(
-        buyerPhone,
-        buyerStatusUpdateWhatsApp({ customerName: buyerName, orderId, statusLabel: "Shipped" }),
-        { kind: "test-buyer-status-update" }
-      );
-    }
-
-    return res.json({ success: true, results });
-  } catch (e) {
-    return sendServerError(res, e, "Test seller flow WhatsApp failed");
-  }
-});
-
-app.post("/api/test-quicksale-whatsapp", async (req, res) => {
-  try {
-    const {
-      sellerPhone, buyerPhone,
-      sellerName = "Test Seller", customerName = "Walk-in Customer",
-      itemSummary = "Nike Air x1", amount = 3500,
-      paymentReference = "TEST_QS_123",
-      sellerShop = "Test Shop",
-    } = req.body || {};
-
-    const results = {};
-
-    if (buyerPhone) {
-      results.buyerQueued = enqueueWhatsApp(
-        buyerPhone,
-        quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }),
-        { kind: "test-quicksale-buyer" }
-      );
-    }
-
-    if (sellerPhone) {
-      results.sellerQueued = enqueueWhatsApp(
-        sellerPhone,
-        quicksaleSellerWhatsApp({
-          sellerName, itemSummary, amount, paymentReference, customerName,
-          customerPhone: buyerPhone || "—",
-        }),
-        { kind: "test-quicksale-seller" }
-      );
-    }
-
-    return res.json({ success: true, results });
-  } catch (e) {
-    return sendServerError(res, e, "Test quicksale WhatsApp failed");
-  }
-});
-
-app.post("/api/test-welcome-whatsapp", async (req, res) => {
-  try {
-    const { phone, name = "Test Subscriber" } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-    const queued = enqueueWhatsApp(
-      phone,
-      welcomeSubscriberWhatsApp({ name }),
-      { kind: "test-welcome-subscriber" }
-    );
-    return res.json({ success: queued, queued });
-  } catch (e) {
-    return sendServerError(res, e, "Test welcome WhatsApp failed");
-  }
-});
-
-app.post("/api/test-whatsapp-notify-image", async (req, res) => {
-  try {
-    const { phone, title = "Image test", message = "Test image message", imageUrl } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-    if (!imageUrl) return res.status(400).json({ success: false, message: "imageUrl required" });
-
-    const r = await fetch(`http://127.0.0.1:${PORT}/api/whatsapp/notify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone, title, message, imageUrl }),
-    });
-    const data = await r.json().catch(() => ({}));
-    return res.json({ success: r.ok, forwarded: data });
-  } catch (e) {
-    return sendServerError(res, e, "Test notify-image failed");
-  }
-});
-
 app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
   try {
     const {
       phone,
       customerName = "Test Buyer",
-      itemSummary = "Nike Air Force x1",
-      amount = 4500,
+      shopName = "Test Shop",
       invoiceId = "OFF-TEST123",
-      sellerShop = "Test Shop",
-      categories = ["Sneakers"],
+      amount = 5500,
+      items = [{ name: "Nike Air Force 1", quantity: 1 }, { name: "White Cap", quantity: 2 }],
+      emoji = "👟",
+      hasSubscriptions = true,
     } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, message: "phone required" });
-    const queued = enqueueWhatsApp(
-      phone,
-      offlineSaleBuyerWhatsApp({ customerName, itemSummary, amount, invoiceId, sellerShop, categories }),
-      { kind: "test-offline-sale-buyer" }
-    );
-    return res.json({ success: queued, queued });
+
+    const dateStr = new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" });
+    const msg = offlineSaleBuyerWhatsApp({
+      customerName, shopName, invoiceId, items, amount,
+      paymentMethod: "Cash", paymentStatus: "paid", dateStr, emoji, hasSubscriptions,
+    });
+    const queued = enqueueWhatsApp(phone, msg, { kind: "test-offline-receipt" });
+    return res.json({ success: queued, queued, preview: msg });
   } catch (e) {
-    return sendServerError(res, e, "Test offline sale WhatsApp failed");
+    return sendServerError(res, e, "Test offline WhatsApp failed");
   }
 });
 
+app.post("/api/test-subscription-confirm-whatsapp", async (req, res) => {
+  try {
+    const { phone, shopNamesByCategory } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    const payload = shopNamesByCategory || [
+      { shop: "Jane's Sneaker Hub", categories: [{ name: "Sneakers", emoji: "👟", count: 1 }] },
+    ];
+    const msg = subscriptionConfirmedWhatsApp({ shopNamesByCategory: payload });
+    const queued = enqueueWhatsApp(phone, msg, { kind: "test-subscription-confirm" });
+    return res.json({ success: queued, queued, preview: msg });
+  } catch (e) {
+    return sendServerError(res, e, "Test subscription confirm failed");
+  }
+});
+
+// ============================
+// HEALTH
+// ============================
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
+    version: "v2.8.0",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
@@ -5334,125 +4912,43 @@ app.get("/_health", (req, res) => {
       marketplace: MARKETPLACE_URL,
       website: WEBSITE_URL,
       products: PRODUCTS_URL,
-      orderReceiptBase: ORDER_RECEIPT_BASE,
       whatsappGroup: WHATSAPP_GROUP_URL,
-      realEstateApp: REAL_ESTATE_APP_URL,
-      realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
-      moving: MOVING_URL,
-      driverDashboard: DRIVER_DASHBOARD_URL,
-      driverOnboard: DRIVER_ONBOARD_URL,
       sellerDashboard: SELLER_DASHBOARD_URL,
     },
-    senders: SENDERS,
     whatsappQueue: waQueue.length,
-    nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
-    autoPromo: {
-      endpoints: ["/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview", "/api/admin/marketing-overrides"],
-      firestoreSettingsDoc: "platformSettings/autoPromo",
-      logCollection: "autoPromoLogs",
-      overridesCollection: "marketingOverrides",
-      inlined: true,
-      version: "v2.6.5",
-      deterministicPreview: true,
-      overrideAware: true,
-      perGroupPreview: true,
-      strictOverrideMatching: true,
-      groupDedupe: true,
-      minuteAccurateScheduler: true,
-      idempotentPerSlot: true,
-      overrideMatchesEditedTime: true,
-      guardKeyedOnOverrideTime: true,
-      imageResolvedFromProduct: true,
-      placeholderImageFilter: true,
-      overrideImageWins: true,
-      overrideBypassesCap: true,
-      overridePinnedProductSkipsPick: true,
-      overridePlaceholderFiltered: true,
-      groupScopedOverrides: true,
-      groupFilterSource: ["forceGroupIds", "settings.selectedGroupIds"],
-      emptySelectionRefusesSend: true,
-      templates: Object.keys(AutoPromoTemplates),
-      campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
-    },
-    occasions: {
-      endpoints: ["/api/admin/occasions", "/api/admin/occasions/preview", "/api/admin/occasions/run-now"],
-      firestoreSettingsDoc: "platformSettings/occasions",
-      logCollection: "occasionLogs",
-      totalOccasions: OCCASION_LIBRARY.length,
-      movableCount: OCCASION_LIBRARY.filter(o => o.movable).length,
-      recurringCount: OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length,
-      sensitiveCount: OCCASION_LIBRARY.filter(o => o.sensitive === true).length,
-      version: "v1",
-    },
-    buyerProfiles: {
+    buyerSubscriptions: {
       enabled: true,
-      collection: "buyerProfiles",
-      subcollection: "buyerProfiles/{phone}/orders",
-      logCollection: "promoLogs",
+      collection: "buyerSubscriptions",
+      keyPattern: "{phone}_{sellerId}_{categoryId}",
+      categoryIdMode: "slug-from-category-string",
+      subscribeKeywords: [...SUBSCRIBE_KEYWORDS],
+      unsubscribeKeywords: [...UNSUBSCRIBE_KEYWORDS],
       endpoints: [
-        "/api/offline-sale/notify",
-        "/api/seller/customers",
-        "/api/seller/customers/:phone",
-        "/api/seller/customers/:phone/orders",
-        "/api/seller/customers/:phone/send-promo",
-        "/api/promo/category-drop",
-        "/api/whatsapp/opt-out-webhook",
-        "/api/test-offline-sale-whatsapp",
+        "POST /api/whatsapp/webhook",
+        "POST /api/promo/stock-drop",
+        "GET  /api/seller/customers",
+        "POST /api/seller/customers/:phone/note",
+        "POST /api/seller/customers/:phone/manual-optout",
+        "POST /api/offline-sale/notify",
+        "POST /api/test-offline-sale-whatsapp",
+        "POST /api/test-subscription-confirm-whatsapp",
       ],
-      version: "v1",
     },
     endpoints: [
-      "/api/whatsapp/notify", "/api/whatsapp/groups", "/api/whatsapp/welcome", "/api/whatsapp/send-media",
-      "/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview",
+      "/api/whatsapp/notify", "/api/whatsapp/groups", "/api/whatsapp/welcome",
+      "/api/whatsapp/webhook",
+      "/api/admin/auto-promo", "/api/admin/auto-promo/run-now",
       "/api/admin/marketing-overrides",
-      "/api/admin/occasions", "/api/admin/occasions/preview", "/api/admin/occasions/run-now",
+      "/api/admin/occasions", "/api/admin/occasions/run-now",
       "/api/service-request/notify", "/api/moving/notify", "/api/re/welcome",
       "/api/stk-push", "/api/store/seed", "/api/real-estate/seed",
-      "/api/admin/notify-user", "/api/driver/decision", "/api/subscription-payment",
-      "/api/seller/withdraw", "/api/seller/recover-pin", "/api/seller/update-status",
       "/api/offline-sale/notify",
-      "/api/seller/customers", "/api/seller/customers/:phone",
-      "/api/seller/customers/:phone/orders", "/api/seller/customers/:phone/send-promo",
-      "/api/promo/category-drop", "/api/whatsapp/opt-out-webhook",
+      "/api/promo/stock-drop",
+      "/api/seller/customers", "/api/seller/update-status",
+      "/api/seller/withdraw", "/api/seller/recover-pin",
       "/api/ad-transaction/:paymentRef", "/api/update-stock",
-      "/api/test-store-whatsapp", "/api/test-seller-flow-whatsapp", "/api/test-quicksale-whatsapp",
-      "/api/test-welcome-whatsapp", "/api/test-whatsapp-notify-image", "/api/test-offline-sale-whatsapp",
+      "/api/test-offline-sale-whatsapp", "/api/test-subscription-confirm-whatsapp",
       "/_health",
-    ],
-    fixes: [
-      "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
-      "FIX #25 — GET/POST/DELETE /api/admin/marketing-overrides",
-      "FIX #26 — preview response includes overridesApplied count",
-      "FIX #27 — v2.4: preview generates ONE SLOT PER GROUP PER TIME",
-      "FIX #28 — v2.4: preview slots include groupId + groupName",
-      "FIX #29 — v2.4: preview RNG seeded per (date|groupId|hour)",
-      "FIX #30 — v2.5: applyOverride strict key matching",
-      "FIX #31 — v2.5: groups deduped by id",
-      "FIX #32 — v2.5: autoSlotHours sorted ascending",
-      "FIX #33 — v2.5: preview diagnostics",
-      "FIX #34 — v2.5: skipped overrides keep their slot in preview",
-      "FIX #35 — v2.6: scheduler matches overrides on time||slot",
-      "FIX #36 — v2.6: scheduler ticks every 60s",
-      "FIX #37 — v2.6.1: idempotency guard keyed on override slot time",
-      "FIX #38 — v2.6.1: free-form ticks no longer blocked by the override guard",
-      "FIX #39 — v2.6.1: edited override times fire at the next matching tick",
-      "FIX #40 — v2.6.2: image resolved from product.images[] with placeholder filter",
-      "FIX #41 — v2.6.2: gs:// and relative image paths converted to HTTPS Firebase download URLs",
-      "FIX #42 — v2.6.2: autoPromoLogs records imageUrlSent for future audits",
-      "FIX #43 — v2.6.3: override matching moved before cap check; overrides bypass the daily cap",
-      "FIX #44 — v2.6.3: override-pinned products skip the auto-pick",
-      "FIX #45 — v2.6.3: placeholder filter applies to override.imageUrl too",
-      "FIX #46 — v2.6.4: overrides accept an optional groupId and are scoped to that group when present",
-      "FIX #47 — v2.6.4: adding a new group to selectedGroupIds no longer causes existing overrides to fire for it",
-      "FIX #48 — v2.6.5: empty selectedGroupIds refuses to send instead of broadcasting to every WAHA group",
-      "FIX #49 — v2.6.5: run-now still works — forceGroupIds path is unaffected",
-      "FIX #50 — v2.7.0: /api/offline-sale/notify sends buyer WhatsApp receipt + updates buyer profile",
-      "FIX #51 — v2.7.0: buyerProfiles collection tracks categories, spend, sellers, opt-out",
-      "FIX #52 — v2.7.0: /api/seller/customers returns buyers for a seller, filterable by category",
-      "FIX #53 — v2.7.0: /api/seller/customers/:phone/send-promo for one-off manual promos",
-      "FIX #54 — v2.7.0: /api/promo/category-drop blasts new products to matching buyers",
-      "FIX #55 — v2.7.0: /api/whatsapp/opt-out-webhook for STOP keyword handling",
-      "FIX #56 — v2.7.0: offlineSaleBuyerWhatsApp template added",
     ],
     uptime: process.uptime(),
   });
@@ -5463,6 +4959,9 @@ app.use((req, res) => res.status(404).json({ success: false, message: "Not Found
 process.on("uncaughtException", (err) => console.error("Uncaught:", err));
 process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 
+// ============================
+// Keep-alive
+// ============================
 (function keepAlive() {
   const disable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
   const enable = process.env.KEEP_ALIVE === "1" || process.env.KEEP_ALIVE === "true";
@@ -5504,71 +5003,15 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 autoPromoStartScheduler({ SCAN_MS: 60 * 1000 });
 occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 
-let adminFlashNudgeLastKey = null;
-const ADMIN_FLASH_NUDGE_HOURS = [7, 19];
-
-async function adminFlashNudgeTick() {
-  try {
-    const hourEAT = autoPromoHourEAT();
-    const dateKey = autoPromoNowEAT().toISOString().slice(0, 10);
-    if (!ADMIN_FLASH_NUDGE_HOURS.includes(hourEAT)) return;
-    const key = `${dateKey}-${hourEAT}`;
-    if (adminFlashNudgeLastKey === key) return;
-
-    const hpSnap = await db.collection("homepage").doc("content").get();
-    const hp = hpSnap.exists ? hpSnap.data() : {};
-    const sales = Array.isArray(hp.flashSales) ? hp.flashSales : [];
-    const nowD = new Date();
-    const active = sales.filter(s => {
-      const st = s.startDate?.toDate ? s.startDate.toDate() : new Date(s.startDate);
-      const en = s.endDate?.toDate ? s.endDate.toDate() : new Date(s.endDate);
-      return st <= nowD && en >= nowD;
-    });
-
-    const campaign = autoPromoGetActiveCampaign();
-    const adminUrl = `${WEBSITE_URL.replace(/\/$/, "")}/admin/dashboard/flash-sales`;
-
-    let body;
-    if (active.length === 0) {
-      body = [
-        "🚨 *FLASH SALES NEED ATTENTION*", "",
-        "0 active flash sales right now.",
-        "Homepage rail is empty.",
-        campaign ? `\nToday's campaign: *${campaign.name}*` : "",
-        `\n👉 ${adminUrl}`,
-      ].filter(Boolean).join("\n");
-    } else {
-      const manual = active.filter(s => !s.autoCreated).length;
-      const auto = active.filter(s => s.autoCreated).length;
-      body = [
-        "📊 *Daily Flash Sales Check-In*", "",
-        `✅ Active: *${active.length}* (${manual} manual, ${auto} auto)`,
-        campaign ? `🎯 Today's campaign: *${campaign.name}*` : "",
-        `\n👉 ${adminUrl}`,
-      ].filter(Boolean).join("\n");
-    }
-
-    enqueueWhatsApp(ADMIN_PHONE, body, { kind: "admin-flash-nudge", hourEAT });
-    adminFlashNudgeLastKey = key;
-    console.log(`📣 Admin flash nudge sent (hour=${hourEAT})`);
-  } catch (e) {
-    console.error("📣 Admin nudge failed:", e.message);
-  }
-}
-
-setInterval(adminFlashNudgeTick, 5 * 60 * 1000).unref?.();
-setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
-console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
-
+// ============================
+// Server start
+// ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`🚀 Server on port ${PORT} — v2.8.0`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`🤖 AutoPromo: v2.6.5 (empty selection refuses send)`);
-  console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
-  console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
-  console.log(`👥 Buyer profiles: ✅ (v2.7.0)`);
-  console.log(`🧾 Offline sale WhatsApp: ✅ /api/offline-sale/notify`);
+  console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
+  console.log(`📨 Webhook: POST /api/whatsapp/webhook`);
 });
 
 const shutdown = () => {
