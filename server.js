@@ -1,5 +1,5 @@
 // server.js — MarketMix backend (with Occasion Engine integrated)
-// v2.6.5 — Safety net: empty selectedGroupIds refuses to send (was: broadcast to all groups)
+// v2.7.0 — Buyer Profiles + Offline Sale WhatsApp + Category Drops
 //
 // Real-estate site uses M-Pesa ref as the customer-facing ID.
 // WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
@@ -1217,8 +1217,6 @@ function applyOverride(slot, overrides) {
 
   if (!ov) return slot;
 
-  // v2.6.4 — group-scoped: if the override pins a groupId and this slot's
-  // group doesn't match, do not apply it.
   if (ov.groupId && ov.groupId !== slot.groupId) return slot;
 
   return {
@@ -1235,18 +1233,6 @@ function applyOverride(slot, overrides) {
   };
 }
 
-/**
- * v2.6.5 — autoPromoRunTick
- *
- * Ordering:
- *   1. Override matching FIRST (before cap check). Group-scoped.
- *   2. Pending override bypasses the daily cap.
- *   3. Override-pinned products skip the auto-pick.
- *   4. Override.imageUrl is placeholder-filtered.
- *
- * v2.6.5 adds: empty selectedGroupIds refuses to send instead of broadcasting
- * to every WAHA group.
- */
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
   autoPromoRunning = true;
@@ -1271,7 +1257,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       return { error: "groups-fetch-failed", detail: e.message };
     }
 
-    // Dedupe groups by id
     const seenIds = new Set();
     groups = groups.filter(g => {
       if (seenIds.has(g.id)) return false;
@@ -1294,10 +1279,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         `(source: ${isForceRun ? "forceGroupIds" : "settings.selectedGroupIds"})`
       );
     } else {
-      // ── Safety net (v2.6.5) ──
-      // Empty selection on a scheduled tick means "nothing to send" — NOT
-      // "send to every group WAHA returned". Previously this fell through
-      // to a full broadcast. Refuse instead.
       console.warn("🤖 AutoPromo: selectedGroupIds is EMPTY — refusing to send to any group");
       return { skipped: "no-selected-groups" };
     }
@@ -1336,7 +1317,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     for (const group of groups) {
       const kind = autoPromoDetectGroupKind(group.name);
 
-      // ── 1. Override matching FIRST (group-scoped) ──
       let matchedOverride = null;
       let matchedKey = null;
 
@@ -1362,7 +1342,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
       const hasPendingOverride = !!matchedOverride;
 
-      // ── 2. Daily cap (bypassed when an override is pending) ──
       if (!bypassCap && !hasPendingOverride) {
         const alreadySent = await autoPromoCountTodaySends(group.id);
         if (alreadySent >= perGroupPerDay) {
@@ -1371,7 +1350,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         }
       }
 
-      // ── 3. Idempotency guard ──
       const overrideSlotKey = matchedOverride
         ? String(matchedOverride.time || (matchedKey || "").split("|")[0] || "").trim()
         : null;
@@ -1394,12 +1372,10 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         }
       }
 
-      // ── 4. Template pool ──
       const usedTodayTemplates = await autoPromoTemplatesUsedToday(group.id);
       const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
       const templateId = pool.find(id => !usedTodayTemplates.has(id)) || pool[0];
 
-      // ── 5. Product pick ──
       const usedTodayProducts = await autoPromoProductsUsedToday(group.id);
       const overridePinnedProductId =
         matchedOverride?.productId && matchedOverride.productId !== "noplan"
@@ -1419,7 +1395,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         continue;
       }
 
-      // ── 6. Caption / image / slot time ──
       let productUrl = `${settings.siteUrl}/product/${product.slug || product.id}`;
       let caption = autoPromoFillTemplate(templateId, { product, campaign, groupName: group.name, productUrl });
       let imageUrl = productImageUrl(product);
@@ -1440,7 +1415,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         }
       }
 
-      // ── 7. Send ──
       try {
         if (imageUrl) {
           enqueueWhatsAppImage(group.id, imageUrl, caption, {
@@ -2118,6 +2092,40 @@ function welcomeSubscriberWhatsApp({ name }) {
   ].join("\n");
 }
 
+/**
+ * Offline sale buyer receipt — sent when a seller records a walk-in sale with a phone.
+ */
+function offlineSaleBuyerWhatsApp({ customerName, itemSummary, amount, invoiceId, sellerShop, categories }) {
+  const name = customerName && String(customerName).trim() ? String(customerName).trim() : "there";
+  const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const cats = Array.isArray(categories) ? categories.filter(Boolean) : [];
+  const catLine = cats.length ? `🏷️ ${cats.join(" · ")}` : null;
+  const topCat = cats[0] || "items";
+  return [
+    `Hey ${name}! 👋`,
+    ``,
+    `Thanks for shopping with us — here's your receipt. 🧾`,
+    ``,
+    `🧾 *Receipt:* ${invoiceId || "—"}`,
+    `🏪 *Shop:* ${sellerShop || "MarketMix seller"}`,
+    `🛍️ *Items:* ${itemSummary || "—"}`,
+    catLine,
+    `💰 *Total:* KES ${amt}`,
+    ``,
+    `We've noted your interest in *${topCat}* — we'll let you know when new ones drop.`,
+    ``,
+    `🛍️ *Browse more:*`,
+    PRODUCTS_URL,
+    ``,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
+    ``,
+    `Reply *STOP* to opt out of future promos.`,
+    ``,
+    `*MarketMix Kenya — Shop smart. Shop easy.*`,
+  ].filter(Boolean).join("\n");
+}
+
 // ============================
 // Inventory movement logger
 // ============================
@@ -2136,6 +2144,66 @@ async function logInventoryMovement({
   } catch (err) {
     console.error("❌ logInventoryMovement failed:", err.message, { productId, delta, reason });
     return null;
+  }
+}
+
+// ============================
+// Buyer Profiles (customers)
+// ============================
+async function updateBuyerProfile({
+  phone, name, items, categories, amount, sellerId, channel = "offline",
+}) {
+  if (!phone) return false;
+  try {
+    const ref = db.collection("buyerProfiles").doc(phone);
+    const snap = await ref.get();
+
+    const base = snap.exists ? snap.data() : {
+      phone,
+      firstOrderAt: admin.firestore.FieldValue.serverTimestamp(),
+      totalOrders: 0,
+      totalSpent: 0,
+      categories: {},
+      categoryKeys: [],
+      tags: [],
+      note: "",
+      optedOut: false,
+      sellers: [],
+      channels: [],
+    };
+
+    const cats = { ...(base.categories || {}) };
+    for (const c of (categories || [])) {
+      if (!c) continue;
+      const key = String(c).trim();
+      if (!key) continue;
+      cats[key] = (cats[key] || 0) + 1;
+    }
+    const categoryKeys = Object.keys(cats);
+    const topCategory = categoryKeys.sort((a, b) => cats[b] - cats[a])[0] || null;
+
+    const sellers = Array.from(new Set([...(base.sellers || []), sellerId].filter(Boolean)));
+    const channels = Array.from(new Set([...(base.channels || []), channel].filter(Boolean)));
+
+    await ref.set({
+      ...base,
+      phone,
+      name: name || base.name || null,
+      totalOrders: (base.totalOrders || 0) + 1,
+      totalSpent: (base.totalSpent || 0) + (Number(amount) || 0),
+      categories: cats,
+      categoryKeys,
+      topCategory,
+      sellers,
+      channels,
+      lastOrderAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return true;
+  } catch (e) {
+    console.error("updateBuyerProfile failed:", e.message);
+    return false;
   }
 }
 
@@ -4112,6 +4180,315 @@ app.post("/api/moving/notify", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════
+   Offline Sale + Buyer Profile Routes
+   ═══════════════════════════════════════════════════════════════ */
+
+app.post("/api/offline-sale/notify", async (req, res) => {
+  try {
+    const { orderId } = req.body || {};
+    if (!orderId) return res.status(400).json({ success: false, message: "orderId required" });
+
+    const snap = await db.collection("orders").doc(orderId).get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Order not found" });
+    const order = snap.data();
+
+    const phone = order.buyerPhoneNormalized || normalizePhoneForWa(order.buyerPhone);
+    const items = Array.isArray(order.items) ? order.items : [];
+    const itemSummary = items.slice(0, 3).map(i => `${i.name} x${i.quantity}`).join(", ")
+      + (items.length > 3 ? ` +${items.length - 3} more` : "");
+
+    const cats = new Set();
+    for (const it of items) {
+      if (it.category) { cats.add(it.category); continue; }
+      if (it.productId) {
+        const p = await db.collection("products").doc(it.productId).get();
+        if (p.exists && p.data().category) cats.add(p.data().category);
+      }
+    }
+    const categories = [...cats];
+
+    const sellerId = (order.involvedSellerIds || [])[0] || null;
+    let sellerShop = null;
+    if (sellerId) {
+      const s = await db.collection("users").doc(sellerId).get();
+      if (s.exists) sellerShop = s.data().shopName || s.data().fullName || null;
+    }
+
+    let whatsappQueued = false;
+    if (phone) {
+      whatsappQueued = enqueueWhatsApp(
+        phone,
+        offlineSaleBuyerWhatsApp({
+          customerName: order.buyerName,
+          itemSummary,
+          amount: order.total || order.totalAmount,
+          invoiceId: order.invoiceId,
+          sellerShop,
+          categories,
+        }),
+        { kind: "offline-sale-buyer", orderId, sellerId }
+      );
+    }
+
+    let profileUpdated = false;
+    if (phone) {
+      profileUpdated = await updateBuyerProfile({
+        phone,
+        name: order.buyerName,
+        items,
+        categories,
+        amount: order.total || order.totalAmount || 0,
+        sellerId,
+        channel: "offline",
+      });
+
+      await db.collection("buyerProfiles").doc(phone)
+        .collection("orders").doc(orderId).set({
+          orderId,
+          invoiceId: order.invoiceId || null,
+          total: order.total || order.totalAmount || 0,
+          items: items.map(i => ({
+            name: i.name,
+            quantity: i.quantity,
+            price: i.price,
+            category: i.category || null,
+          })),
+          channel: "offline",
+          sellerId,
+          sellerShop,
+          recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+    }
+
+    return res.json({ success: true, whatsappQueued, profileUpdated, hasPhone: !!phone });
+  } catch (e) {
+    return sendServerError(res, e, "Offline sale notify failed");
+  }
+});
+
+app.get("/api/seller/customers", async (req, res) => {
+  try {
+    const { sellerId, limit = 200, category = null } = req.query || {};
+    if (!sellerId) return res.status(400).json({ success: false, message: "sellerId required" });
+
+    const snap = await db.collection("buyerProfiles")
+      .where("sellers", "array-contains", sellerId)
+      .limit(Math.min(Number(limit) || 200, 500))
+      .get();
+
+    let customers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    if (category) {
+      customers = customers.filter(c =>
+        Array.isArray(c.categoryKeys) && c.categoryKeys.includes(category)
+      );
+    }
+
+    customers.sort((a, b) => {
+      const at = a.lastOrderAt?.toDate?.()?.getTime?.() || 0;
+      const bt = b.lastOrderAt?.toDate?.()?.getTime?.() || 0;
+      return bt - at;
+    });
+
+    return res.json({ success: true, count: customers.length, customers });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load customers");
+  }
+});
+
+app.get("/api/seller/customers/:phone/orders", async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+
+    const snap = await db.collection("buyerProfiles").doc(phone)
+      .collection("orders")
+      .orderBy("recordedAt", "desc")
+      .limit(50)
+      .get();
+
+    return res.json({
+      success: true,
+      count: snap.size,
+      orders: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load buyer orders");
+  }
+});
+
+app.post("/api/seller/customers/:phone", async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const { note, tags, optedOut, sellerId } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+
+    const patch = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (typeof note === "string") patch.note = note.slice(0, 1000);
+    if (Array.isArray(tags)) patch.tags = tags.slice(0, 20).map(t => String(t).slice(0, 40));
+    if (typeof optedOut === "boolean") patch.optedOut = optedOut;
+    if (sellerId) patch.lastEditedBy = sellerId;
+
+    await db.collection("buyerProfiles").doc(phone).set(patch, { merge: true });
+
+    const snap = await db.collection("buyerProfiles").doc(phone).get();
+    return res.json({ success: true, customer: { id: snap.id, ...snap.data() } });
+  } catch (e) {
+    return sendServerError(res, e, "Could not update customer");
+  }
+});
+
+app.post("/api/seller/customers/:phone/send-promo", async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const { message, productId, sellerId } = req.body || {};
+    if (!phone || !message) {
+      return res.status(400).json({ success: false, message: "phone and message required" });
+    }
+
+    const profileSnap = await db.collection("buyerProfiles").doc(phone).get();
+    if (profileSnap.exists && profileSnap.data().optedOut) {
+      return res.status(400).json({ success: false, message: "Customer has opted out" });
+    }
+
+    let body = message;
+    if (productId) {
+      const pSnap = await db.collection("products").doc(productId).get();
+      if (pSnap.exists) {
+        const p = pSnap.data();
+        const url = `${WEBSITE_URL}/product/${p.slug || productId}`;
+        body = [
+          message,
+          "",
+          `🛍️ *${p.name}*`,
+          `💰 KES ${Number(p.price || 0).toLocaleString("en-KE")}`,
+          `👉 ${url}`,
+        ].join("\n");
+      }
+    }
+
+    const queued = enqueueWhatsApp(phone, body, {
+      kind: "manual-customer-promo",
+      sellerId: sellerId || null,
+      productId: productId || null,
+    });
+
+    await db.collection("promoLogs").add({
+      buyerPhone: phone,
+      sellerId: sellerId || null,
+      productId: productId || null,
+      channel: "manual",
+      messagePreview: String(message).slice(0, 200),
+      status: queued ? "queued" : "failed",
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    return res.json({ success: true, queued });
+  } catch (e) {
+    return sendServerError(res, e, "Promo send failed");
+  }
+});
+
+app.post("/api/promo/category-drop", async (req, res) => {
+  try {
+    const { productId, sellerId, customMessage, maxRecipients = 100 } = req.body || {};
+    if (!productId) return res.status(400).json({ success: false, message: "productId required" });
+
+    const pSnap = await db.collection("products").doc(productId).get();
+    if (!pSnap.exists) return res.status(404).json({ success: false, message: "Product not found" });
+    const product = pSnap.data();
+    const category = product.category;
+    if (!category) return res.status(400).json({ success: false, message: "Product has no category" });
+
+    const profilesSnap = await db.collection("buyerProfiles")
+      .where("categoryKeys", "array-contains", category)
+      .where("optedOut", "==", false)
+      .limit(Math.min(Number(maxRecipients) || 100, 300))
+      .get();
+
+    let sellerShop = "MarketMix seller";
+    const sid = sellerId || product.sellerId;
+    if (sid) {
+      const s = await db.collection("users").doc(sid).get();
+      if (s.exists) sellerShop = s.data().shopName || s.data().fullName || sellerShop;
+    }
+
+    const productUrl = `${WEBSITE_URL}/product/${product.slug || productId}`;
+    let sent = 0;
+
+    for (const d of profilesSnap.docs) {
+      const p = d.data();
+      const body = customMessage
+        ? personalizeBulkMessage(customMessage, { name: p.name })
+        : [
+            `Hey ${p.name || "there"}! 👋`,
+            ``,
+            `You usually buy *${category}* — new drop just landed at ${sellerShop}:`,
+            ``,
+            `🛍️ *${product.name}*`,
+            `💰 KES ${Number(product.price || 0).toLocaleString("en-KE")}`,
+            ``,
+            `👉 ${productUrl}`,
+            ``,
+            `Reply STOP to opt out.`,
+          ].join("\n");
+
+      enqueueWhatsApp(p.phone, body, {
+        kind: "category-drop",
+        productId,
+        category,
+        buyerPhone: p.phone,
+      });
+
+      await db.collection("promoLogs").add({
+        productId,
+        category,
+        sellerId: sid || null,
+        buyerPhone: p.phone,
+        channel: "category-drop",
+        status: "queued",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      sent++;
+      await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));
+    }
+
+    return res.json({ success: true, matched: profilesSnap.size, sent, category, sellerShop });
+  } catch (e) {
+    return sendServerError(res, e, "Category drop failed");
+  }
+});
+
+app.post("/api/whatsapp/opt-out-webhook", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const from = payload?.from || payload?.chatId || payload?.author || null;
+    const text = String(payload?.body || payload?.text || "").trim().toUpperCase();
+
+    if (from && ["STOP", "STOP PROMOS", "UNSUBSCRIBE"].includes(text)) {
+      const phone = normalizePhoneForWa(String(from).replace(/@.*$/, ""));
+      if (phone) {
+        await db.collection("buyerProfiles").doc(phone).set({
+          optedOut: true,
+          optedOutAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+        console.log(`🚫 Buyer ${phone} opted out`);
+      }
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("opt-out webhook error:", e.message);
+    return res.json({ success: true });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════
+   IntaSend callback
+   ═══════════════════════════════════════════════════════════════ */
+
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -4924,6 +5301,29 @@ app.post("/api/test-whatsapp-notify-image", async (req, res) => {
   }
 });
 
+app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
+  try {
+    const {
+      phone,
+      customerName = "Test Buyer",
+      itemSummary = "Nike Air Force x1",
+      amount = 4500,
+      invoiceId = "OFF-TEST123",
+      sellerShop = "Test Shop",
+      categories = ["Sneakers"],
+    } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    const queued = enqueueWhatsApp(
+      phone,
+      offlineSaleBuyerWhatsApp({ customerName, itemSummary, amount, invoiceId, sellerShop, categories }),
+      { kind: "test-offline-sale-buyer" }
+    );
+    return res.json({ success: queued, queued });
+  } catch (e) {
+    return sendServerError(res, e, "Test offline sale WhatsApp failed");
+  }
+});
+
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
@@ -4984,6 +5384,23 @@ app.get("/_health", (req, res) => {
       sensitiveCount: OCCASION_LIBRARY.filter(o => o.sensitive === true).length,
       version: "v1",
     },
+    buyerProfiles: {
+      enabled: true,
+      collection: "buyerProfiles",
+      subcollection: "buyerProfiles/{phone}/orders",
+      logCollection: "promoLogs",
+      endpoints: [
+        "/api/offline-sale/notify",
+        "/api/seller/customers",
+        "/api/seller/customers/:phone",
+        "/api/seller/customers/:phone/orders",
+        "/api/seller/customers/:phone/send-promo",
+        "/api/promo/category-drop",
+        "/api/whatsapp/opt-out-webhook",
+        "/api/test-offline-sale-whatsapp",
+      ],
+      version: "v1",
+    },
     endpoints: [
       "/api/whatsapp/notify", "/api/whatsapp/groups", "/api/whatsapp/welcome", "/api/whatsapp/send-media",
       "/api/admin/auto-promo", "/api/admin/auto-promo/run-now", "/api/admin/auto-promo/preview",
@@ -4993,9 +5410,14 @@ app.get("/_health", (req, res) => {
       "/api/stk-push", "/api/store/seed", "/api/real-estate/seed",
       "/api/admin/notify-user", "/api/driver/decision", "/api/subscription-payment",
       "/api/seller/withdraw", "/api/seller/recover-pin", "/api/seller/update-status",
+      "/api/offline-sale/notify",
+      "/api/seller/customers", "/api/seller/customers/:phone",
+      "/api/seller/customers/:phone/orders", "/api/seller/customers/:phone/send-promo",
+      "/api/promo/category-drop", "/api/whatsapp/opt-out-webhook",
       "/api/ad-transaction/:paymentRef", "/api/update-stock",
       "/api/test-store-whatsapp", "/api/test-seller-flow-whatsapp", "/api/test-quicksale-whatsapp",
-      "/api/test-welcome-whatsapp", "/api/test-whatsapp-notify-image", "/_health",
+      "/api/test-welcome-whatsapp", "/api/test-whatsapp-notify-image", "/api/test-offline-sale-whatsapp",
+      "/_health",
     ],
     fixes: [
       "FIX #24 — marketingOverrides: preview + live scheduler apply admin edits",
@@ -5024,6 +5446,13 @@ app.get("/_health", (req, res) => {
       "FIX #47 — v2.6.4: adding a new group to selectedGroupIds no longer causes existing overrides to fire for it",
       "FIX #48 — v2.6.5: empty selectedGroupIds refuses to send instead of broadcasting to every WAHA group",
       "FIX #49 — v2.6.5: run-now still works — forceGroupIds path is unaffected",
+      "FIX #50 — v2.7.0: /api/offline-sale/notify sends buyer WhatsApp receipt + updates buyer profile",
+      "FIX #51 — v2.7.0: buyerProfiles collection tracks categories, spend, sellers, opt-out",
+      "FIX #52 — v2.7.0: /api/seller/customers returns buyers for a seller, filterable by category",
+      "FIX #53 — v2.7.0: /api/seller/customers/:phone/send-promo for one-off manual promos",
+      "FIX #54 — v2.7.0: /api/promo/category-drop blasts new products to matching buyers",
+      "FIX #55 — v2.7.0: /api/whatsapp/opt-out-webhook for STOP keyword handling",
+      "FIX #56 — v2.7.0: offlineSaleBuyerWhatsApp template added",
     ],
     uptime: process.uptime(),
   });
@@ -5138,6 +5567,8 @@ const server = app.listen(PORT, () => {
   console.log(`🤖 AutoPromo: v2.6.5 (empty selection refuses send)`);
   console.log(`✏️  Overrides: ✅ /api/admin/marketing-overrides`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
+  console.log(`👥 Buyer profiles: ✅ (v2.7.0)`);
+  console.log(`🧾 Offline sale WhatsApp: ✅ /api/offline-sale/notify`);
 });
 
 const shutdown = () => {
