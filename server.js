@@ -2113,6 +2113,8 @@ function offlineSaleBuyerWhatsApp({
   paymentMethod, paymentStatus, dateStr, emoji,
   hasSubscriptions,
   receiptVariant = "new",   // "new" | "subscribed" | "opted-out"
+  cashReceived = null,
+  changeGiven = null,
 }) {
   const name = (customerName && String(customerName).trim()) || "there";
   const shop = (shopName && String(shopName).trim()) || "MarketMix seller";
@@ -2142,6 +2144,15 @@ function offlineSaleBuyerWhatsApp({
     ``,
     `💰 *Total paid: KES ${amt}*`,
   ];
+
+  if (paymentMethod === "cash" && cashReceived != null && Number(cashReceived) > 0) {
+    const cashAmt = Number(cashReceived).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+    lines.push(`💵 Amount given: KES ${cashAmt}`);
+  }
+  if (paymentMethod === "cash" && changeGiven != null && Number(changeGiven) > 0) {
+    const changeAmt = Number(changeGiven).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+    lines.push(`🪙 Change: KES ${changeAmt}`);
+  }
 
   if (!hasSubscriptions) {
     lines.push(
@@ -4492,6 +4503,8 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       emoji,
       hasSubscriptions: subscriptionsCreated > 0,
       receiptVariant,
+      cashReceived: order.cashReceived != null ? Number(order.cashReceived) : null,
+      changeGiven: order.changeGiven != null ? Number(order.changeGiven) : null,
     });
 
     let whatsappQueued = false;
@@ -5194,14 +5207,19 @@ app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
       emoji = "👟",
       hasSubscriptions = true,
       receiptVariant = "new",
+      paymentMethod = "Cash",
+      cashReceived = null,
+      changeGiven = null,
     } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, message: "phone required" });
 
     const dateStr = new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" });
     const msg = offlineSaleBuyerWhatsApp({
       customerName, shopName, invoiceId, items, amount,
-      paymentMethod: "Cash", paymentStatus: "paid", dateStr, emoji, hasSubscriptions,
+      paymentMethod, paymentStatus: "paid", dateStr, emoji, hasSubscriptions,
       receiptVariant,
+      cashReceived: cashReceived != null ? Number(cashReceived) : null,
+      changeGiven: changeGiven != null ? Number(changeGiven) : null,
     });
     const queued = enqueueWhatsApp(phone, msg, { kind: "test-offline-receipt" });
     return res.json({ success: queued, queued, preview: msg });
