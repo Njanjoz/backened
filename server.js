@@ -1,19 +1,40 @@
 // server.js — MarketMix backend
-// v2.9.0 — Token-based STOCK subscriptions + LID fallback escalation
+// v2.10.0 — Full merge: v2.6.5 endpoint surface + v2.9.0 token/LID/buyer-subs
 //
-// Real-estate site uses M-Pesa ref as the customer-facing ID.
-// WhatsApp (WAHA) sends are queued: first attempt aborts fast (8s) so a cold
-// WAHA doesn't block the queue; retries use a 30s timeout once WAHA is warm.
-// Dual Firebase Admin: shop (default) owns shop data; realestate (named) owns
-// Real Estate auth + Real Estate Firestore.
-//
-// NEW in v2.9.0:
-//   • Receipts include a wa.me link with a short token (subscribeTokens/{token})
-//     so buyers can subscribe from a fresh chat even when WAHA NOWEB sends @lid.
-//   • Webhook accepts "STOCK <token>" (or "STOP <token>") and resolves identity.
-//   • LID fallback now escalates across 3 messages instead of one, with a
-//     shorter repeat cooldown, so confused buyers get progressively clearer help.
-//   • GET /api/admin/unresolved-lids for diagnostics.
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ MERGE PROVENANCE                                                         │
+// │                                                                          │
+// │ [v2.6.5]  Base — all endpoints the Admin Console was built against:      │
+// │             • POST /api/admin/auto-promo/preview   (Daily Preview)       │
+// │             • POST /api/admin/occasions/preview    (Occasion preview)    │
+// │             • POST /api/whatsapp/send-media        (Direct Message)      │
+// │             • POST /api/admin/notify-user          (Admin → user)        │
+// │             • POST /api/driver/decision            (Approve/reject)      │
+// │             • POST /api/test-* (all 7 test endpoints)                    │
+// │             • adminFlashNudgeTick (7am/7pm EAT)                          │
+// │             • Occasion engine                                            │
+// │             • AutoPromo scheduler v2.6.5                                 │
+// │                                                                          │
+// │ [v2.9.0]  Layer — subscriptions & WAHA identity resolution:              │
+// │             • Token system (subscribeTokens)                             │
+// │             • LID fallback escalation (3 messages)                       │
+// │             • Buyer subscriptions (buyerSubscriptions)                   │
+// │             • whatsappMessageMap / waUnresolvedLids / cooldowns          │
+// │             • /api/admin/unresolved-lids, /api/admin/subscribe-tokens    │
+// │             • /api/offline-sale/notify (token-aware receipt)             │
+// │             • /api/promo/stock-drop                                      │
+// │             • /api/seller/customers{,/:phone/note,/:phone/manual-optout} │
+// │             • /api/whatsapp/webhook (token + reply-chain parsing)        │
+// │                                                                          │
+// │ [NEW v2.10.0] Fixes & additions:                                         │
+// │             • Preview endpoints answer on BOTH GET and POST              │
+// │             • /api/admin/marketing/calendar?year=YYYY (Annual Calendar)  │
+// │             • /api/admin/campaigns CRUD (Campaigns page)                 │
+// │             • /api/admin/content-library CRUD (Content Library page)     │
+// │             • /api/admin/delivery-logs (Delivery Logs page)              │
+// │             • /api/admin/sticker-studio (Sticker Studio storage)         │
+// │             • /_health enumerates every mount + fix list                 │
+// └──────────────────────────────────────────────────────────────────────────┘
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -32,7 +53,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
 // ============================
-// CORS
+// CORS — [v2.6.5]
 // ============================
 const allowedOrigins = [
   "http://localhost:5173",
@@ -62,6 +83,7 @@ app.use(cors({
 
 app.use(bodyParser.json({ limit: "25mb" }));
 
+// Request logger — [v2.6.5]
 app.use((req, res, next) => {
   try {
     const logBody = { ...req.body };
@@ -79,7 +101,7 @@ app.use((req, res, next) => {
 });
 
 // ============================
-// ENV CHECK
+// ENV CHECK — [v2.6.5]
 // ============================
 const requiredEnv = [
   "INTASEND_PUBLISHABLE_KEY",
@@ -94,7 +116,7 @@ if (missing.length) {
 }
 
 // ============================
-// Firebase
+// Firebase (dual admin) — [v2.6.5]
 // ============================
 let shopApp;
 let reApp;
@@ -120,6 +142,7 @@ try {
 db = shopApp.firestore();
 reDb = reApp.firestore();
 
+// Verify token against shop OR realestate — [v2.6.5]
 async function verifyAnyToken(idToken) {
   try {
     return await shopApp.auth().verifyIdToken(idToken);
@@ -131,7 +154,7 @@ async function verifyAnyToken(idToken) {
 }
 
 // ============================
-// IntaSend
+// IntaSend — [v2.6.5]
 // ============================
 const intasend = new IntaSend(
   process.env.INTASEND_PUBLISHABLE_KEY,
@@ -139,6 +162,9 @@ const intasend = new IntaSend(
   false
 );
 
+// ============================
+// URL constants — [v2.6.5] + [v2.9.0] WA_BUSINESS_NUMBER
+// ============================
 const BACKEND_HOST = process.env.RENDER_BACKEND_URL || `http://localhost:${PORT}`;
 const REAL_ESTATE_RECEIPT_URL =
   process.env.REAL_ESTATE_RECEIPT_URL ||
@@ -157,15 +183,13 @@ const WHATSAPP_GROUP_URL = process.env.WHATSAPP_GROUP_URL || "https://chat.whats
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "254115988107";
 const ORDERS_PHONE = process.env.ORDERS_PHONE || "254115988107";
 const APK_DOWNLOAD_URL = process.env.APK_DOWNLOAD_URL || `${WEBSITE_URL}/apk/MarketMix-Kenya.apk`;
-
-// Public WhatsApp business number buyers message to subscribe
-const WA_BUSINESS_NUMBER = process.env.WA_BUSINESS_NUMBER || ORDERS_PHONE;
+const WA_BUSINESS_NUMBER = process.env.WA_BUSINESS_NUMBER || ORDERS_PHONE; // [v2.9.0]
 
 const buildOrderReceiptUrl = (orderId) =>
   orderId ? `${ORDER_RECEIPT_BASE}/${orderId}` : WEBSITE_URL;
 
 // ============================
-// Category slug (Option Y)
+// Category slug helpers — [v2.9.0]
 // ============================
 function slugifyCategory(raw) {
   if (!raw) return null;
@@ -198,7 +222,7 @@ function categoryEmoji(categoryId) {
 }
 
 // ============================
-// Subscription keyword map
+// Subscription keyword map — [v2.9.0]
 // ============================
 const SUBSCRIBE_KEYWORDS = new Set([
   "STOCK", "YES", "SUBSCRIBE",
@@ -219,7 +243,7 @@ const UNSUBSCRIBE_KEYWORDS = new Set([
 ]);
 
 // ============================
-// Brevo
+// Brevo senders & sendEmail — [v2.6.5]
 // ============================
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
@@ -293,6 +317,7 @@ const sendEmail = async (to, subject, html, type = "security", phone = null) => 
   }
 };
 
+// Brevo startup probe — [v2.6.5]
 (async () => {
   if (!BREVO_API_KEY) {
     console.warn("⚠️ BREVO_API_KEY not set — emails will not be sent");
@@ -314,7 +339,7 @@ const sendEmail = async (to, subject, html, type = "security", phone = null) => 
 })();
 
 // ============================
-// WAHA
+// WAHA client & queue — [v2.6.5]
 // ============================
 const WAHA_URL = process.env.WAHA_URL;
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
@@ -360,6 +385,7 @@ function normalizeWaChatId(input) {
   if (!input) return null;
   const s = String(input).trim();
   if (s.endsWith("@g.us")) return s;
+  if (s.endsWith("@lid")) return s; // [v2.9.0] keep LID as-is so fallback works
   return normalizePhoneForWa(s);
 }
 
@@ -413,6 +439,7 @@ function backoffForAttempt(attempts) {
   return [1000, 3000, 8000][attempts - 1] || 8000;
 }
 
+// Enqueue text WA — [v2.6.5] + [v2.9.0] onSent callback
 function enqueueWhatsApp(phoneNumber, message, meta = {}) {
   const normalized = normalizeWaChatId(phoneNumber);
   if (!normalized) {
@@ -433,6 +460,7 @@ function enqueueWhatsApp(phoneNumber, message, meta = {}) {
   return true;
 }
 
+// Enqueue image WA — [v2.6.5]
 function enqueueWhatsAppImage(phoneNumber, imageUrl, caption = "", meta = {}) {
   const normalized = normalizeWaChatId(phoneNumber);
   if (!normalized) {
@@ -478,6 +506,7 @@ async function drainWaQueue() {
   waRunning = false;
 }
 
+// Send attempt — [v2.6.5] + [v2.9.0] onSent callback capture
 async function attemptWaSend(job) {
   if (!WAHA_URL || !WAHA_API_KEY) {
     console.log("⚠️ WAHA not configured, dropping queued message");
@@ -488,7 +517,9 @@ async function attemptWaSend(job) {
     : timeoutForAttempt(job.attempts);
 
   try {
-    const chatId = job.phone.endsWith("@g.us") ? job.phone : `${job.phone}@c.us`;
+    const chatId = job.phone.endsWith("@g.us") || job.phone.endsWith("@lid")
+      ? job.phone
+      : `${job.phone}@c.us`;
 
     if (job.kind === "image" && job.imageUrl) {
       const res = await wahaFetch(WAHA_SEND_IMAGE_PATH, {
@@ -524,6 +555,7 @@ async function attemptWaSend(job) {
     }
     console.log(`📱 WhatsApp sent → ${job.phone} (attempt ${job.attempts + 1}, ${timeoutMs}ms)`);
 
+    // [v2.9.0] Capture WAHA's message ID for reply-chain resolution
     const sentMessageId = data?.key?.id || data?.id?.id || data?.id?._serialized || null;
     if (sentMessageId && typeof job.onSent === "function") {
       try {
@@ -543,12 +575,13 @@ async function attemptWaSend(job) {
   }
 }
 
-const sendWhatsApp = async (phoneNumber, message) => enqueueWhatsApp(phoneNumber, message);
-
+// Direct WAHA image send (bypasses queue) — [v2.6.5]
 async function wahaSendImage({ phone, imageUrl, caption, filename }) {
   const normalized = normalizeWaChatId(phone);
   if (!normalized) throw new Error(`Invalid phone/group: ${phone}`);
-  const chatId = normalized.endsWith("@g.us") ? normalized : `${normalized}@c.us`;
+  const chatId = normalized.endsWith("@g.us") || normalized.endsWith("@lid")
+    ? normalized
+    : `${normalized}@c.us`;
 
   const body = {
     session: "default",
@@ -574,10 +607,13 @@ async function wahaSendImage({ phone, imageUrl, caption, filename }) {
   return data;
 }
 
+// Direct WAHA file send (bypasses queue) — [v2.6.5]
 async function wahaSendFile({ phone, fileUrl, filename, caption }) {
   const normalized = normalizeWaChatId(phone);
   if (!normalized) throw new Error(`Invalid phone/group: ${phone}`);
-  const chatId = normalized.endsWith("@g.us") ? normalized : `${normalized}@c.us`;
+  const chatId = normalized.endsWith("@g.us") || normalized.endsWith("@lid")
+    ? normalized
+    : `${normalized}@c.us`;
 
   const body = {
     session: "default",
@@ -609,6 +645,7 @@ function personalizeBulkMessage(template, { name } = {}) {
   return msg.replace(/[ \t]+\n/g, "\n").trim();
 }
 
+// WAHA keep-alive ping — [v2.6.5]
 (function pingWaha() {
   if (!WAHA_URL) {
     console.log("🛑 WAHA ping disabled (WAHA_URL not set)");
@@ -624,7 +661,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo — INLINED
+   AutoPromo Engine — [v2.6.5] (base) + [NEW v2.10.0] GET previews
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -673,6 +710,7 @@ function productImageUrl(product) {
   return resolveProductImageUrl(chosen);
 }
 
+// EAT time helpers — [v2.6.5]
 function autoPromoNowEAT() {
   return new Date(Date.now() + 3 * 60 * 60 * 1000);
 }
@@ -720,6 +758,8 @@ function autoPromoDetectGroupKind(groupName) {
   return "general";
 }
 
+// AutoPromo campaign calendar — [v2.6.5]
+// NOTE: v2.10.0 also exposes CRUD via /api/admin/campaigns
 const AUTO_PROMO_CAMPAIGNS = [
   { name: "New Year",            startMonth: 12, startDay: 27, endMonth: 1,  endDay: 3,  eventMonth: 1,  eventDay: 1  },
   { name: "Back to School Jan",  startMonth: 12, startDay: 28, endMonth: 1,  endDay: 15, eventMonth: 1,  eventDay: 8  },
@@ -826,6 +866,8 @@ const AUTO_FOOTER = (v) => [
   "━━━━━━━━━━━━━━",
 ].join("\n");
 
+// Content Library templates (T1–T20) — [v2.6.5]
+// NOTE: v2.10.0 also exposes CRUD overrides via /api/admin/content-library
 const AutoPromoTemplates = {
   T1: (v) => [
     `☀️ *MORNING PICK*`, ``,
@@ -1136,6 +1178,7 @@ function autoPromoPickRandom(arr, n = 1) {
   return out;
 }
 
+// Settings load/save — [v2.6.5]
 async function autoPromoLoadSettings() {
   const ref = db.collection("platformSettings").doc("autoPromo");
   const snap = await ref.get();
@@ -1251,7 +1294,7 @@ async function autoPromoPickProduct({ group, forceProductId = null, days7Window 
   return autoPromoPickRandom(top, 1)[0].p;
 }
 
-/* ─── Overrides ─── */
+// Overrides load/apply — [v2.6.5]
 async function loadOverridesForDate(dateStr) {
   const map = new Map();
   if (!dateStr) return map;
@@ -1295,6 +1338,7 @@ function applyOverride(slot, overrides) {
   };
 }
 
+// Live AutoPromo tick — [v2.6.5]
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
   if (autoPromoRunning) return { skipped: "already-running" };
   autoPromoRunning = true;
@@ -1551,6 +1595,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
   }
 }
 
+// AutoPromo scheduler — [v2.6.5]
 function autoPromoStartScheduler({ SCAN_MS = 60 * 1000 } = {}) {
   const tick = async () => {
     try {
@@ -1566,7 +1611,7 @@ function autoPromoStartScheduler({ SCAN_MS = 60 * 1000 } = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Occasion Engine
+   Occasion Engine — [v2.6.5]
    ═══════════════════════════════════════════════════════════════ */
 
 const OCCASION_LIBRARY = [
@@ -1672,7 +1717,12 @@ function fillOccasionTemplate(text, vars = {}) {
 }
 
 function resolveOccasionsForDate({
-  month, day, weekday = null, movableDates = {}, includeRecurring = false, year = null,
+  month,
+  day,
+  weekday = null,
+  movableDates = {},
+  includeRecurring = false,
+  year = null,
 } = {}) {
   const fixed = [];
   const recurring = [];
@@ -1684,14 +1734,20 @@ function resolveOccasionsForDate({
       }
       continue;
     }
+
     if (occ.movable) {
       const resolved = movableDates[occ.key];
       if (!resolved) continue;
       if (year && resolved.year && resolved.year !== year) continue;
-      if (resolved.month === month && resolved.day === day) fixed.push(occ);
+      if (resolved.month === month && resolved.day === day) {
+        fixed.push(occ);
+      }
       continue;
     }
-    if (occ.month === month && occ.day === day) fixed.push(occ);
+
+    if (occ.month === month && occ.day === day) {
+      fixed.push(occ);
+    }
   }
 
   return { dated: fixed, recurring };
@@ -1711,6 +1767,7 @@ function buildOccasionMessage(occasion, { shopLink, name } = {}) {
   return fillOccasionTemplate(raw, { shopLink, name });
 }
 
+// Occasion settings — [v2.6.5]
 async function occasionLoadSettings() {
   const ref = db.collection("platformSettings").doc("occasions");
   const snap = await ref.get();
@@ -1750,6 +1807,7 @@ async function occasionWasSentToday(occasionKey) {
 
 let occasionRunning = false;
 
+// Live occasion tick — [v2.6.5]
 async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dryRun = false } = {}) {
   if (occasionRunning) return { skipped: "already-running" };
   occasionRunning = true;
@@ -1902,6 +1960,7 @@ async function occasionRunTick({ forceGroups = null, forceOccasionKey = null, dr
 
 let occasionTickTimer = null;
 
+// Occasion scheduler — [v2.6.5]
 function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
   const tick = async () => {
     try {
@@ -1916,10 +1975,11 @@ function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
   return () => { if (occasionTickTimer) clearTimeout(occasionTickTimer); };
 }
 
-// ============================
-// WhatsApp message templates
-// ============================
+/* ═══════════════════════════════════════════════════════════════
+   WhatsApp message templates — [v2.6.5] + [v2.9.0] additions
+   ═══════════════════════════════════════════════════════════════ */
 
+// Store payment confirmed — [v2.6.5]
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -1937,10 +1997,16 @@ function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference 
     `🛍️ *Explore more products:*`,
     PRODUCTS_URL,
     ``,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
+    ``,
+    `Happy shopping!`,
+    ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
+// Store order confirmed — [v2.6.5]
 function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, orderStatus }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -1956,15 +2022,24 @@ function storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus, ord
     `💳 *Payment:* ${pay}`,
     `🚚 *Order status:* ${status}`,
     ``,
+    `We're getting things ready for you!`,
+    ``,
     `📦 *Track your order:*`,
     receiptUrl,
     ``,
+    `💬 Need help? Just reply to this message.`,
+    ``,
     `Thanks for shopping with us, ${name}. We appreciate you! ❤️`,
     ``,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
+    ``,
     `*MarketMix Kenya*`,
+    `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
+// Buyer status update — [v2.6.5]
 function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const id = orderId ? String(orderId) : "—";
@@ -1992,10 +2067,17 @@ function buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel }) {
     `📦 *Track your order:*`,
     receiptUrl,
     ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
+    ``,
     `*MarketMix Kenya*`,
+    `Your marketplace. Your choice.`,
   ].join("\n");
 }
 
+// Quicksale buyer — [v2.6.5]
 function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }) {
   const name = customerName && String(customerName).trim() ? String(customerName).trim() : "Customer";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -2005,7 +2087,7 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
   return [
     `Hey ${name}! 👋`,
     ``,
-    `Payment confirmed — your purchase is locked in. 🎉`,
+    `Good news — your payment has landed safely. 🎉`,
     ``,
     `🛍️ *Item:* ${summary}`,
     `💰 *Amount paid:* KES ${amt}`,
@@ -2013,11 +2095,21 @@ function quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentRefe
     `🏪 *Seller:* ${shop}`,
     ``,
     `Thanks for shopping with MarketMix Kenya! ❤️`,
+    `The seller has been notified and your purchase is confirmed.`,
+    ``,
+    `🛍️ *Explore more products:*`,
+    PRODUCTS_URL,
+    ``,
+    `💬 Questions? Just reply to this message.`,
+    ``,
+    `👥 *Join our WhatsApp group for deals & new drops:*`,
+    WHATSAPP_GROUP_URL,
     ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
+// Quicksale seller — [v2.6.5]
 function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentReference, customerName, customerPhone }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const amt = Number(amount || 0).toLocaleString("en-KE", { minimumFractionDigits: 2 });
@@ -2045,6 +2137,7 @@ function quicksaleSellerWhatsApp({ sellerName, itemSummary, amount, paymentRefer
   ].join("\n");
 }
 
+// Seller new-order — [v2.6.5]
 function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -2070,6 +2163,7 @@ function sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue,
   ].join("\n");
 }
 
+// Seller reminder — [v2.6.5]
 function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nudgeNumber, maxNudges }) {
   const name = sellerName && String(sellerName).trim() ? String(sellerName).trim() : "Seller";
   const id = orderId ? String(orderId) : "—";
@@ -2095,6 +2189,7 @@ function sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince, nu
   ].join("\n");
 }
 
+// Welcome subscriber — [v2.6.5]
 function welcomeSubscriberWhatsApp({ name }) {
   const displayName = name && String(name).trim() ? String(name).trim() : "there";
   return [
@@ -2110,25 +2205,27 @@ function welcomeSubscriberWhatsApp({ name }) {
     `🛍️ *Explore what's live now:*`,
     WEBSITE_URL,
     ``,
+    `Thanks for joining us! ❤️`,
+    ``,
     `*MarketMix Kenya — Shop smart. Shop easy.*`,
   ].join("\n");
 }
 
-// ============================
-// Offline receipt — the locked-in copy
-// v2.9.0: includes wa.me subscribe link with token.
-// ============================
+// ── [v2.9.0] Subscriptions & offline receipts ──
+
+// Build a wa.me link with embedded token
 function buildSubscribeLink(phone, token) {
   if (!token) return null;
   const text = encodeURIComponent(`STOCK ${token}`);
   return `https://wa.me/${WA_BUSINESS_NUMBER}?text=${text}`;
 }
 
+// Offline receipt with token-aware subscribe CTA — [v2.9.0]
 function offlineSaleBuyerWhatsApp({
   customerName, shopName, invoiceId, items, amount,
   paymentMethod, paymentStatus, dateStr, emoji,
   hasSubscriptions,
-  receiptVariant = "new",   // "new" | "subscribed" | "opted-out"
+  receiptVariant = "new",
   cashReceived = null,
   changeGiven = null,
   subscribeLink = null,
@@ -2198,7 +2295,6 @@ function offlineSaleBuyerWhatsApp({
       );
     }
   } else {
-    // "new" — first-time buyer, no subscription yet
     if (subscribeLink) {
       lines.push(
         ``,
@@ -2228,6 +2324,7 @@ function offlineSaleBuyerWhatsApp({
   return lines.join("\n");
 }
 
+// Subscription confirmed — [v2.9.0]
 function subscriptionConfirmedWhatsApp({ shopNamesByCategory }) {
   const blocks = [];
   for (const entry of shopNamesByCategory) {
@@ -2246,6 +2343,7 @@ function subscriptionConfirmedWhatsApp({ shopNamesByCategory }) {
   ].join("\n");
 }
 
+// Already subscribed ack — [v2.9.0]
 function alreadySubscribedWhatsApp({ shopNamesByCategory }) {
   const blocks = [];
   for (const entry of shopNamesByCategory) {
@@ -2264,6 +2362,7 @@ function alreadySubscribedWhatsApp({ shopNamesByCategory }) {
   ].join("\n");
 }
 
+// Opt-out confirmed — [v2.9.0]
 function optOutConfirmedWhatsApp() {
   return [
     `Got it — you won't receive any more stock notifications from us.`,
@@ -2277,7 +2376,7 @@ function optOutConfirmedWhatsApp() {
 }
 
 // ============================
-// Inventory movement logger
+// Inventory movement logger — [v2.6.5]
 // ============================
 async function logInventoryMovement({
   productId, sellerId, delta, reason,
@@ -2298,7 +2397,7 @@ async function logInventoryMovement({
 }
 
 // ============================
-// Helpers
+// Fee helpers — [v2.6.5]
 // ============================
 const WITHDRAWAL_THRESHOLD = 100.0;
 const FIXED_FEE_BELOW_THRESHOLD = 10.0;
@@ -2365,7 +2464,7 @@ function quicksaleItemSummary(orderData) {
 }
 
 // ============================
-// EMAIL SHELL
+// EMAIL SHELL — [v2.6.5]
 // ============================
 const marketMixEmailShell = ({ preheader = "", eyebrow = "MarketMix Kenya", title, subtitle, bodyHtml, ctaLabel, ctaUrl, footerNote = "" }) => `
 <!DOCTYPE html>
@@ -2425,6 +2524,7 @@ const emailBodyText = (text) => `
 const emailSectionLabel = (label) => `
   <p style="margin:0 0 6px 0;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#64748b;font-weight:700;">${label}</p>`;
 
+// Order confirmation email — [v2.6.5]
 const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   try {
     console.log("📧 Order confirmation →", userEmail);
@@ -2490,6 +2590,7 @@ const sendOrderConfirmationEmail = async (orderData, userEmail, orderId) => {
   }
 };
 
+// Real estate payment email — [v2.6.5]
 const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   try {
     console.log("🏠 Real estate receipt →", userEmail);
@@ -2556,6 +2657,7 @@ const sendRealEstatePaymentEmail = async (data, userEmail, orderId) => {
   }
 };
 
+// Moving confirmation email — [v2.6.5]
 const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   try {
     console.log("🚚 Moving confirmation →", userEmail);
@@ -2631,6 +2733,7 @@ const sendMovingConfirmationEmail = async (data, userEmail, requestId) => {
   }
 };
 
+// Real estate welcome email — [v2.6.5]
 const sendRealEstateWelcomeEmail = async ({
   userEmail, userName, roleLabel, roleDesc = "", rolePerks = [],
   isSwitch = false, previousRoleLabel = null,
@@ -2705,6 +2808,9 @@ const sendRealEstateWelcomeEmail = async ({
   }
 };
 
+// ============================
+// PIN recovery helpers — [v2.6.5]
+// ============================
 const generateReplacementCode = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -2762,6 +2868,9 @@ const markCodeAsUsed = async (userId) => {
   } catch (e) { return false; }
 };
 
+// ============================
+// Subscription activation — [v2.6.5]
+// ============================
 const validateSubscriptionPayment = (data) => {
   const { amount, phoneNumber, fullName, email, orderId, planId, sellerId } = data || {};
   if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
@@ -2830,6 +2939,9 @@ const activateSellerSubscription = async (s, mpesaReference) => {
   return true;
 };
 
+// ============================
+// Seller new-order notification — [v2.6.5]
+// ============================
 async function notifySellersOfNewOrder(orderId, orderData) {
   const sellerIds = Array.isArray(orderData?.involvedSellerIds) ? orderData.involvedSellerIds : [];
   if (!sellerIds.length) {
@@ -2895,6 +3007,9 @@ async function notifySellersOfNewOrder(orderId, orderData) {
   }
 }
 
+// ============================
+// Seller nudge scheduler — [v2.6.5]
+// ============================
 const NUDGE_MAX = 4;
 const NUDGE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const NUDGE_SCAN_MS = 15 * 60 * 1000;
@@ -3008,19 +3123,13 @@ async function runSellerNudgeScan() {
 })();
 
 // ============================
-// ═══════════════════════════════════════════════════
-// BUYER SUBSCRIPTIONS  (phone → sellerId → categoryId)
-// ═══════════════════════════════════════════════════
+// ── [v2.9.0] BUYER SUBSCRIPTIONS ──
 // ============================
 
 function buyerSubscriptionId(phone, sellerId, categoryId) {
   return `${phone}_${sellerId}_${categoryId}`;
 }
 
-/**
- * Upsert one subscription per (phone, sellerId, categoryId).
- * Repeat purchases bump `purchaseCount` atomically, never reset subscribed/optedOut.
- */
 async function upsertBuyerSubscription({
   phone, sellerId, categoryId, categoryName, orderId, purchasedAt,
 }) {
@@ -3220,13 +3329,11 @@ async function optOutAllSubscriptionsForPhone(phone) {
 }
 
 // ============================
-// SUBSCRIBE TOKENS (v2.9.0)
-// wa.me link carries a short token so buyers can subscribe from a fresh
-// chat even when WAHA NOWEB sends @lid without a phone.
+// ── [v2.9.0] SUBSCRIBE TOKENS ──
 // ============================
 
 const SUBSCRIBE_TOKEN_TTL_DAYS = 90;
-const SUBSCRIBE_TOKEN_BYTES = 6; // 8 chars after base64url
+const SUBSCRIBE_TOKEN_BYTES = 6;
 
 function generateSubscribeToken() {
   const buf = crypto.randomBytes(SUBSCRIBE_TOKEN_BYTES);
@@ -3237,14 +3344,9 @@ function generateSubscribeToken() {
     .slice(0, 8);
 }
 
-/**
- * Create (or reuse) a token for { phone, sellerId }. One token per phone.
- * If a fresh token already exists for this phone we reuse it.
- */
 async function getOrCreateSubscribeToken({ phone, sellerId = null, orderId = null }) {
   if (!phone) return null;
   try {
-    // Reuse recent token for this phone
     const existing = await db.collection("subscribeTokens")
       .where("phone", "==", phone)
       .orderBy("createdAt", "desc")
@@ -3257,7 +3359,6 @@ async function getOrCreateSubscribeToken({ phone, sellerId = null, orderId = nul
       const createdMs = data.createdAt?.toDate?.()?.getTime?.() || 0;
       const ageDays = (Date.now() - createdMs) / (1000 * 60 * 60 * 24);
       if (ageDays < SUBSCRIBE_TOKEN_TTL_DAYS) {
-        // Refresh last used
         await d.ref.set({
           lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
           uses: admin.firestore.FieldValue.increment(1),
@@ -3266,9 +3367,7 @@ async function getOrCreateSubscribeToken({ phone, sellerId = null, orderId = nul
       }
     }
 
-    // Create fresh
     let token = generateSubscribeToken();
-    // Collision guard (unlikely but cheap)
     for (let i = 0; i < 3; i++) {
       const check = await db.collection("subscribeTokens").doc(token).get();
       if (!check.exists) break;
@@ -3295,10 +3394,6 @@ async function getOrCreateSubscribeToken({ phone, sellerId = null, orderId = nul
   }
 }
 
-/**
- * Resolve token → { phone, sellerId, orderId }.
- * Returns null if missing or expired.
- */
 async function resolveSubscribeToken(token) {
   if (!token) return null;
   try {
@@ -3321,23 +3416,13 @@ async function resolveSubscribeToken(token) {
   }
 }
 
-/**
- * Parse leading keyword + optional trailing token.
- * Examples:
- *   "STOCK"          → { keyword: "STOCK", token: null }
- *   "STOCK AB12CD34" → { keyword: "STOCK", token: "AB12CD34" }
- *   "STOP AB12CD34"  → { keyword: "STOP",  token: "AB12CD34" }
- *   "  stop  "       → { keyword: "STOP",  token: null }
- */
 function parseKeywordAndToken(rawText) {
   const text = String(rawText || "").trim();
   if (!text) return { keyword: "", token: null };
 
-  // Normalize internal whitespace
   const normalized = text.replace(/\s+/g, " ");
   const upper = normalized.toUpperCase();
 
-  // Try longest keyword first (e.g. "STOP ALL" before "STOP")
   const allKeywords = [...UNSUBSCRIBE_KEYWORDS, ...SUBSCRIBE_KEYWORDS]
     .sort((a, b) => b.length - a.length);
 
@@ -3345,10 +3430,8 @@ function parseKeywordAndToken(rawText) {
     if (upper === kw) return { keyword: kw, token: null };
     if (upper.startsWith(kw + " ")) {
       const rest = normalized.slice(kw.length).trim();
-      // Token is a single token: alphanumeric, 4-16 chars
       const tokenMatch = /^([A-Za-z0-9]{4,16})$/.exec(rest);
       if (tokenMatch) return { keyword: kw, token: tokenMatch[1].toUpperCase() };
-      // Anything else after keyword → treat whole thing as keyword, no token
       return { keyword: kw, token: null };
     }
   }
@@ -3357,10 +3440,10 @@ function parseKeywordAndToken(rawText) {
 }
 
 // ============================
-// LID resolution (WAHA NOWEB sends @lid, not phone)
+// ── [v2.9.0] LID RESOLUTION ──
 // ============================
-const LID_FALLBACK_COOLDOWN_HOURS = 24;   // first fallback
-const LID_FALLBACK_REPEAT_HOURS = 2;      // subsequent fallbacks for same LID
+const LID_FALLBACK_COOLDOWN_HOURS = 24;
+const LID_FALLBACK_REPEAT_HOURS = 2;
 const LID_FALLBACK_MAX_SENDS = 3;
 
 async function storeConfirmationMessageMap({ messageId, phone, sellerId, kind, orderId = null }) {
@@ -3404,13 +3487,6 @@ async function resolveLidViaReply({ replyToId }) {
   }
 }
 
-/**
- * Subscribe fallback with escalation. Returns true if a message was queued.
- * Attempt 1 → gentle "reply to your receipt"
- * Attempt 2 → 3-step instructions
- * Attempt 3 → last try, point to WhatsApp support
- * After attempt 3 → silent log only (no more sends until cooldown)
- */
 async function maybeSendSubscribeFallback({ phoneRaw, text, reason, token = null }) {
   if (!SUBSCRIBE_KEYWORDS.has(text)) return false;
   if (UNSUBSCRIBE_KEYWORDS.has(text)) return false;
@@ -3422,7 +3498,6 @@ async function maybeSendSubscribeFallback({ phoneRaw, text, reason, token = null
     const data = snap.exists ? (snap.data() || {}) : {};
     const sentCount = Number(data.sentCount || 0);
 
-    // Hard cap after 3 attempts
     if (sentCount >= LID_FALLBACK_MAX_SENDS) {
       console.log(`🔕 Fallback maxed for ${phoneRaw} (sent ${sentCount}x)`);
       return false;
@@ -3542,9 +3617,1110 @@ async function maybeSendStopFallback({ phoneRaw, text, reason }) {
 }
 
 // ============================
-// WhatsApp Inbound Webhook
-// v2.9.0: accepts "STOCK <token>" / "STOP <token>" from wa.me links
+// ── ROUTES ──
 // ============================
+
+// ── Proposal status email — [v2.6.5] ──
+app.post("/api/send-proposal-status", async (req, res) => {
+  try {
+    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body || {};
+    if (!to || !proposalId || !status) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+    const emailHtml = html || marketMixEmailShell({
+      preheader: `Proposal ${status}`,
+      eyebrow: "MarketMix Kenya · Lipa Mdogo Mdogo",
+      title: `Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}`,
+      subtitle: `Hello ${studentName || "Student"}, your installment proposal has been reviewed.`,
+      bodyHtml: `
+        ${emailInfoCard([
+          ["Proposal ID", String(proposalId)],
+          ["Status", status.toUpperCase(), status === "approved"],
+          ["Amount", `KSH ${Number(amount || 0).toLocaleString()}`],
+          ["Institution", institution || "N/A"],
+        ])}
+        ${notes ? emailBodyText(notes) : ""}
+      `,
+      ctaLabel: "Open MarketMix",
+      ctaUrl: MARKETPLACE_URL,
+    });
+
+    const ok = await sendEmail(to, subject || `Proposal ${status}`, emailHtml, "sales");
+    return res.json({ success: ok, message: ok ? "Sent" : "Failed" });
+  } catch (e) {
+    return sendServerError(res, e, "Proposal email failed");
+  }
+});
+
+// ── STK push — [v2.6.5] ──
+app.post("/api/stk-push", async (req, res) => {
+  try {
+    const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
+    const amt = parsePositiveNumber(amount);
+    if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
+    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
+    if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
+    if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
+    if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
+
+    const [firstName, ...rest] = fullName.trim().split(" ");
+    const lastName = rest.join(" ") || "N/A";
+
+    let response;
+    try {
+      response = await intasend.collection().mpesaStkPush({
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        phone_number: phoneNumber,
+        amount: amt,
+        host: BACKEND_HOST,
+        api_ref: orderId,
+      });
+    } catch (intasendErr) {
+      console.error("❌ IntaSend STK failed:", intasendErr?.response || intasendErr);
+      return res.status(502).json({ success: false, message: "Payment provider error" });
+    }
+
+    await db.collection("orders").doc(orderId).set({
+      invoiceId: response?.invoice?.invoice_id || null,
+      status: "STK_PUSH_SENT",
+      totalAmount: amt,
+      userEmail: email,
+      buyerEmail: email,
+      phoneNumber,
+      "shippingDetails.fullName": fullName,
+      "shippingDetails.phoneNumber": phoneNumber,
+      "shippingDetails.email": email,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, data: response });
+  } catch (e) {
+    return sendServerError(res, e, "STK push failed");
+  }
+});
+
+// ── Store seed — [v2.6.5] ──
+app.post("/api/store/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, cart } = req.body || {};
+    if (!ref || !email) return res.status(400).json({ success: false, message: "ref and email required" });
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "store",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      phoneNumber,
+      shippingDetails: { fullName, phoneNumber, email, deliveryPlace: "TBD" },
+      items: Array.isArray(cart?.items) ? cart.items : [],
+      sellerGroups: Array.isArray(cart?.sellerGroups) ? cart.sellerGroups : [],
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, ref });
+  } catch (e) {
+    return sendServerError(res, e, "Store seed failed");
+  }
+});
+
+// ── Real estate seed — [v2.6.5] ──
+app.post("/api/real-estate/seed", async (req, res) => {
+  try {
+    const { ref, amount, email, fullName, phoneNumber, paymentKind, property, landlord } = req.body || {};
+    if (!ref || !ref.startsWith("PROP_")) {
+      return res.status(400).json({ success: false, message: "ref must start with PROP_" });
+    }
+    if (!property?.id || !landlord?.phone || !email) {
+      return res.status(400).json({ success: false, message: "Missing property/landlord/email" });
+    }
+
+    await db.collection("orders").doc(ref).set({
+      orderId: ref,
+      orderType: "real_estate",
+      isRealEstate: true,
+      paymentKind: paymentKind || "rent",
+      totalAmount: Number(amount) || 0,
+      userEmail: email,
+      buyerEmail: email,
+      buyerName: fullName || "Buyer",
+      phoneNumber,
+      shippingDetails: { fullName, phoneNumber, email },
+      propertyId: property.id,
+      propertyTitle: property.title,
+      propertyLocation: property.location,
+      propertyType: property.type,
+      landlordName: landlord.name,
+      landlordPhone: landlord.phone,
+      paymentStatus: "pending",
+      state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({ success: true, message: "Real estate order seeded", ref });
+  } catch (e) {
+    return sendServerError(res, e, "Real estate seed failed");
+  }
+});
+
+// ── Seller update status — [v2.6.5] ──
+const ALLOWED_SELLER_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
+
+app.post("/api/seller/update-status", async (req, res) => {
+  try {
+    const { orderId, newStatus } = req.body || {};
+    if (!orderId || !newStatus) {
+      return res.status(400).json({ success: false, message: "orderId and newStatus required" });
+    }
+    if (!ALLOWED_SELLER_STATUSES.includes(newStatus)) {
+      return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${ALLOWED_SELLER_STATUSES.join(", ")}` });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+
+    const sellerId = decoded.uid;
+
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const order = orderSnap.data() || {};
+
+    const involved = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
+    if (!involved.includes(sellerId)) {
+      return res.status(403).json({ success: false, message: "You are not a seller on this order" });
+    }
+
+    if (order.paymentStatus !== "paid") {
+      return res.status(400).json({ success: false, message: "Order is not paid — cannot update status" });
+    }
+
+    await orderRef.update({
+      status: newStatus,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      sellerNudgeActive: false,
+      lastStatusUpdateBy: sellerId,
+      lastStatusUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`✅ Order ${orderId} status → ${newStatus} by seller ${sellerId}`);
+
+    const buyerPhone =
+      order.phoneNumber || order.shippingDetails?.phoneNumber || order.buyerPhone || null;
+
+    if (buyerPhone) {
+      const customerName =
+        order.shippingDetails?.fullName || order.buyerName || "Customer";
+      enqueueWhatsApp(
+        buyerPhone,
+        buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel: newStatus }),
+        { kind: "buyer-status-update", orderId, sellerId, status: newStatus }
+      );
+    } else {
+      console.log(`⚠️ Order ${orderId} has no buyer phone — buyer WhatsApp skipped`);
+    }
+
+    if (newStatus === "Cancelled") {
+      try {
+        await db.collection("adminAlerts").add({
+          type: "seller_cancelled_order",
+          orderId, cancelledBy: sellerId, involvedSellerIds: involved,
+          flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+    }
+
+    return res.json({ success: true, orderId, newStatus, buyerNotified: !!buyerPhone });
+  } catch (e) {
+    console.error("❌ /api/seller/update-status failed:", e);
+    return sendServerError(res, e, "Status update failed");
+  }
+});
+
+// ── RE welcome — [v2.6.5] ──
+app.post("/api/re/welcome", async (req, res) => {
+  try {
+    const {
+      email, name, phone, roleLabel, roleDesc, rolePerks,
+      isSwitch = false, previousRoleLabel = null, ctaLabel, ctaUrl,
+    } = req.body || {};
+
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ success: false, message: "Valid email required" });
+    }
+    if (!roleLabel) {
+      return res.status(400).json({ success: false, message: "roleLabel required" });
+    }
+
+    const emailSent = await sendRealEstateWelcomeEmail({
+      userEmail: email, userName: name, roleLabel, roleDesc,
+      rolePerks: Array.isArray(rolePerks) ? rolePerks : [],
+      isSwitch: !!isSwitch, previousRoleLabel, ctaLabel, ctaUrl,
+    });
+
+    let whatsappQueued = false;
+    if (phone) {
+      const lines = [
+        `🏠 *MarketMix Real Estates*`,
+        ``,
+        isSwitch
+          ? `Hi ${name || "there"} — you're now a *${roleLabel}*${previousRoleLabel ? ` (was ${previousRoleLabel})` : ""}.`
+          : `*Welcome, ${name || "friend"}!*`,
+        ``,
+        roleDesc ? roleDesc : "",
+        rolePerks && rolePerks.length ? `\n*What you can do:*` : "",
+        ...(Array.isArray(rolePerks) ? rolePerks.map((l) => `• ${l}`) : []),
+        ``,
+        isSwitch
+          ? `Changed by mistake? You can switch back anytime from your Profile page.`
+          : `You can switch your account type anytime from your Profile page.`,
+        ``,
+        `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
+        ``,
+        `👥 *Join our WhatsApp group:*`,
+        WHATSAPP_GROUP_URL,
+      ].filter(Boolean);
+
+      whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
+        kind: isSwitch ? "re-welcome-role-switch" : "re-welcome-signup",
+        roleLabel,
+      });
+    }
+
+    return res.json({ success: true, emailSent, whatsappQueued, isSwitch: !!isSwitch, roleLabel });
+  } catch (e) {
+    console.error("❌ /api/re/welcome failed:", e);
+    return sendServerError(res, e, "Welcome failed");
+  }
+});
+
+// ── WAHA groups — [v2.6.5] ──
+app.get("/api/whatsapp/groups", async (req, res) => {
+  try {
+    const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+    const raw = await r.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+
+    if (!r.ok) {
+      console.error(`❌ WAHA /api/default/groups → ${r.status}: ${raw.slice(0, 300)}`);
+      return res.status(r.status).json({
+        success: false, message: "WAHA returned an error",
+        wahaStatus: r.status, wahaBody: raw.slice(0, 500),
+      });
+    }
+
+    let list = [];
+    if (Array.isArray(data)) list = data;
+    else if (data && typeof data === "object") list = Object.values(data);
+
+    const groups = list
+      .filter((c) => c && (c.id || c.chatId) && String(c.id || c.chatId).endsWith("@g.us"))
+      .map((c) => ({
+        id: c.id || c.chatId,
+        name: c.subject || c.name || "(unnamed group)",
+        size: c.size || null,
+      }));
+
+    console.log(`👥 /api/whatsapp/groups → ${groups.length} group(s)`);
+    return res.json({ success: true, count: groups.length, groups });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/groups failed:", e);
+    return sendServerError(res, e, "Could not list groups");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// AUTO-PROMO ADMIN ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+// GET settings + recent logs — [v2.6.5]
+app.get("/api/admin/auto-promo", async (req, res) => {
+  try {
+    const settings = await autoPromoLoadSettings();
+    const recent = await db.collection("autoPromoLogs")
+      .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
+    const campaign = autoPromoGetActiveCampaign();
+    return res.json({
+      success: true,
+      settings,
+      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
+      templates: Object.keys(AutoPromoTemplates).map(id => ({ id })),
+      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load auto-promo settings");
+  }
+});
+
+// POST save settings — [v2.6.5]
+app.post("/api/admin/auto-promo", async (req, res) => {
+  try {
+    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds", "activeCampaignName", "activeFrom", "activeUntil", "activeContentType", "activeSendTimes"];
+    const patch = {};
+    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+    await autoPromoSaveSettings(patch, req.body?.uid || "admin");
+    const settings = await autoPromoLoadSettings();
+    return res.json({ success: true, settings });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save auto-promo settings");
+  }
+});
+
+// [NEW v2.10.0] Preview handler — shared by GET & POST
+// Endpoint: /api/admin/auto-promo/preview
+// Method:   GET ?date=YYYY-MM-DD  OR  POST { date, groupIds }
+//
+// Returns a deterministic slot plan for the target date. Applies
+// marketingOverrides on top of each generated slot.
+async function handleAutoPromoPreview(req, res) {
+  try {
+    const src = (req.method === "POST" ? (req.body || {}) : (req.query || {}));
+    const { date = null } = src;
+    const rawGroupIds = req.method === "POST" ? src.groupIds : null;
+    const groupIds = Array.isArray(rawGroupIds) ? rawGroupIds : null;
+
+    const autoSettings = await autoPromoLoadSettings();
+    const occSettings  = await occasionLoadSettings();
+
+    let groups = [];
+    try {
+      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+      const data = await r.json().catch(() => ({}));
+      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      groups = list
+        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
+        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
+    } catch (e) {
+      return sendServerError(res, e, "Could not fetch groups");
+    }
+
+    const seenIds = new Set();
+    groups = groups.filter(g => {
+      if (seenIds.has(g.id)) return false;
+      seenIds.add(g.id);
+      return true;
+    });
+
+    const previewPersistedIds = Array.isArray(autoSettings.selectedGroupIds)
+      ? autoSettings.selectedGroupIds
+      : [];
+    const previewEffectiveIds = (Array.isArray(groupIds) && groupIds.length > 0)
+      ? groupIds
+      : previewPersistedIds;
+    if (previewEffectiveIds.length > 0) {
+      const allowed = new Set(previewEffectiveIds);
+      groups = groups.filter(g => allowed.has(g.id));
+      console.log(`🤖 Preview: filtered to ${groups.length} group(s) (source: ${Array.isArray(groupIds) && groupIds.length ? "body/query" : "settings.selectedGroupIds"})`);
+    }
+
+    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const dateStr = targetDate.toISOString().slice(0, 10);
+    const month = targetDate.getUTCMonth() + 1;
+    const day   = targetDate.getUTCDate();
+    const dow   = targetDate.getUTCDay();
+    const year  = targetDate.getUTCFullYear();
+
+    const overrides = await loadOverridesForDate(dateStr);
+    console.log(`🤖 Preview: ${overrides.size} override(s) loaded for ${dateStr}`);
+
+    const perGroupPerDay = Math.min(
+      AUTO_PROMO_MAX_PER_GROUP_PER_DAY,
+      Math.max(1, Number(autoSettings.perGroupPerDay) || 4)
+    );
+    const { start: hourStart, end: hourEnd } = autoSettings.activeHours || { start: 8, end: 21 };
+
+    const hourPool = [];
+    for (let h = hourStart; h < hourEnd; h++) hourPool.push(h);
+
+    const autoSlotHours = [];
+    if (hourPool.length && perGroupPerDay > 0) {
+      const step = hourPool.length / perGroupPerDay;
+      for (let i = 0; i < perGroupPerDay; i++) {
+        const idx = Math.min(hourPool.length - 1, Math.floor(i * step));
+        if (!autoSlotHours.includes(hourPool[idx])) autoSlotHours.push(hourPool[idx]);
+      }
+      while (autoSlotHours.length < perGroupPerDay) {
+        const next = hourPool.find(h => !autoSlotHours.includes(h));
+        if (next === undefined) break;
+        autoSlotHours.push(next);
+      }
+    }
+    autoSlotHours.sort((a, b) => a - b);
+
+    const pSnap = await db.collection("products").get();
+    const products = pSnap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(p => {
+        const qty = Number(p.quantity) || 0;
+        const variantStock = Array.isArray(p.variants)
+          ? p.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0)
+          : 0;
+        return (qty > 0 || variantStock > 0) && p.isPublished !== false;
+      });
+
+    const nowKey = month * 100 + day;
+    let campaign = null;
+    for (const c of AUTO_PROMO_CAMPAIGNS) {
+      const startKey = c.startMonth * 100 + c.startDay;
+      const endKey   = c.endMonth   * 100 + c.endDay;
+      const evtKey   = c.eventMonth * 100 + c.eventDay;
+      let inRange = false;
+      if (startKey <= endKey) inRange = nowKey >= startKey && nowKey <= endKey;
+      else                    inRange = nowKey >= startKey || nowKey <= endKey;
+      if (inRange) {
+        const evtMonth = Math.floor(evtKey / 100);
+        const nowMonth = Math.floor(nowKey / 100);
+        const daysToEvent = nowKey <= evtKey
+          ? (evtMonth - nowMonth) * 30 + (c.eventDay - day)
+          : -1;
+        campaign = { ...c, daysToEvent };
+        break;
+      }
+    }
+
+    const dayBucket = dow === 1 ? "monday"
+      : (dow === 2 || dow === 3) ? "midweek"
+      : dow === 4 ? "almost_friday"
+      : dow === 5 ? "friday"
+      : dow === 6 ? "saturday" : "sunday";
+    const payday   = day >= 25 || day <= 5;
+    const monthEnd = day >= 28;
+
+    const autoSlots = [];
+
+    for (const group of groups) {
+      const usedProducts = new Set();
+      const usedTemplates = new Set();
+      const kind = autoPromoDetectGroupKind(group.name);
+
+      for (const hour of autoSlotHours) {
+        const timeBucket = autoPromoTimeBucket(hour);
+        const rng = autoPromoSeededRng(`${dateStr}|${group.id}|${hour}`);
+
+        const pool = autoPromoPickTemplatePool({ campaign, timeBucket, dayBucket, payday, monthEnd, groupKind: kind });
+        const templateId = pool.find(id => !usedTemplates.has(id)) || pool[0];
+        usedTemplates.add(templateId);
+
+        const available = products.filter(p => !usedProducts.has(p.id));
+        const pickFrom = available.length ? available : products;
+        if (!pickFrom.length) {
+          autoSlots.push({
+            time: `${String(hour).padStart(2, "0")}:00`,
+            hourEAT: hour, timeBucket, templateId,
+            slotKind: "promo", skipped: true, reason: "no-products",
+            groupId: group.id,
+            groupName: group.name,
+            productName: null, imageUrl: null,
+            caption: "(no product available)",
+          });
+          continue;
+        }
+        const product = pickFrom[Math.floor(rng() * pickFrom.length)];
+        usedProducts.add(product.id);
+
+        const productUrl = `${autoSettings.siteUrl}/product/${product.slug || product.id}`;
+        const caption = autoPromoFillTemplate(templateId, {
+          product,
+          campaign,
+          groupName: group.name,
+          productUrl,
+        });
+
+        let slot = {
+          time: `${String(hour).padStart(2, "0")}:00`,
+          hourEAT: hour, timeBucket, templateId,
+          slotKind: "promo",
+          groupId: group.id,
+          groupName: group.name,
+          productId: product.id,
+          productName: product.name || "—",
+          imageUrl: productImageUrl(product),
+          caption,
+          skipped: false,
+        };
+
+        slot = applyOverride(slot, overrides);
+        autoSlots.push(slot);
+      }
+    }
+
+    const { dated, recurring } = resolveOccasionsForDate({
+      month, day, weekday: dow, year,
+      movableDates: occSettings.movableDates || {},
+      includeRecurring: !!occSettings.sendRecurring,
+    });
+
+    const occasionSlots = [];
+    for (const group of groups) {
+      for (const occ of [...dated, ...recurring]) {
+        const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
+        if (!message) continue;
+        const isRecurring = !!occ.recurring;
+        const isSensitive = !!occ.sensitive;
+        const baseHour = isRecurring ? 3 : 9;
+        occasionSlots.push({
+          time: `${String(baseHour).padStart(2, "0")}:00`,
+          hourEAT: baseHour,
+          slotKind: isSensitive ? "non-promo" : "occasion",
+          templateId: null,
+          groupId: group.id,
+          groupName: group.name,
+          occasionKey: occ.key,
+          occasionName: occ.name,
+          sensitive: isSensitive,
+          productName: occ.name,
+          imageUrl: null,
+          caption: message,
+          skipped: false,
+        });
+      }
+    }
+
+    const slots = [...autoSlots, ...occasionSlots]
+      .sort((a, b) => {
+        const t = a.time.localeCompare(b.time);
+        if (t !== 0) return t;
+        return (a.groupName || "").localeCompare(b.groupName || "");
+      });
+
+    const expectedPromoSlots = groups.length * autoSlotHours.length;
+
+    return res.json({
+      success: true,
+      date: dateStr,
+      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
+      groupCount: groups.length,
+      perGroupPerDay,
+      autoSlotHours,
+      expectedPromoSlots,
+      promoSlotsReturned: autoSlots.length,
+      occasionSlotsReturned: occasionSlots.length,
+      activeHours: autoSettings.activeHours || { start: 8, end: 21 },
+      overridesLoaded: overrides.size,
+      overridesApplied: autoSlots.filter(s => s.isOverridden).length,
+      slots,
+    });
+  } catch (e) {
+    console.error("❌ /api/admin/auto-promo/preview failed:", e);
+    return sendServerError(res, e, "Preview failed");
+  }
+}
+
+// [NEW v2.10.0] Preview works on POST (v2.6.5 canonical)
+app.post("/api/admin/auto-promo/preview", handleAutoPromoPreview);
+// [NEW v2.10.0] Preview also works on GET (for Daily Preview page)
+app.get("/api/admin/auto-promo/preview", handleAutoPromoPreview);
+
+// Run-now — [v2.6.5]
+app.post("/api/admin/auto-promo/run-now", async (req, res) => {
+  try {
+    const settings = await autoPromoLoadSettings();
+    await autoPromoSaveSettings({ enabled: true }, "admin-run-now");
+    const result = await autoPromoRunTick({
+      WA_MAX_PER_RUN: 3,
+      forceGroupIds: Array.isArray(req.body?.groupIds) ? req.body.groupIds : null,
+      forceProductId: req.body?.productId || null,
+    });
+    await autoPromoSaveSettings({ enabled: !!settings.enabled }, "admin-run-now-restore");
+    return res.json({ success: true, result });
+  } catch (e) {
+    return sendServerError(res, e, "Run-now failed");
+  }
+});
+
+// ── Marketing overrides — [v2.6.5] ──
+app.get("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: "date query param required" });
+    const snap = await db.collection("marketingOverrides")
+      .where("date", "==", date)
+      .get();
+    return res.json({
+      success: true,
+      count: snap.size,
+      overrides: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load overrides");
+  }
+});
+
+app.post("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date, slot, originalProductId, productId, productName, imageUrl, caption, time, skipped, groupId } = req.body || {};
+    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
+
+    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
+    const payload = {
+      date,
+      slot,
+      originalProductId: originalProductId || null,
+      savedAt: admin.firestore.FieldValue.serverTimestamp(),
+      savedBy: req.body?.uid || "admin",
+    };
+    if (groupId !== undefined) payload.groupId = groupId;
+    if (productId !== undefined) payload.productId = productId;
+    if (productName !== undefined) payload.productName = productName;
+    if (imageUrl !== undefined) payload.imageUrl = imageUrl;
+    if (caption !== undefined) payload.caption = caption;
+    if (time !== undefined) payload.time = time;
+    if (skipped !== undefined) payload.skipped = skipped;
+
+    await db.collection("marketingOverrides").doc(key).set(payload, { merge: true });
+    return res.json({ success: true, key, payload });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save override");
+  }
+});
+
+app.delete("/api/admin/marketing-overrides", async (req, res) => {
+  try {
+    const { date, slot, originalProductId } = req.body || {};
+    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
+    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
+    await db.collection("marketingOverrides").doc(key).delete().catch(() => {});
+    return res.json({ success: true, key });
+  } catch (e) {
+    return sendServerError(res, e, "Could not delete override");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// OCCASIONS ADMIN ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+// GET settings + today — [v2.6.5]
+app.get("/api/admin/occasions", async (req, res) => {
+  try {
+    const settings = await occasionLoadSettings();
+    const todayMonth = autoPromoMonthEAT();
+    const todayDay = autoPromoDayEAT();
+    const todayWeekday = autoPromoDowEAT();
+    const today = resolveOccasionsForDate({
+      month: todayMonth, day: todayDay, weekday: todayWeekday,
+      movableDates: settings.movableDates || {},
+      includeRecurring: true,
+    });
+
+    const recent = await db.collection("occasionLogs")
+      .orderBy("sentAt", "desc").limit(30).get().catch(() => ({ docs: [] }));
+
+    return res.json({
+      success: true,
+      settings,
+      today: {
+        dated: today.dated.map(o => ({ key: o.key, name: o.name, sensitive: !!o.sensitive, kind: o.kind })),
+        recurring: today.recurring.map(o => ({ key: o.key, name: o.name, sensitive: !!o.sensitive })),
+      },
+      totalOccasions: OCCASION_LIBRARY.length,
+      movableCount: OCCASION_LIBRARY.filter(o => o.movable).length,
+      recurringCount: OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length,
+      sensitiveCount: OCCASION_LIBRARY.filter(o => o.sensitive === true).length,
+      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load occasions");
+  }
+});
+
+// POST save settings — [v2.6.5]
+app.post("/api/admin/occasions", async (req, res) => {
+  try {
+    const allowed = ["enabled", "sendDated", "sendRecurring", "activeHours", "siteUrl", "movableDates", "allowPromoOnSensitive"];
+    const patch = {};
+    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
+    await occasionSaveSettings(patch, req.body?.uid || "admin");
+    const settings = await occasionLoadSettings();
+    return res.json({ success: true, settings });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save occasion settings");
+  }
+});
+
+// [NEW v2.10.0] Occasion preview handler — shared by GET & POST
+async function handleOccasionPreview(req, res) {
+  try {
+    const src = (req.method === "POST" ? (req.body || {}) : (req.query || {}));
+    const { date = null } = src;
+    const rawGroupIds = req.method === "POST" ? src.groupIds : (src.groupIds ? String(src.groupIds).split(",") : null);
+    const groupIds = Array.isArray(rawGroupIds) ? rawGroupIds : null;
+    const includeRecurring = req.method === "POST"
+      ? (src.includeRecurring !== false)
+      : (src.includeRecurring !== "false");
+
+    const settings = await occasionLoadSettings();
+
+    let groups = [];
+    try {
+      const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
+      const data = await r.json().catch(() => ({}));
+      const list = Array.isArray(data) ? data : (data && typeof data === "object" ? Object.values(data) : []);
+      groups = list
+        .filter(g => g && (g.id || g.chatId) && String(g.id || g.chatId).endsWith("@g.us"))
+        .map(g => ({ id: g.id || g.chatId, name: g.subject || g.name || "(unnamed)" }));
+    } catch (e) {
+      return sendServerError(res, e, "Could not fetch groups");
+    }
+    if (Array.isArray(groupIds) && groupIds.length > 0) {
+      const allowed = new Set(groupIds);
+      groups = groups.filter(g => allowed.has(g.id));
+    }
+
+    const targetDate = date ? new Date(date + "T00:00:00Z") : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const month = targetDate.getUTCMonth() + 1;
+    const day = targetDate.getUTCDate();
+    const weekday = targetDate.getUTCDay();
+    const year = targetDate.getUTCFullYear();
+
+    const { dated, recurring } = resolveOccasionsForDate({
+      month, day, weekday, year,
+      movableDates: settings.movableDates || {},
+      includeRecurring: !!includeRecurring,
+    });
+
+    const buildPreviews = (list) => list.map(occ => {
+      const message = buildOccasionMessage(occ, { shopLink: settings.siteUrl || WEBSITE_URL });
+      return {
+        key: occ.key, name: occ.name, kind: occ.kind,
+        sensitive: !!occ.sensitive, movable: !!occ.movable,
+        preview: message ? message.slice(0, 300) : null,
+      };
+    });
+
+    return res.json({
+      success: true,
+      date: targetDate.toISOString().slice(0, 10),
+      groupCount: groups.length,
+      dated: buildPreviews(dated),
+      recurring: buildPreviews(recurring),
+    });
+  } catch (e) {
+    console.error("❌ /api/admin/occasions/preview failed:", e);
+    return sendServerError(res, e, "Occasion preview failed");
+  }
+}
+
+// [NEW v2.10.0] Occasion preview on both methods
+app.post("/api/admin/occasions/preview", handleOccasionPreview);
+app.get("/api/admin/occasions/preview", handleOccasionPreview);
+
+// Run-now — [v2.6.5]
+app.post("/api/admin/occasions/run-now", async (req, res) => {
+  try {
+    const settings = await occasionLoadSettings();
+    const wasEnabled = settings.enabled;
+    await occasionSaveSettings({ enabled: true }, "admin-occasion-run-now");
+    const result = await occasionRunTick({
+      forceGroups: Array.isArray(req.body?.groupIds)
+        ? req.body.groupIds.map(id => ({ id, name: "(forced)" }))
+        : null,
+      forceOccasionKey: req.body?.occasionKey || null,
+    });
+    await occasionSaveSettings({ enabled: !!wasEnabled }, "admin-occasion-run-now-restore");
+    return res.json({ success: true, result });
+  } catch (e) {
+    return sendServerError(res, e, "Occasion run-now failed");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// WHATSAPP BULK & NOTIFY — [v2.6.5]
+// ═══════════════════════════════════════════════════════════════
+
+// Bulk send-media (Direct Message page) — [v2.6.5]
+app.post("/api/whatsapp/send-media", async (req, res) => {
+  try {
+    const {
+      recipients = [], message = "", mediaUrl = null,
+      mediaType = "image", filename = null, pace = "safe", dryRun = false,
+    } = req.body || {};
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ success: false, message: "recipients[] required" });
+    }
+    if (!message && !mediaUrl) {
+      return res.status(400).json({ success: false, message: "message or mediaUrl required" });
+    }
+    if (recipients.length > 300) {
+      return res.status(400).json({ success: false, message: "Max 300 recipients per batch" });
+    }
+
+    const PACE = {
+      safe:   { base: 6000, jitter: 0.35 },
+      normal: { base: 4000, jitter: 0.30 },
+      fast:   { base: 2500, jitter: 0.25 },
+    };
+    const { base, jitter } = PACE[pace] || PACE.safe;
+    const delay = () => base + Math.floor(base * jitter * (Math.random() * 2 - 1));
+
+    const results = [];
+    const startedAt = Date.now();
+
+    for (let i = 0; i < recipients.length; i++) {
+      const r = recipients[i] || {};
+      const phone = r.phone;
+      const name = r.name || null;
+      const text = personalizeBulkMessage(message, { name });
+
+      if (dryRun) {
+        results.push({ phone, name, status: "validated", message: text.slice(0, 120) + (text.length > 120 ? "…" : "") });
+        continue;
+      }
+
+      try {
+        if (mediaUrl) {
+          const sender = mediaType === "file" ? wahaSendFile : wahaSendImage;
+          await sender({
+            phone,
+            ...(mediaType === "file" ? { fileUrl: mediaUrl } : { imageUrl: mediaUrl }),
+            caption: text, filename,
+          });
+        } else {
+          enqueueWhatsApp(phone, text, { kind: "bulk-text" });
+        }
+        results.push({ phone, name, status: "sent" });
+        console.log(`📤 Bulk ${i + 1}/${recipients.length} → ${phone}`);
+      } catch (e) {
+        results.push({ phone, name, status: "failed", error: e.message || "send failed" });
+        console.error(`❌ Bulk fail → ${phone}:`, e.message);
+      }
+
+      if (i < recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delay()));
+      }
+    }
+
+    const sent = results.filter((x) => x.status === "sent").length;
+    const failed = results.filter((x) => x.status === "failed").length;
+
+    await reDb.collection("bulkWhatsAppLogs").add({
+      total: recipients.length, sent, failed, pace,
+      mediaType: mediaUrl ? mediaType : "text",
+      mediaUrl: mediaUrl || null,
+      messagePreview: String(message).slice(0, 300),
+      durationMs: Date.now() - startedAt,
+      results,
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    return res.json({
+      success: true, total: recipients.length, sent, failed,
+      dryRun: !!dryRun, durationMs: Date.now() - startedAt, results,
+    });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/send-media failed:", e);
+    return sendServerError(res, e, "Bulk WhatsApp send failed");
+  }
+});
+
+// Admin notify-user — [v2.6.5]
+app.post("/api/admin/notify-user", async (req, res) => {
+  try {
+    const { userId, phone, email, title = "MarketMix update", message, kind = "admin-notify" } = req.body || {};
+    if (!userId || !message) {
+      return res.status(400).json({ success: false, message: "userId and message required" });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+
+    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
+    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
+    const caller = callerDoc.data() || {};
+    const isAdmin =
+      caller.role === "admin" || caller.userType === "admin" ||
+      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
+
+    let target = null;
+    let targetDb = "realestate";
+
+    const reTarget = await reDb.collection("users").doc(userId).get();
+    if (reTarget.exists) target = reTarget.data();
+    else {
+      const shopTarget = await db.collection("users").doc(userId).get();
+      if (shopTarget.exists) { target = shopTarget.data(); targetDb = "shop"; }
+    }
+
+    if (!target) return res.status(404).json({ success: false, message: "User not found" });
+
+    const resolvedPhone = phone || target.phoneNumber || target.phone || target.driverProfile?.phone || null;
+    const resolvedEmail = email || target.email || null;
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (resolvedPhone) {
+      whatsappQueued = enqueueWhatsApp(
+        resolvedPhone,
+        `🛍️ MarketMix Kenya\n${title}\n\n${message}`,
+        { kind, userId, sourceDb: targetDb }
+      );
+    }
+
+    if (resolvedEmail) {
+      const html = marketMixEmailShell({
+        preheader: title, eyebrow: "MarketMix Kenya", title,
+        subtitle: "Update from MarketMix",
+        bodyHtml: emailBodyText(message),
+        footerNote: "If this wasn't expected, reply to this email and we'll help.",
+      });
+      emailSent = await sendEmail(resolvedEmail, title, html, "sales");
+    }
+
+    try {
+      await reDb.collection("adminNotifications").add({
+        userId, phone: resolvedPhone || null, email: resolvedEmail || null,
+        title, message, kind, whatsappQueued, emailSent,
+        sentBy: decoded.uid,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!resolvedPhone, hasEmail: !!resolvedEmail });
+  } catch (e) {
+    console.error("❌ Admin notify-user failed:", e);
+    return sendServerError(res, e, "Admin notify failed");
+  }
+});
+
+// Driver approve/reject — [v2.6.5]
+app.post("/api/driver/decision", async (req, res) => {
+  try {
+    const { userId, decision, reason = "" } = req.body || {};
+    if (!userId || !["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ success: false, message: "userId and decision (approve|reject) required" });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+
+    const callerDoc = await reDb.collection("users").doc(decoded.uid).get();
+    if (!callerDoc.exists) return res.status(403).json({ success: false, message: "Admin access required" });
+    const caller = callerDoc.data() || {};
+    const isAdmin =
+      caller.role === "admin" || caller.userType === "admin" ||
+      (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
+
+    const userRef = reDb.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return res.status(404).json({ success: false, message: "Driver not found" });
+    const driver = userSnap.data() || {};
+    const profile = driver.driverProfile || {};
+    const approved = decision === "approve";
+
+    await userRef.update({
+      driverApproved: approved,
+      driverStatus: approved ? "approved" : "rejected",
+      driverRejectionReason: approved ? "" : (reason || "Not specified"),
+      driverReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+      driverReviewedBy: decoded.uid,
+      roles: approved
+        ? Array.from(new Set([...(Array.isArray(driver.roles) ? driver.roles : []), "driver"]))
+        : (Array.isArray(driver.roles) ? driver.roles : []).filter(r => r !== "driver"),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const driverEmail = driver.email || "";
+    const driverPhone = profile.phone || driver.phone || driver.phoneNumber || "";
+    const driverName = driver.name || (driverEmail ? driverEmail.split("@")[0] : "Driver");
+
+    if (approved) {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Your driver account is approved",
+          eyebrow: "MarketMix Moving",
+          title: "You're approved to drive",
+          subtitle: `Welcome aboard, ${driverName}. Your driver account is active.`,
+          bodyHtml: `
+            ${emailBodyText("You can now accept move requests on MarketMix and start earning.")}
+            ${emailSectionLabel("Your driver details")}
+            ${emailInfoCard([
+              ["Vehicle", profile.vehicleId || "—"],
+              ["Plate", profile.plate || "—"],
+              ["License", profile.licenseNumber || "—"],
+              ["Phone", driverPhone || "—"],
+            ])}
+            ${emailBodyText("Open the driver dashboard to see live offers and manage trips.")}
+          `,
+          ctaLabel: "Open driver dashboard",
+          ctaUrl: DRIVER_DASHBOARD_URL,
+          footerNote: "Questions? Reply to this email and we'll help.",
+        });
+        sendEmail(driverEmail, "You're approved · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver approve email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nWelcome ${driverName}!\nYour driver account is APPROVED.\nVehicle: ${profile.vehicleId || "—"}\nPlate: ${profile.plate || "—"}\nOpen dashboard: ${DRIVER_DASHBOARD_URL}`,
+          { kind: "driver-approved", userId }
+        );
+      }
+    } else {
+      if (driverEmail) {
+        const html = marketMixEmailShell({
+          preheader: "Driver application update",
+          eyebrow: "MarketMix Moving",
+          title: "Driver application not approved",
+          subtitle: `Hello ${driverName}, we couldn't approve your driver account at this time.`,
+          bodyHtml: `
+            ${emailBodyText("You can update your details and resubmit at any time.")}
+            ${emailSectionLabel("Reason")}
+            ${emailInfoCard([["Reason", reason || "Not specified"]])}
+            ${emailBodyText("If you believe this is a mistake, reply to this email and we'll review again.")}
+          `,
+          ctaLabel: "Update my details",
+          ctaUrl: DRIVER_ONBOARD_URL,
+          footerNote: "MarketMix Kenya · support@marketmix.site",
+        });
+        sendEmail(driverEmail, "Update on your driver application · MarketMix Moving", html, "moving")
+          .catch(e => console.error("Driver reject email error:", e));
+      }
+      if (driverPhone) {
+        enqueueWhatsApp(driverPhone,
+          `🚚 MarketMix Moving\nHello ${driverName},\nYour driver application was not approved.\nReason: ${reason || "Not specified"}\nUpdate your details at ${DRIVER_ONBOARD_URL}`,
+          { kind: "driver-rejected", userId }
+        );
+      }
+    }
+
+    console.log(`✅ Driver ${userId} → ${approved ? "approved" : "rejected"} (by admin ${decoded.uid})`);
+    return res.json({ success: true, decision, userId });
+  } catch (e) {
+    console.error("❌ Driver decision failed:", e);
+    return sendServerError(res, e, "Driver decision failed");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// WHATSAPP WEBHOOK — [v2.9.0] with token + reply-chain resolution
+// ═══════════════════════════════════════════════════════════════
 app.post("/api/whatsapp/webhook", async (req, res) => {
   res.json({ success: true });
 
@@ -3562,11 +4738,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
     const { keyword, token } = parseKeywordAndToken(rawBody);
 
-    // ── Resolve identity ──────────────────────────────────────────────
-    // Priority:
-    //   1. Token in message → resolve phone + sellerId directly
-    //   2. Reply-chain to a mapped receipt → resolve phone + sellerId
-    //   3. Direct phone in `from` (non-@lid) → use as-is
     let phone = null;
     let receiptSellerId = null;
     let resolutionReason = "direct";
@@ -3601,7 +4772,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       phone = normalizePhoneForWa(String(rawFrom).replace(/@.*$/, ""));
     }
 
-    // ── Unresolved ────────────────────────────────────────────────────
     if (!phone) {
       console.log(
         `⚠️ Unresolved inbound (${resolutionReason}): from=${rawFrom} ` +
@@ -3637,7 +4807,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       `📨 Inbound WA: ${phone} → "${keyword}"${token ? ` (token ${token})` : ""} (via ${resolutionReason})`
     );
 
-    // ── STOP ──────────────────────────────────────────────────────────
     if (UNSUBSCRIBE_KEYWORDS.has(keyword)) {
       const r = await optOutAllSubscriptionsForPhone(phone);
       enqueueWhatsApp(phone, optOutConfirmedWhatsApp(), {
@@ -3659,7 +4828,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       return;
     }
 
-    // ── Subscribe keyword ────────────────────────────────────────────
     if (SUBSCRIBE_KEYWORDS.has(keyword)) {
       const r = await activateAllSubscriptionsForPhone({
         phone,
@@ -3685,7 +4853,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       return;
     }
 
-    // Unknown — log silently
     await db.collection("waInboundLogs").add({
       phone, keyword, action: "unknown",
       rawFrom, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -3695,9 +4862,9 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
   }
 });
 
-// ============================
-// Stock Drop Notification
-// ============================
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.9.0] STOCK DROP ──
+// ═══════════════════════════════════════════════════════════════
 app.post("/api/promo/stock-drop", async (req, res) => {
   try {
     const { productId, sellerId: sellerOverride, maxRecipients = 200 } = req.body || {};
@@ -3798,10 +4965,9 @@ app.post("/api/promo/stock-drop", async (req, res) => {
   }
 });
 
-// ============================
-// Seller-facing customer endpoints
-// ============================
-
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.9.0] SELLER CUSTOMERS ──
+// ═══════════════════════════════════════════════════════════════
 app.get("/api/seller/customers", async (req, res) => {
   try {
     const { sellerId, limit = 200, categoryId = null, subscribedOnly = null } = req.query || {};
@@ -3890,710 +5056,9 @@ app.post("/api/seller/customers/:phone/manual-optout", async (req, res) => {
   }
 });
 
-// ============================
-// ROUTES
-// ============================
-
-app.post("/api/send-proposal-status", async (req, res) => {
-  try {
-    const { to, subject, html, proposalId, studentName, status, notes, amount, institution } = req.body || {};
-    if (!to || !proposalId || !status) {
-      return res.status(400).json({ success: false, message: "Missing required fields" });
-    }
-    const emailHtml = html || marketMixEmailShell({
-      preheader: `Proposal ${status}`,
-      eyebrow: "MarketMix Kenya · Lipa Mdogo Mdogo",
-      title: `Proposal ${status === "approved" ? "Approved ✅" : "Rejected ❌"}`,
-      subtitle: `Hello ${studentName || "Student"}, your installment proposal has been reviewed.`,
-      bodyHtml: `
-        ${emailInfoCard([
-          ["Proposal ID", String(proposalId)],
-          ["Status", status.toUpperCase(), status === "approved"],
-          ["Amount", `KSH ${Number(amount || 0).toLocaleString()}`],
-          ["Institution", institution || "N/A"],
-        ])}
-        ${notes ? emailBodyText(notes) : ""}
-      `,
-      ctaLabel: "Open MarketMix",
-      ctaUrl: MARKETPLACE_URL,
-    });
-
-    const ok = await sendEmail(to, subject || `Proposal ${status}`, emailHtml, "sales");
-    return res.json({ success: ok, message: ok ? "Sent" : "Failed" });
-  } catch (e) {
-    return sendServerError(res, e, "Proposal email failed");
-  }
-});
-
-app.post("/api/stk-push", async (req, res) => {
-  try {
-    const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
-    const amt = parsePositiveNumber(amount);
-    if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
-    if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
-    if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
-    if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
-    if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
-
-    const [firstName, ...rest] = fullName.trim().split(" ");
-    const lastName = rest.join(" ") || "N/A";
-
-    let response;
-    try {
-      response = await intasend.collection().mpesaStkPush({
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        phone_number: phoneNumber,
-        amount: amt,
-        host: BACKEND_HOST,
-        api_ref: orderId,
-      });
-    } catch (intasendErr) {
-      console.error("❌ IntaSend STK failed:", intasendErr?.response || intasendErr);
-      return res.status(502).json({ success: false, message: "Payment provider error" });
-    }
-
-    await db.collection("orders").doc(orderId).set({
-      invoiceId: response?.invoice?.invoice_id || null,
-      status: "STK_PUSH_SENT",
-      totalAmount: amt,
-      userEmail: email,
-      buyerEmail: email,
-      phoneNumber,
-      "shippingDetails.fullName": fullName,
-      "shippingDetails.phoneNumber": phoneNumber,
-      "shippingDetails.email": email,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return res.json({ success: true, data: response });
-  } catch (e) {
-    return sendServerError(res, e, "STK push failed");
-  }
-});
-
-app.post("/api/store/seed", async (req, res) => {
-  try {
-    const { ref, amount, email, fullName, phoneNumber, cart } = req.body || {};
-    if (!ref || !email) return res.status(400).json({ success: false, message: "ref and email required" });
-
-    await db.collection("orders").doc(ref).set({
-      orderId: ref,
-      orderType: "store",
-      totalAmount: Number(amount) || 0,
-      userEmail: email,
-      buyerEmail: email,
-      phoneNumber,
-      shippingDetails: { fullName, phoneNumber, email, deliveryPlace: "TBD" },
-      items: Array.isArray(cart?.items) ? cart.items : [],
-      sellerGroups: Array.isArray(cart?.sellerGroups) ? cart.sellerGroups : [],
-      paymentStatus: "pending",
-      state: "INITIATED",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return res.json({ success: true, ref });
-  } catch (e) {
-    return sendServerError(res, e, "Store seed failed");
-  }
-});
-
-app.post("/api/real-estate/seed", async (req, res) => {
-  try {
-    const { ref, amount, email, fullName, phoneNumber, paymentKind, property, landlord } = req.body || {};
-    if (!ref || !ref.startsWith("PROP_")) {
-      return res.status(400).json({ success: false, message: "ref must start with PROP_" });
-    }
-    if (!property?.id || !landlord?.phone || !email) {
-      return res.status(400).json({ success: false, message: "Missing property/landlord/email" });
-    }
-
-    await db.collection("orders").doc(ref).set({
-      orderId: ref,
-      orderType: "real_estate",
-      isRealEstate: true,
-      paymentKind: paymentKind || "rent",
-      totalAmount: Number(amount) || 0,
-      userEmail: email,
-      buyerEmail: email,
-      buyerName: fullName || "Buyer",
-      phoneNumber,
-      shippingDetails: { fullName, phoneNumber, email },
-      propertyId: property.id,
-      propertyTitle: property.title,
-      propertyLocation: property.location,
-      propertyType: property.type,
-      landlordName: landlord.name,
-      landlordPhone: landlord.phone,
-      paymentStatus: "pending",
-      state: "INITIATED",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return res.json({ success: true, message: "Real estate order seeded", ref });
-  } catch (e) {
-    return sendServerError(res, e, "Real estate seed failed");
-  }
-});
-
-const ALLOWED_SELLER_STATUSES = ["Processing", "Shipped", "Delivered", "Cancelled"];
-
-app.post("/api/seller/update-status", async (req, res) => {
-  try {
-    const { orderId, newStatus } = req.body || {};
-    if (!orderId || !newStatus) {
-      return res.status(400).json({ success: false, message: "orderId and newStatus required" });
-    }
-    if (!ALLOWED_SELLER_STATUSES.includes(newStatus)) {
-      return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${ALLOWED_SELLER_STATUSES.join(", ")}` });
-    }
-
-    const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
-
-    let decoded;
-    try { decoded = await verifyAnyToken(idToken); }
-    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
-
-    const sellerId = decoded.uid;
-
-    const orderRef = db.collection("orders").doc(orderId);
-    const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) {
-      return res.status(404).json({ success: false, message: "Order not found" });
-    }
-    const order = orderSnap.data() || {};
-
-    const involved = Array.isArray(order.involvedSellerIds) ? order.involvedSellerIds : [];
-    if (!involved.includes(sellerId)) {
-      return res.status(403).json({ success: false, message: "You are not a seller on this order" });
-    }
-
-    if (order.paymentStatus !== "paid") {
-      return res.status(400).json({ success: false, message: "Order is not paid — cannot update status" });
-    }
-
-    await orderRef.update({
-      status: newStatus,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      sellerNudgeActive: false,
-      lastStatusUpdateBy: sellerId,
-      lastStatusUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    console.log(`✅ Order ${orderId} status → ${newStatus} by seller ${sellerId}`);
-
-    const buyerPhone =
-      order.phoneNumber || order.shippingDetails?.phoneNumber || order.buyerPhone || null;
-
-    if (buyerPhone) {
-      const customerName =
-        order.shippingDetails?.fullName || order.buyerName || "Customer";
-      enqueueWhatsApp(
-        buyerPhone,
-        buyerStatusUpdateWhatsApp({ customerName, orderId, statusLabel: newStatus }),
-        { kind: "buyer-status-update", orderId, sellerId, status: newStatus }
-      );
-    } else {
-      console.log(`⚠️ Order ${orderId} has no buyer phone — buyer WhatsApp skipped`);
-    }
-
-    if (newStatus === "Cancelled") {
-      try {
-        await db.collection("adminAlerts").add({
-          type: "seller_cancelled_order",
-          orderId, cancelledBy: sellerId, involvedSellerIds: involved,
-          flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      } catch (_) {}
-    }
-
-    return res.json({ success: true, orderId, newStatus, buyerNotified: !!buyerPhone });
-  } catch (e) {
-    console.error("❌ /api/seller/update-status failed:", e);
-    return sendServerError(res, e, "Status update failed");
-  }
-});
-
-app.post("/api/re/welcome", async (req, res) => {
-  try {
-    const {
-      email, name, phone, roleLabel, roleDesc, rolePerks,
-      isSwitch = false, previousRoleLabel = null, ctaLabel, ctaUrl,
-    } = req.body || {};
-
-    if (!email || !email.includes("@")) {
-      return res.status(400).json({ success: false, message: "Valid email required" });
-    }
-    if (!roleLabel) {
-      return res.status(400).json({ success: false, message: "roleLabel required" });
-    }
-
-    const emailSent = await sendRealEstateWelcomeEmail({
-      userEmail: email, userName: name, roleLabel, roleDesc,
-      rolePerks: Array.isArray(rolePerks) ? rolePerks : [],
-      isSwitch: !!isSwitch, previousRoleLabel, ctaLabel, ctaUrl,
-    });
-
-    let whatsappQueued = false;
-    if (phone) {
-      const lines = [
-        `🏠 *MarketMix Real Estates*`,
-        ``,
-        isSwitch
-          ? `Hi ${name || "there"} — you're now a *${roleLabel}*${previousRoleLabel ? ` (was ${previousRoleLabel})` : ""}.`
-          : `*Welcome, ${name || "friend"}!*`,
-        ``,
-        roleDesc ? roleDesc : "",
-        rolePerks && rolePerks.length ? `\n*What you can do:*` : "",
-        ...(Array.isArray(rolePerks) ? rolePerks.map((l) => `• ${l}`) : []),
-        ``,
-        isSwitch
-          ? `Changed by mistake? You can switch back anytime from your Profile page.`
-          : `You can switch your account type anytime from your Profile page.`,
-        ``,
-        `👉 ${ctaUrl || REAL_ESTATE_APP_URL}`,
-      ].filter(Boolean);
-
-      whatsappQueued = enqueueWhatsApp(phone, lines.join("\n"), {
-        kind: isSwitch ? "re-welcome-role-switch" : "re-welcome-signup",
-        roleLabel,
-      });
-    }
-
-    return res.json({ success: true, emailSent, whatsappQueued, isSwitch: !!isSwitch, roleLabel });
-  } catch (e) {
-    console.error("❌ /api/re/welcome failed:", e);
-    return sendServerError(res, e, "Welcome failed");
-  }
-});
-
-app.get("/api/whatsapp/groups", async (req, res) => {
-  try {
-    const r = await wahaFetch("/api/default/groups", { timeoutMs: 20000 });
-    const raw = await r.text();
-    let data = null;
-    try { data = JSON.parse(raw); } catch {}
-
-    if (!r.ok) {
-      console.error(`❌ WAHA /api/default/groups → ${r.status}: ${raw.slice(0, 300)}`);
-      return res.status(r.status).json({
-        success: false, message: "WAHA returned an error",
-        wahaStatus: r.status, wahaBody: raw.slice(0, 500),
-      });
-    }
-
-    let list = [];
-    if (Array.isArray(data)) list = data;
-    else if (data && typeof data === "object") list = Object.values(data);
-
-    const groups = list
-      .filter((c) => c && (c.id || c.chatId) && String(c.id || c.chatId).endsWith("@g.us"))
-      .map((c) => ({
-        id: c.id || c.chatId,
-        name: c.subject || c.name || "(unnamed group)",
-        size: c.size || null,
-      }));
-
-    console.log(`👥 /api/whatsapp/groups → ${groups.length} group(s)`);
-    return res.json({ success: true, count: groups.length, groups });
-  } catch (e) {
-    console.error("❌ /api/whatsapp/groups failed:", e);
-    return sendServerError(res, e, "Could not list groups");
-  }
-});
-
-app.get("/api/admin/auto-promo", async (req, res) => {
-  try {
-    const settings = await autoPromoLoadSettings();
-    const recent = await db.collection("autoPromoLogs")
-      .orderBy("sentAt", "desc").limit(20).get().catch(() => ({ docs: [] }));
-    const campaign = autoPromoGetActiveCampaign();
-    return res.json({
-      success: true,
-      settings,
-      campaign: campaign ? { name: campaign.name, daysToEvent: campaign.daysToEvent } : null,
-      templates: Object.keys(AutoPromoTemplates).map(id => ({ id })),
-      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
-    });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load auto-promo settings");
-  }
-});
-
-app.post("/api/admin/auto-promo", async (req, res) => {
-  try {
-    const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds", "activeCampaignName", "activeFrom", "activeUntil", "activeContentType", "activeSendTimes"];
-    const patch = {};
-    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-    await autoPromoSaveSettings(patch, req.body?.uid || "admin");
-    const settings = await autoPromoLoadSettings();
-    return res.json({ success: true, settings });
-  } catch (e) {
-    return sendServerError(res, e, "Could not save auto-promo settings");
-  }
-});
-
-app.post("/api/admin/auto-promo/run-now", async (req, res) => {
-  try {
-    const settings = await autoPromoLoadSettings();
-    await autoPromoSaveSettings({ enabled: true }, "admin-run-now");
-    const result = await autoPromoRunTick({
-      WA_MAX_PER_RUN: 3,
-      forceGroupIds: Array.isArray(req.body?.groupIds) ? req.body.groupIds : null,
-      forceProductId: req.body?.productId || null,
-    });
-    await autoPromoSaveSettings({ enabled: !!settings.enabled }, "admin-run-now-restore");
-    return res.json({ success: true, result });
-  } catch (e) {
-    return sendServerError(res, e, "Run-now failed");
-  }
-});
-
-app.get("/api/admin/marketing-overrides", async (req, res) => {
-  try {
-    const { date } = req.query;
-    if (!date) return res.status(400).json({ success: false, message: "date query param required" });
-    const snap = await db.collection("marketingOverrides")
-      .where("date", "==", date)
-      .get();
-    return res.json({
-      success: true,
-      count: snap.size,
-      overrides: snap.docs.map(d => ({ id: d.id, ...d.data() })),
-    });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load overrides");
-  }
-});
-
-app.post("/api/admin/marketing-overrides", async (req, res) => {
-  try {
-    const { date, slot, originalProductId, productId, productName, imageUrl, caption, time, skipped, groupId } = req.body || {};
-    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
-
-    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
-    const payload = {
-      date,
-      slot,
-      originalProductId: originalProductId || null,
-      savedAt: admin.firestore.FieldValue.serverTimestamp(),
-      savedBy: req.body?.uid || "admin",
-    };
-    if (groupId !== undefined) payload.groupId = groupId;
-    if (productId !== undefined) payload.productId = productId;
-    if (productName !== undefined) payload.productName = productName;
-    if (imageUrl !== undefined) payload.imageUrl = imageUrl;
-    if (caption !== undefined) payload.caption = caption;
-    if (time !== undefined) payload.time = time;
-    if (skipped !== undefined) payload.skipped = skipped;
-
-    await db.collection("marketingOverrides").doc(key).set(payload, { merge: true });
-    return res.json({ success: true, key, payload });
-  } catch (e) {
-    return sendServerError(res, e, "Could not save override");
-  }
-});
-
-app.delete("/api/admin/marketing-overrides", async (req, res) => {
-  try {
-    const { date, slot, originalProductId } = req.body || {};
-    if (!date || !slot) return res.status(400).json({ success: false, message: "date and slot required" });
-    const key = `${date}_${slot}_${originalProductId || "noplan"}`;
-    await db.collection("marketingOverrides").doc(key).delete().catch(() => {});
-    return res.json({ success: true, key });
-  } catch (e) {
-    return sendServerError(res, e, "Could not delete override");
-  }
-});
-
-app.get("/api/admin/occasions", async (req, res) => {
-  try {
-    const settings = await occasionLoadSettings();
-    const todayMonth = autoPromoMonthEAT();
-    const todayDay = autoPromoDayEAT();
-    const todayWeekday = autoPromoDowEAT();
-    const today = resolveOccasionsForDate({
-      month: todayMonth, day: todayDay, weekday: todayWeekday,
-      movableDates: settings.movableDates || {},
-      includeRecurring: true,
-    });
-
-    const recent = await db.collection("occasionLogs")
-      .orderBy("sentAt", "desc").limit(30).get().catch(() => ({ docs: [] }));
-
-    return res.json({
-      success: true,
-      settings,
-      today: {
-        dated: today.dated.map(o => ({ key: o.key, name: o.name, sensitive: !!o.sensitive, kind: o.kind })),
-        recurring: today.recurring.map(o => ({ key: o.key, name: o.name, sensitive: !!o.sensitive })),
-      },
-      totalOccasions: OCCASION_LIBRARY.length,
-      movableCount: OCCASION_LIBRARY.filter(o => o.movable).length,
-      recurringCount: OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length,
-      sensitiveCount: OCCASION_LIBRARY.filter(o => o.sensitive === true).length,
-      recent: recent.docs.map(d => ({ id: d.id, ...d.data() })),
-    });
-  } catch (e) {
-    return sendServerError(res, e, "Could not load occasions");
-  }
-});
-
-app.post("/api/admin/occasions", async (req, res) => {
-  try {
-    const allowed = ["enabled", "sendDated", "sendRecurring", "activeHours", "siteUrl", "movableDates", "allowPromoOnSensitive"];
-    const patch = {};
-    for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-    await occasionSaveSettings(patch, req.body?.uid || "admin");
-    const settings = await occasionLoadSettings();
-    return res.json({ success: true, settings });
-  } catch (e) {
-    return sendServerError(res, e, "Could not save occasion settings");
-  }
-});
-
-app.post("/api/admin/occasions/run-now", async (req, res) => {
-  try {
-    const settings = await occasionLoadSettings();
-    const wasEnabled = settings.enabled;
-    await occasionSaveSettings({ enabled: true }, "admin-occasion-run-now");
-    const result = await occasionRunTick({
-      forceGroups: Array.isArray(req.body?.groupIds)
-        ? req.body.groupIds.map(id => ({ id, name: "(forced)" }))
-        : null,
-      forceOccasionKey: req.body?.occasionKey || null,
-    });
-    await occasionSaveSettings({ enabled: !!wasEnabled }, "admin-occasion-run-now-restore");
-    return res.json({ success: true, result });
-  } catch (e) {
-    return sendServerError(res, e, "Occasion run-now failed");
-  }
-});
-
-app.post("/api/whatsapp/notify", async (req, res) => {
-  try {
-    const {
-      phone, title, message, imageUrl, imageBase64, filename,
-      mediaType = "image",
-    } = req.body || {};
-
-    if (!phone || !message) {
-      return res.status(400).json({ success: false, message: "phone and message required" });
-    }
-
-    const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
-
-    const incomingImage =
-      (typeof imageUrl === "string" && imageUrl.trim()) ||
-      (typeof imageBase64 === "string" && imageBase64.trim()) ||
-      null;
-
-    const imagePayload = incomingImage ? buildWahaFilePayload(incomingImage, { filename }) : null;
-
-    if (!imagePayload) {
-      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
-      if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
-      return res.json({ success: true, queued: true, mode: "text", phone: normalizeWaChatId(phone) });
-    }
-
-    const normalized = normalizeWaChatId(phone);
-    if (!normalized) {
-      return res.status(400).json({ success: false, message: "Invalid phone number" });
-    }
-
-    try {
-      const isFile = mediaType === "file";
-      const sender = isFile ? wahaSendFile : wahaSendImage;
-
-      await sender({
-        phone: normalized,
-        ...(isFile
-          ? { fileUrl: imagePayload.mode === "url" ? imagePayload.file.url : null,
-              ...(imagePayload.mode === "data"
-                ? { fileUrl: `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }
-                : {}) }
-          : { imageUrl: imagePayload.mode === "url"
-              ? imagePayload.file.url
-              : `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }),
-        caption: body,
-        filename: filename || imagePayload.file.filename,
-      });
-
-      console.log(`🖼️ /api/whatsapp/notify → image sent to ${normalized}`);
-      return res.json({
-        success: true, sent: true, mode: "image",
-        mediaType: isFile ? "file" : "image",
-        phone: normalized,
-      });
-    } catch (imgErr) {
-      console.error(`⚠️ Image send failed for ${normalized}, falling back to text:`, imgErr.message);
-      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify-fallback" });
-      return res.json({
-        success: true, queued, mode: "text-fallback",
-        phone: normalized, imageError: imgErr.message,
-      });
-    }
-  } catch (e) {
-    console.error("❌ /api/whatsapp/notify failed:", e);
-    return sendServerError(res, e, "WhatsApp notify failed");
-  }
-});
-
-app.post("/api/whatsapp/welcome", async (req, res) => {
-  try {
-    const { phone, name } = req.body || {};
-    if (!phone) {
-      return res.status(400).json({ success: false, message: "phone required" });
-    }
-    const queued = enqueueWhatsApp(
-      phone,
-      welcomeSubscriberWhatsApp({ name }),
-      { kind: "welcome-subscriber", phone, hasName: !!name }
-    );
-    if (!queued) {
-      return res.status(400).json({ success: false, message: "Invalid phone number" });
-    }
-    return res.json({ success: true, queued: true });
-  } catch (e) {
-    console.error("❌ /api/whatsapp/welcome failed:", e);
-    return sendServerError(res, e, "Welcome WhatsApp failed");
-  }
-});
-
-app.post("/api/service-request/notify", async (req, res) => {
-  try {
-    const { requestId } = req.body || {};
-    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
-
-    let snap = await db.collection("serviceRequests").doc(requestId).get();
-    let sourceDb = "shop";
-    if (!snap.exists) {
-      snap = await reDb.collection("serviceRequests").doc(requestId).get();
-      sourceDb = "realestate";
-    }
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
-
-    const d = snap.data() || {};
-    const phone = d.userPhone || d.phoneNumber || null;
-    const email = d.userEmail || d.email || null;
-    const status = String(d.status || "new").toUpperCase();
-    const note = d.adminNote || "";
-    const label = d.packageTitle || d.packageId || "Move-in request";
-
-    let whatsappQueued = false;
-    let emailSent = false;
-
-    if (phone) {
-      whatsappQueued = enqueueWhatsApp(
-        phone,
-        `🏠 MarketMix Real Estates\n${label}\nStatus: ${status}${note ? `\n\nNote: ${note}` : ""}`,
-        { kind: "service-request-update", requestId, sourceDb }
-      );
-    }
-
-    if (email) {
-      const html = marketMixEmailShell({
-        preheader: `${label} · ${status}`,
-        eyebrow: "MarketMix Real Estates",
-        title: `${label} update`,
-        subtitle: `Status: ${status}`,
-        bodyHtml: `
-          ${emailSectionLabel("Update")}
-          ${emailInfoCard([
-            ["Request", label],
-            ["Status", status, true],
-            ["Area", d.area || "—"],
-          ])}
-          ${note ? emailBodyText(`<strong>Note from our team:</strong><br/>${note}`) : ""}
-        `,
-        ctaLabel: "Open MarketMix",
-        ctaUrl: REAL_ESTATE_APP_URL,
-      });
-      emailSent = await sendEmail(email, `${label} · ${status}`, html, "bookings");
-    }
-
-    try {
-      await reDb.collection("serviceRequestNotifications").add({
-        requestId, sourceDb, phone, email, whatsappQueued, emailSent, status, note,
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    } catch (_) {}
-
-    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
-  } catch (e) {
-    console.error("❌ service-request/notify failed:", e);
-    return sendServerError(res, e, "Service request notify failed");
-  }
-});
-
-app.post("/api/moving/notify", async (req, res) => {
-  try {
-    const { requestId } = req.body || {};
-    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
-
-    let snap = await reDb.collection("transportRequests").doc(requestId).get();
-    if (!snap.exists) snap = await db.collection("transportRequests").doc(requestId).get();
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
-
-    const d = snap.data() || {};
-    const phone = d.userPhone || d.phoneNumber || d.user?.phone || null;
-    const email = d.userEmail || d.email || null;
-    const statusLabel = String(d.status || "REQUESTED").replace(/_/g, " ").toLowerCase();
-    const quote = d.quotedPrice != null ? `KSh ${Number(d.quotedPrice).toLocaleString("en-KE")}` : "Pending";
-    const driver = d.driverName ? `${d.driverName}${d.driverPhone ? ` · ${d.driverPhone}` : ""}` : "Not yet assigned";
-    const vehicle = d.vehicleLabel || "—";
-    const eta = d.etaMinutes != null ? `${d.etaMinutes} min` : "—";
-
-    let whatsappQueued = false;
-    let emailSent = false;
-
-    if (phone) {
-      whatsappQueued = enqueueWhatsApp(
-        phone,
-        `🚚 MarketMix Moving\nStatus: ${statusLabel.toUpperCase()}\nQuote: ${quote}\nDriver: ${driver}\nVehicle: ${vehicle}\nETA: ${eta}\nTrack: ${MOVING_URL}`,
-        { kind: "moving-admin-update", requestId: snap.id }
-      );
-    }
-
-    if (email) {
-      const html = marketMixEmailShell({
-        preheader: `Your move is ${statusLabel}`,
-        eyebrow: "MarketMix Moving",
-        title: "Move update",
-        subtitle: `Status: ${statusLabel}`,
-        bodyHtml: `
-          ${emailSectionLabel("Update")}
-          ${emailInfoCard([
-            ["Status", statusLabel.toUpperCase(), true],
-            ["Quote", quote],
-            ["Driver", driver],
-            ["Vehicle", vehicle],
-            ["ETA", eta],
-          ])}
-          ${emailBodyText("Open the tracking page for live updates.")}
-        `,
-        ctaLabel: "Open tracking page",
-        ctaUrl: MOVING_URL,
-      });
-      emailSent = await sendEmail(email, `Move update · ${statusLabel}`, html, "moving");
-    }
-
-    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
-  } catch (e) {
-    console.error("❌ moving/notify failed:", e);
-    return sendServerError(res, e, "Moving notify failed");
-  }
-});
-
-// ============================
-// Offline Sale Notify
-// v2.9.0: creates token and includes wa.me link in receipt
-// ============================
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.9.0] OFFLINE SALE NOTIFY ──
+// ═══════════════════════════════════════════════════════════════
 app.post("/api/offline-sale/notify", async (req, res) => {
   try {
     const { orderId } = req.body || {};
@@ -4610,7 +5075,6 @@ app.post("/api/offline-sale/notify", async (req, res) => {
     const phone = order.buyerPhoneNormalized || normalizePhoneForWa(order.buyerPhone);
     const items = Array.isArray(order.items) ? order.items : [];
 
-    // Build subscriptions grouped by seller + category
     let subscriptionsCreated = 0;
     const tuples = new Map();
 
@@ -4662,7 +5126,6 @@ app.post("/api/offline-sale/notify", async (req, res) => {
 
     const sellerId = (order.involvedSellerIds || [])[0] || null;
 
-    // Determine receipt variant
     let receiptVariant = "new";
     if (phone && sellerId) {
       try {
@@ -4696,7 +5159,6 @@ app.post("/api/offline-sale/notify", async (req, res) => {
       } catch {}
     }
 
-    // Create subscribe token for this buyer
     let subscribeLink = null;
     if (phone && subscriptionsCreated > 0 && receiptVariant !== "subscribed") {
       const token = await getOrCreateSubscribeToken({ phone, sellerId, orderId });
@@ -4788,9 +5250,9 @@ app.post("/api/offline-sale/notify", async (req, res) => {
   }
 });
 
-// ============================
-// IntaSend callback
-// ============================
+// ═══════════════════════════════════════════════════════════════
+// INTASEND CALLBACK — [v2.6.5] base + [v2.9.0] quicksale branch
+// ═══════════════════════════════════════════════════════════════
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -4962,7 +5424,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       if (realEstate) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}`,
+            `🏠 MarketMix Real Estates\nPayment confirmed — ${orderData.propertyTitle || "Property"}\nKES ${amountNum.toLocaleString("en-KE")}\nM-Pesa ref: ${mpesa_reference || "—"}\nView receipt: ${REAL_ESTATE_RECEIPT_URL}/${mpesa_reference || api_ref}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
             { kind: "re-buyer", api_ref }
           );
         }
@@ -4975,7 +5437,7 @@ app.post("/api/intasend-callback", async (req, res) => {
       } else if (moving) {
         if (payerPhone) {
           enqueueWhatsApp(payerPhone,
-            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}`,
+            `🚚 MarketMix Moving\nYour move is confirmed\nRef: ${shortRef}\nAmount: KES ${amountNum.toLocaleString("en-KE")}\nTrack it: ${MOVING_URL}\n\n👥 *Join our WhatsApp group:*\n${WHATSAPP_GROUP_URL}`,
             { kind: "moving-paid", api_ref }
           );
         }
@@ -5064,6 +5526,9 @@ app.post("/api/intasend-callback", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.6.5] Ad transaction lookup ──
+// ═══════════════════════════════════════════════════════════════
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
   try {
@@ -5132,6 +5597,7 @@ app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   }
 });
 
+// ── [v2.6.5] Transaction lookup ──
 app.get("/api/transaction/:invoiceId", async (req, res) => {
   try {
     const invoiceId = req.params.invoiceId;
@@ -5144,6 +5610,7 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
   }
 });
 
+// ── [v2.6.5] Seller withdraw ──
 app.post("/api/seller/withdraw", async (req, res) => {
   try {
     const { sellerId, amount: requestedAmount, phoneNumber } = req.body || {};
@@ -5238,6 +5705,7 @@ app.post("/api/seller/withdraw", async (req, res) => {
   }
 });
 
+// ── [v2.6.5] PIN recovery ──
 app.post("/api/seller/recover-pin", async (req, res) => {
   try {
     const { email, userId } = req.body || {};
@@ -5341,6 +5809,7 @@ app.post("/api/seller/reset-pin", async (req, res) => {
   }
 });
 
+// ── [v2.6.5] Update stock ──
 app.post("/api/update-stock", async (req, res) => {
   try {
     const {
@@ -5382,6 +5851,7 @@ app.post("/api/update-stock", async (req, res) => {
   }
 });
 
+// ── [v2.6.5] AI image generation ──
 app.post("/api/generate-ai-image", async (req, res) => {
   try {
     const prompt = (req.body && req.body.prompt) || "";
@@ -5415,6 +5885,10 @@ app.post("/api/generate-ai-image", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.6.5] TEST ENDPOINTS ──
+// ═══════════════════════════════════════════════════════════════
+
 app.get("/api/test-email-auth", async (req, res) => {
   res.json({
     success: !!BREVO_API_KEY,
@@ -5424,6 +5898,186 @@ app.get("/api/test-email-auth", async (req, res) => {
   });
 });
 
+app.post("/api/test-proposal-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const html = marketMixEmailShell({
+    preheader: "Test proposal email",
+    eyebrow: "MarketMix Kenya",
+    title: "Test Proposal Email",
+    subtitle: "This is a test from the proposal status system.",
+    bodyHtml: emailBodyText("If you received this, the pipeline is working."),
+  });
+  const ok = await sendEmail(testEmail, "Test Proposal Email", html, "sales");
+  res.json({ success: ok, to: testEmail });
+});
+
+app.post("/api/test-real-estate-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "PROP_TEST_" + Date.now();
+  const ok = await sendRealEstatePaymentEmail({
+    propertyTitle: "Spacious Bedsitter - Kilimani",
+    propertyLocation: "Kilimani, Nairobi",
+    propertyType: "For Rent",
+    totalAmount: 4000,
+    mpesaReference: "UJ8NN93LWY",
+    buyerName: "Test Buyer",
+    landlordName: "Test Landlord",
+    landlordPhone: "254712345678",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
+});
+
+app.post("/api/test-moving-email", async (req, res) => {
+  const testEmail = req.body?.email || "test@example.com";
+  const ref = "MOVE_TEST_" + Date.now();
+  const ok = await sendMovingConfirmationEmail({
+    userName: "Test User",
+    pickupLabel: "Kilimani, Nairobi",
+    pickupCoordinates: { lat: -1.2921, lng: 36.8219 },
+    destinationLabel: "Westlands, Nairobi",
+    destinationTitle: "2 Bedroom Apartment",
+    destinationCoordinates: { lat: -1.2674, lng: 36.8109 },
+    vehicleLabel: "Pickup",
+    itemCount: 12,
+    items: { bed: 1, sofa: 1, box: 10 },
+    quotedPrice: 4500,
+    status: "REQUESTED",
+  }, testEmail, ref);
+  res.json({ success: ok, to: testEmail });
+});
+
+app.post("/api/test-store-whatsapp", async (req, res) => {
+  try {
+    const { phone, customerName = "Test Customer", amount = 2500, paymentReference = "TEST_REF_123", orderId = "TEST_ORDER_456" } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+
+    const queued1 = enqueueWhatsApp(
+      phone,
+      storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }),
+      { kind: "test-store-payment" }
+    );
+    const queued2 = enqueueWhatsApp(
+      phone,
+      storeOrderConfirmedWhatsApp({ customerName, orderId, paymentStatus: "Paid", orderStatus: "Processing" }),
+      { kind: "test-store-order" }
+    );
+
+    return res.json({ success: queued1 && queued2, queued1, queued2 });
+  } catch (e) {
+    return sendServerError(res, e, "Test store WhatsApp failed");
+  }
+});
+
+app.post("/api/test-seller-flow-whatsapp", async (req, res) => {
+  try {
+    const {
+      sellerPhone, buyerPhone,
+      sellerName = "Test Seller", buyerName = "Test Buyer",
+      orderId = "TEST_ORDER_789",
+      sellerRevenue = 3500,
+      itemSummary = "Sneakers x1, Cap x2",
+    } = req.body || {};
+
+    const results = {};
+
+    if (sellerPhone) {
+      results.newOrderQueued = enqueueWhatsApp(
+        sellerPhone,
+        sellerNewOrderWhatsApp({ sellerName, orderId, buyerName, sellerRevenue, itemSummary, itemCount: 2 }),
+        { kind: "test-seller-new-order" }
+      );
+      results.reminderQueued = enqueueWhatsApp(
+        sellerPhone,
+        sellerReminderWhatsApp({ sellerName, orderId, buyerName, hoursSince: 6, nudgeNumber: 1, maxNudges: 4 }),
+        { kind: "test-seller-reminder" }
+      );
+    }
+
+    if (buyerPhone) {
+      results.statusUpdateQueued = enqueueWhatsApp(
+        buyerPhone,
+        buyerStatusUpdateWhatsApp({ customerName: buyerName, orderId, statusLabel: "Shipped" }),
+        { kind: "test-buyer-status-update" }
+      );
+    }
+
+    return res.json({ success: true, results });
+  } catch (e) {
+    return sendServerError(res, e, "Test seller flow WhatsApp failed");
+  }
+});
+
+app.post("/api/test-quicksale-whatsapp", async (req, res) => {
+  try {
+    const {
+      sellerPhone, buyerPhone,
+      sellerName = "Test Seller", customerName = "Walk-in Customer",
+      itemSummary = "Nike Air x1", amount = 3500,
+      paymentReference = "TEST_QS_123",
+      sellerShop = "Test Shop",
+    } = req.body || {};
+
+    const results = {};
+
+    if (buyerPhone) {
+      results.buyerQueued = enqueueWhatsApp(
+        buyerPhone,
+        quicksaleBuyerWhatsApp({ customerName, itemSummary, amount, paymentReference, sellerShop }),
+        { kind: "test-quicksale-buyer" }
+      );
+    }
+
+    if (sellerPhone) {
+      results.sellerQueued = enqueueWhatsApp(
+        sellerPhone,
+        quicksaleSellerWhatsApp({
+          sellerName, itemSummary, amount, paymentReference, customerName,
+          customerPhone: buyerPhone || "—",
+        }),
+        { kind: "test-quicksale-seller" }
+      );
+    }
+
+    return res.json({ success: true, results });
+  } catch (e) {
+    return sendServerError(res, e, "Test quicksale WhatsApp failed");
+  }
+});
+
+app.post("/api/test-welcome-whatsapp", async (req, res) => {
+  try {
+    const { phone, name = "Test Subscriber" } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    const queued = enqueueWhatsApp(
+      phone,
+      welcomeSubscriberWhatsApp({ name }),
+      { kind: "test-welcome-subscriber" }
+    );
+    return res.json({ success: queued, queued });
+  } catch (e) {
+    return sendServerError(res, e, "Test welcome WhatsApp failed");
+  }
+});
+
+app.post("/api/test-whatsapp-notify-image", async (req, res) => {
+  try {
+    const { phone, title = "Image test", message = "Test image message", imageUrl } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone required" });
+    if (!imageUrl) return res.status(400).json({ success: false, message: "imageUrl required" });
+
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/whatsapp/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone, title, message, imageUrl }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.json({ success: r.ok, forwarded: data });
+  } catch (e) {
+    return sendServerError(res, e, "Test notify-image failed");
+  }
+});
+
+// ── [v2.9.0] test offline receipt ──
 app.post("/api/test-offline-sale-whatsapp", async (req, res) => {
   try {
     const {
@@ -5479,11 +6133,229 @@ app.post("/api/test-subscription-confirm-whatsapp", async (req, res) => {
   }
 });
 
-// ============================
-// v2.9.0 Diagnostics
-// ============================
+// ═══════════════════════════════════════════════════════════════
+// GENERIC WA NOTIFY & WELCOME — [v2.6.5]
+// ═══════════════════════════════════════════════════════════════
+app.post("/api/whatsapp/notify", async (req, res) => {
+  try {
+    const {
+      phone, title, message, imageUrl, imageBase64, filename,
+      mediaType = "image",
+    } = req.body || {};
 
-// Inspect unresolved LIDs + fallback cooldowns
+    if (!phone || !message) {
+      return res.status(400).json({ success: false, message: "phone and message required" });
+    }
+
+    const body = title ? `🛍️ MarketMix Kenya\n${title}\n\n${message}` : String(message);
+
+    const incomingImage =
+      (typeof imageUrl === "string" && imageUrl.trim()) ||
+      (typeof imageBase64 === "string" && imageBase64.trim()) ||
+      null;
+
+    const imagePayload = incomingImage ? buildWahaFilePayload(incomingImage, { filename }) : null;
+
+    if (!imagePayload) {
+      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify" });
+      if (!queued) return res.status(400).json({ success: false, message: "Invalid phone number" });
+      return res.json({ success: true, queued: true, mode: "text", phone: normalizeWaChatId(phone) });
+    }
+
+    const normalized = normalizeWaChatId(phone);
+    if (!normalized) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+
+    try {
+      const isFile = mediaType === "file";
+      const sender = isFile ? wahaSendFile : wahaSendImage;
+
+      await sender({
+        phone: normalized,
+        ...(isFile
+          ? { fileUrl: imagePayload.mode === "url" ? imagePayload.file.url : null,
+              ...(imagePayload.mode === "data"
+                ? { fileUrl: `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }
+                : {}) }
+          : { imageUrl: imagePayload.mode === "url"
+              ? imagePayload.file.url
+              : `data:${imagePayload.file.mimetype};base64,${imagePayload.file.data}` }),
+        caption: body,
+        filename: filename || imagePayload.file.filename,
+      });
+
+      console.log(`🖼️ /api/whatsapp/notify → image sent to ${normalized}`);
+      return res.json({
+        success: true, sent: true, mode: "image",
+        mediaType: isFile ? "file" : "image",
+        phone: normalized,
+      });
+    } catch (imgErr) {
+      console.error(`⚠️ Image send failed for ${normalized}, falling back to text:`, imgErr.message);
+      const queued = enqueueWhatsApp(phone, body, { kind: "generic-notify-fallback" });
+      return res.json({
+        success: true, queued, mode: "text-fallback",
+        phone: normalized, imageError: imgErr.message,
+      });
+    }
+  } catch (e) {
+    console.error("❌ /api/whatsapp/notify failed:", e);
+    return sendServerError(res, e, "WhatsApp notify failed");
+  }
+});
+
+app.post("/api/whatsapp/welcome", async (req, res) => {
+  try {
+    const { phone, name } = req.body || {};
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "phone required" });
+    }
+    const queued = enqueueWhatsApp(
+      phone,
+      welcomeSubscriberWhatsApp({ name }),
+      { kind: "welcome-subscriber", phone, hasName: !!name }
+    );
+    if (!queued) {
+      return res.status(400).json({ success: false, message: "Invalid phone number" });
+    }
+    return res.json({ success: true, queued: true });
+  } catch (e) {
+    console.error("❌ /api/whatsapp/welcome failed:", e);
+    return sendServerError(res, e, "Welcome WhatsApp failed");
+  }
+});
+
+// ── [v2.6.5] Service request notify ──
+app.post("/api/service-request/notify", async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
+
+    let snap = await db.collection("serviceRequests").doc(requestId).get();
+    let sourceDb = "shop";
+    if (!snap.exists) {
+      snap = await reDb.collection("serviceRequests").doc(requestId).get();
+      sourceDb = "realestate";
+    }
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const d = snap.data() || {};
+    const phone = d.userPhone || d.phoneNumber || null;
+    const email = d.userEmail || d.email || null;
+    const status = String(d.status || "new").toUpperCase();
+    const note = d.adminNote || "";
+    const label = d.packageTitle || d.packageId || "Move-in request";
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (phone) {
+      whatsappQueued = enqueueWhatsApp(
+        phone,
+        `🏠 MarketMix Real Estates\n${label}\nStatus: ${status}${note ? `\n\nNote: ${note}` : ""}`,
+        { kind: "service-request-update", requestId, sourceDb }
+      );
+    }
+
+    if (email) {
+      const html = marketMixEmailShell({
+        preheader: `${label} · ${status}`,
+        eyebrow: "MarketMix Real Estates",
+        title: `${label} update`,
+        subtitle: `Status: ${status}`,
+        bodyHtml: `
+          ${emailSectionLabel("Update")}
+          ${emailInfoCard([
+            ["Request", label],
+            ["Status", status, true],
+            ["Area", d.area || "—"],
+          ])}
+          ${note ? emailBodyText(`<strong>Note from our team:</strong><br/>${note}`) : ""}
+        `,
+        ctaLabel: "Open MarketMix",
+        ctaUrl: REAL_ESTATE_APP_URL,
+      });
+      emailSent = await sendEmail(email, `${label} · ${status}`, html, "bookings");
+    }
+
+    try {
+      await reDb.collection("serviceRequestNotifications").add({
+        requestId, sourceDb, phone, email, whatsappQueued, emailSent, status, note,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
+  } catch (e) {
+    console.error("❌ service-request/notify failed:", e);
+    return sendServerError(res, e, "Service request notify failed");
+  }
+});
+
+// ── [v2.6.5] Moving notify ──
+app.post("/api/moving/notify", async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    if (!requestId) return res.status(400).json({ success: false, message: "requestId required" });
+
+    let snap = await reDb.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) snap = await db.collection("transportRequests").doc(requestId).get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const d = snap.data() || {};
+    const phone = d.userPhone || d.phoneNumber || d.user?.phone || null;
+    const email = d.userEmail || d.email || null;
+    const statusLabel = String(d.status || "REQUESTED").replace(/_/g, " ").toLowerCase();
+    const quote = d.quotedPrice != null ? `KSh ${Number(d.quotedPrice).toLocaleString("en-KE")}` : "Pending";
+    const driver = d.driverName ? `${d.driverName}${d.driverPhone ? ` · ${d.driverPhone}` : ""}` : "Not yet assigned";
+    const vehicle = d.vehicleLabel || "—";
+    const eta = d.etaMinutes != null ? `${d.etaMinutes} min` : "—";
+
+    let whatsappQueued = false;
+    let emailSent = false;
+
+    if (phone) {
+      whatsappQueued = enqueueWhatsApp(
+        phone,
+        `🚚 MarketMix Moving\nStatus: ${statusLabel.toUpperCase()}\nQuote: ${quote}\nDriver: ${driver}\nVehicle: ${vehicle}\nETA: ${eta}\nTrack: ${MOVING_URL}`,
+        { kind: "moving-admin-update", requestId: snap.id }
+      );
+    }
+
+    if (email) {
+      const html = marketMixEmailShell({
+        preheader: `Your move is ${statusLabel}`,
+        eyebrow: "MarketMix Moving",
+        title: "Move update",
+        subtitle: `Status: ${statusLabel}`,
+        bodyHtml: `
+          ${emailSectionLabel("Update")}
+          ${emailInfoCard([
+            ["Status", statusLabel.toUpperCase(), true],
+            ["Quote", quote],
+            ["Driver", driver],
+            ["Vehicle", vehicle],
+            ["ETA", eta],
+          ])}
+          ${emailBodyText("Open the tracking page for live updates.")}
+        `,
+        ctaLabel: "Open tracking page",
+        ctaUrl: MOVING_URL,
+      });
+      emailSent = await sendEmail(email, `Move update · ${statusLabel}`, html, "moving");
+    }
+
+    return res.json({ success: true, whatsappQueued, emailSent, hasPhone: !!phone, hasEmail: !!email });
+  } catch (e) {
+    console.error("❌ moving/notify failed:", e);
+    return sendServerError(res, e, "Moving notify failed");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── [v2.9.0] ADMIN DIAGNOSTICS ──
+// ═══════════════════════════════════════════════════════════════
 app.get("/api/admin/unresolved-lids", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
@@ -5504,7 +6376,6 @@ app.get("/api/admin/unresolved-lids", async (req, res) => {
   }
 });
 
-// Lookup a subscribe token (for support)
 app.get("/api/admin/subscribe-tokens/:token", async (req, res) => {
   try {
     const { token } = req.params || {};
@@ -5518,7 +6389,6 @@ app.get("/api/admin/subscribe-tokens/:token", async (req, res) => {
   }
 });
 
-// Manually mint a token for a buyer (support use)
 app.post("/api/admin/subscribe-tokens", async (req, res) => {
   try {
     const { phone, sellerId = null } = req.body || {};
@@ -5538,13 +6408,271 @@ app.post("/api/admin/subscribe-tokens", async (req, res) => {
   }
 });
 
-// ============================
-// HEALTH
-// ============================
+// ═══════════════════════════════════════════════════════════════
+// ── [NEW v2.10.0] ANNUAL CALENDAR ──
+// GET /api/admin/marketing/calendar?year=YYYY
+// Returns all campaigns + occasions for the given year.
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/marketing/calendar", async (req, res) => {
+  try {
+    const year = Number(req.query.year) || autoPromoNowEAT().getUTCFullYear();
+    const settings = await occasionLoadSettings();
+
+    const campaigns = AUTO_PROMO_CAMPAIGNS.map(c => ({
+      name: c.name,
+      startsOn: `${year}-${String(c.startMonth).padStart(2, "0")}-${String(c.startDay).padStart(2, "0")}`,
+      endsOn: `${year}-${String(c.endMonth).padStart(2, "0")}-${String(c.endDay).padStart(2, "0")}`,
+      eventOn: `${year}-${String(c.eventMonth).padStart(2, "0")}-${String(c.eventDay).padStart(2, "0")}`,
+    }));
+
+    const occasions = OCCASION_LIBRARY.map(o => {
+      if (o.recurring === "weekly") {
+        return {
+          key: o.key, name: o.name, kind: o.kind,
+          recurring: "weekly", weekday: o.weekday,
+          sensitive: !!o.sensitive,
+        };
+      }
+      if (o.movable) {
+        const mv = (settings.movableDates || {})[o.key];
+        return {
+          key: o.key, name: o.name, kind: o.kind,
+          movable: true, sensitive: !!o.sensitive,
+          resolvedDate: mv && mv.month && mv.day
+            ? `${year}-${String(mv.month).padStart(2, "0")}-${String(mv.day).padStart(2, "0")}`
+            : null,
+        };
+      }
+      return {
+        key: o.key, name: o.name, kind: o.kind,
+        date: `${year}-${String(o.month).padStart(2, "0")}-${String(o.day).padStart(2, "0")}`,
+        sensitive: !!o.sensitive,
+      };
+    });
+
+    return res.json({ success: true, year, campaigns, occasions });
+  } catch (e) {
+    return sendServerError(res, e, "Could not build calendar");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── [NEW v2.10.0] CAMPAIGNS CRUD ──
+// Stored overrides at platformSettings/campaigns
+// Falls back to built-in AUTO_PROMO_CAMPAIGNS when unset.
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/campaigns", async (req, res) => {
+  try {
+    const snap = await db.collection("platformSettings").doc("campaigns").get();
+    const stored = snap.exists ? (snap.data()?.list || null) : null;
+    return res.json({
+      success: true,
+      source: stored ? "firestore" : "builtin",
+      count: (stored || AUTO_PROMO_CAMPAIGNS).length,
+      campaigns: stored || AUTO_PROMO_CAMPAIGNS,
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load campaigns");
+  }
+});
+
+app.post("/api/admin/campaigns", async (req, res) => {
+  try {
+    const { list, uid = "admin" } = req.body || {};
+    if (!Array.isArray(list)) return res.status(400).json({ success: false, message: "list[] required" });
+    for (const c of list) {
+      if (
+        !c.name ||
+        !Number.isInteger(c.startMonth) || !Number.isInteger(c.startDay) ||
+        !Number.isInteger(c.endMonth)   || !Number.isInteger(c.endDay) ||
+        !Number.isInteger(c.eventMonth) || !Number.isInteger(c.eventDay)
+      ) {
+        return res.status(400).json({ success: false, message: "Each campaign needs name + start/end/event month+day (integers)" });
+      }
+    }
+    await db.collection("platformSettings").doc("campaigns").set({
+      list,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: uid,
+    }, { merge: true });
+    return res.json({ success: true, count: list.length });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save campaigns");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── [NEW v2.10.0] CONTENT LIBRARY CRUD ──
+// Stored at platformSettings/contentLibrary
+// Returns template IDs from the built-in map plus any
+// admin-supplied overrides (subject/caption text).
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/content-library", async (req, res) => {
+  try {
+    const snap = await db.collection("platformSettings").doc("contentLibrary").get();
+    const overrides = snap.exists ? (snap.data()?.overrides || {}) : {};
+    const ids = Object.keys(AutoPromoTemplates);
+    const library = ids.map(id => ({
+      id,
+      hasOverride: Object.prototype.hasOwnProperty.call(overrides, id),
+      override: overrides[id] || null,
+    }));
+    return res.json({ success: true, count: ids.length, templates: library });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load content library");
+  }
+});
+
+app.post("/api/admin/content-library", async (req, res) => {
+  try {
+    const { templateId, override = null, uid = "admin" } = req.body || {};
+    if (!templateId || !Object.prototype.hasOwnProperty.call(AutoPromoTemplates, templateId)) {
+      return res.status(400).json({ success: false, message: "Unknown templateId" });
+    }
+    const ref = db.collection("platformSettings").doc("contentLibrary");
+    const snap = await ref.get();
+    const current = snap.exists ? (snap.data()?.overrides || {}) : {};
+    if (override === null) {
+      delete current[templateId];
+    } else {
+      current[templateId] = {
+        caption: override.caption || null,
+        notes: override.notes || null,
+        updatedAt: new Date().toISOString(),
+        updatedBy: uid,
+      };
+    }
+    await ref.set({
+      overrides: current,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: uid,
+    }, { merge: true });
+    return res.json({ success: true, templateId, cleared: override === null });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save content library override");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── [NEW v2.10.0] DELIVERY LOGS ──
+// GET /api/admin/delivery-logs?kind=promo|occasion|inbound|all&limit=100
+// Unified reader across autoPromoLogs, occasionLogs, waInboundLogs.
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/delivery-logs", async (req, res) => {
+  try {
+    const kind = String(req.query.kind || "all").toLowerCase();
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+
+    const reads = [];
+    if (kind === "all" || kind === "promo") {
+      reads.push(
+        db.collection("autoPromoLogs").orderBy("sentAt", "desc").limit(limit)
+          .get().catch(() => ({ docs: [] }))
+          .then(snap => snap.docs.map(d => ({ type: "promo", id: d.id, ...d.data() })))
+      );
+    } else {
+      reads.push(Promise.resolve([]));
+    }
+    if (kind === "all" || kind === "occasion") {
+      reads.push(
+        db.collection("occasionLogs").orderBy("sentAt", "desc").limit(limit)
+          .get().catch(() => ({ docs: [] }))
+          .then(snap => snap.docs.map(d => ({ type: "occasion", id: d.id, ...d.data() })))
+      );
+    } else {
+      reads.push(Promise.resolve([]));
+    }
+    if (kind === "all" || kind === "inbound") {
+      reads.push(
+        db.collection("waInboundLogs").orderBy("loggedAt", "desc").limit(limit)
+          .get().catch(() => ({ docs: [] }))
+          .then(snap => snap.docs.map(d => ({ type: "inbound", id: d.id, ...d.data() })))
+      );
+    } else {
+      reads.push(Promise.resolve([]));
+    }
+
+    const [promo, occasion, inbound] = await Promise.all(reads);
+    const merged = [...promo, ...occasion, ...inbound]
+      .sort((a, b) => {
+        const ta = (a.sentAt || a.loggedAt)?.toDate?.()?.getTime?.() || 0;
+        const tb = (b.sentAt || b.loggedAt)?.toDate?.()?.getTime?.() || 0;
+        return tb - ta;
+      })
+      .slice(0, limit);
+
+    return res.json({
+      success: true,
+      kind,
+      limit,
+      counts: { promo: promo.length, occasion: occasion.length, inbound: inbound.length },
+      logs: merged,
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load delivery logs");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── [NEW v2.10.0] STICKER STUDIO ──
+// POST /api/admin/sticker-studio         → create sticker
+// GET  /api/admin/sticker-studio         → list stickers
+// DELETE /api/admin/sticker-studio/:id   → delete sticker
+// Stickers stored at stickerStudio/{id} with a data URL or external URL.
+// ═══════════════════════════════════════════════════════════════
+app.get("/api/admin/sticker-studio", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 300);
+    const snap = await db.collection("stickerStudio")
+      .orderBy("createdAt", "desc").limit(limit)
+      .get().catch(() => ({ docs: [] }));
+    return res.json({
+      success: true,
+      count: snap.docs.length,
+      stickers: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not load stickers");
+  }
+});
+
+app.post("/api/admin/sticker-studio", async (req, res) => {
+  try {
+    const { name, imageUrl, tags = [], uid = "admin" } = req.body || {};
+    if (!name || !imageUrl) {
+      return res.status(400).json({ success: false, message: "name and imageUrl required" });
+    }
+    const ref = await db.collection("stickerStudio").add({
+      name: String(name).slice(0, 80),
+      imageUrl: String(imageUrl),
+      tags: Array.isArray(tags) ? tags.slice(0, 10) : [],
+      createdBy: uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ success: true, id: ref.id });
+  } catch (e) {
+    return sendServerError(res, e, "Could not save sticker");
+  }
+});
+
+app.delete("/api/admin/sticker-studio/:id", async (req, res) => {
+  try {
+    const { id } = req.params || {};
+    if (!id) return res.status(400).json({ success: false, message: "id required" });
+    await db.collection("stickerStudio").doc(id).delete();
+    return res.json({ success: true, id });
+  } catch (e) {
+    return sendServerError(res, e, "Could not delete sticker");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── HEALTH ──
+// ═══════════════════════════════════════════════════════════════
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.9.0",
+    version: "v2.10.0",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
@@ -5552,71 +6680,176 @@ app.get("/_health", (req, res) => {
       marketplace: MARKETPLACE_URL,
       website: WEBSITE_URL,
       products: PRODUCTS_URL,
+      orderReceiptBase: ORDER_RECEIPT_BASE,
       whatsappGroup: WHATSAPP_GROUP_URL,
+      realEstateApp: REAL_ESTATE_APP_URL,
+      realEstateReceipt: REAL_ESTATE_RECEIPT_URL,
+      moving: MOVING_URL,
+      driverDashboard: DRIVER_DASHBOARD_URL,
+      driverOnboard: DRIVER_ONBOARD_URL,
       sellerDashboard: SELLER_DASHBOARD_URL,
       waBusinessNumber: WA_BUSINESS_NUMBER,
     },
+    senders: SENDERS,
     whatsappQueue: waQueue.length,
+    nudgeScheduler: { scanMs: NUDGE_SCAN_MS, intervalMs: NUDGE_INTERVAL_MS, maxNudges: NUDGE_MAX },
+    autoPromo: {
+      enabled: true,
+      endpoints: [
+        "GET  /api/admin/auto-promo",
+        "POST /api/admin/auto-promo",
+        "GET  /api/admin/auto-promo/preview",
+        "POST /api/admin/auto-promo/preview",
+        "POST /api/admin/auto-promo/run-now",
+        "GET  /api/admin/marketing-overrides",
+        "POST /api/admin/marketing-overrides",
+        "DELETE /api/admin/marketing-overrides",
+      ],
+      templates: Object.keys(AutoPromoTemplates),
+      campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
+    },
+    occasions: {
+      enabled: true,
+      endpoints: [
+        "GET  /api/admin/occasions",
+        "POST /api/admin/occasions",
+        "GET  /api/admin/occasions/preview",
+        "POST /api/admin/occasions/preview",
+        "POST /api/admin/occasions/run-now",
+      ],
+      totalOccasions: OCCASION_LIBRARY.length,
+    },
     buyerSubscriptions: {
       enabled: true,
       collection: "buyerSubscriptions",
       keyPattern: "{phone}_{sellerId}_{categoryId}",
-      categoryIdMode: "slug-from-category-string",
       subscribeKeywords: [...SUBSCRIBE_KEYWORDS],
       unsubscribeKeywords: [...UNSUBSCRIBE_KEYWORDS],
-      sellerScopedActivation: true,
-      alreadySubscribedAck: true,
       tokenSystem: {
         enabled: true,
         collection: "subscribeTokens",
         ttlDays: SUBSCRIBE_TOKEN_TTL_DAYS,
         tokenLength: 8,
         waLinkFormat: `https://wa.me/${WA_BUSINESS_NUMBER}?text=STOCK%20<token>`,
-        parseFormat: '"STOCK <token>" or "STOP <token>"',
       },
       lidResolution: {
         enabled: true,
-        messageMapCollection: "whatsappMessageMap",
-        unresolvedLogCollection: "waUnresolvedLids",
-        stockFallbackCollection: "waFallbackCooldowns",
-        stopFallbackCollection: "waStopFallbackCooldowns",
         fallbackSchedule: {
           firstSendHours: LID_FALLBACK_COOLDOWN_HOURS,
           repeatHours: LID_FALLBACK_REPEAT_HOURS,
           maxSends: LID_FALLBACK_MAX_SENDS,
         },
-        replyChainReturnsSellerId: true,
       },
-      endpoints: [
+    },
+    endpoints: {
+      autoPromo: [
+        "GET  /api/admin/auto-promo",
+        "POST /api/admin/auto-promo",
+        "GET  /api/admin/auto-promo/preview",
+        "POST /api/admin/auto-promo/preview",
+        "POST /api/admin/auto-promo/run-now",
+        "GET  /api/admin/marketing-overrides",
+        "POST /api/admin/marketing-overrides",
+        "DELETE /api/admin/marketing-overrides",
+      ],
+      occasions: [
+        "GET  /api/admin/occasions",
+        "POST /api/admin/occasions",
+        "GET  /api/admin/occasions/preview",
+        "POST /api/admin/occasions/preview",
+        "POST /api/admin/occasions/run-now",
+      ],
+      marketing: [
+        "GET  /api/admin/marketing/calendar",
+        "GET  /api/admin/campaigns",
+        "POST /api/admin/campaigns",
+        "GET  /api/admin/content-library",
+        "POST /api/admin/content-library",
+        "GET  /api/admin/delivery-logs",
+        "GET  /api/admin/sticker-studio",
+        "POST /api/admin/sticker-studio",
+        "DELETE /api/admin/sticker-studio/:id",
+      ],
+      whatsapp: [
+        "POST /api/whatsapp/notify",
+        "POST /api/whatsapp/welcome",
+        "POST /api/whatsapp/send-media",
         "POST /api/whatsapp/webhook",
-        "POST /api/promo/stock-drop",
-        "GET  /api/seller/customers",
-        "POST /api/seller/customers/:phone/note",
-        "POST /api/seller/customers/:phone/manual-optout",
-        "POST /api/offline-sale/notify",
-        "POST /api/test-offline-sale-whatsapp",
-        "POST /api/test-subscription-confirm-whatsapp",
+        "GET  /api/whatsapp/groups",
+      ],
+      admin: [
+        "POST /api/admin/notify-user",
+        "POST /api/driver/decision",
         "GET  /api/admin/unresolved-lids",
         "GET  /api/admin/subscribe-tokens/:token",
         "POST /api/admin/subscribe-tokens",
       ],
+      realEstate: [
+        "POST /api/service-request/notify",
+        "POST /api/moving/notify",
+        "POST /api/re/welcome",
+        "POST /api/real-estate/seed",
+      ],
+      seller: [
+        "POST /api/seller/update-status",
+        "POST /api/seller/withdraw",
+        "POST /api/seller/recover-pin",
+        "POST /api/seller/verify-recovery-code",
+        "POST /api/seller/reset-pin",
+        "GET  /api/seller/customers",
+        "POST /api/seller/customers/:phone/note",
+        "POST /api/seller/customers/:phone/manual-optout",
+      ],
+      store: [
+        "POST /api/stk-push",
+        "POST /api/store/seed",
+        "POST /api/offline-sale/notify",
+        "POST /api/promo/stock-drop",
+        "POST /api/intasend-callback",
+        "GET  /api/ad-transaction/:paymentRef",
+        "GET  /api/transaction/:invoiceId",
+        "POST /api/update-stock",
+        "POST /api/generate-ai-image",
+        "POST /api/send-proposal-status",
+      ],
+      test: [
+        "GET  /api/test-email-auth",
+        "POST /api/test-proposal-email",
+        "POST /api/test-real-estate-email",
+        "POST /api/test-moving-email",
+        "POST /api/test-store-whatsapp",
+        "POST /api/test-seller-flow-whatsapp",
+        "POST /api/test-quicksale-whatsapp",
+        "POST /api/test-welcome-whatsapp",
+        "POST /api/test-whatsapp-notify-image",
+        "POST /api/test-offline-sale-whatsapp",
+        "POST /api/test-subscription-confirm-whatsapp",
+      ],
     },
-    endpoints: [
-      "/api/whatsapp/notify", "/api/whatsapp/groups", "/api/whatsapp/welcome",
-      "/api/whatsapp/webhook",
-      "/api/admin/auto-promo", "/api/admin/auto-promo/run-now",
-      "/api/admin/marketing-overrides",
-      "/api/admin/occasions", "/api/admin/occasions/run-now",
-      "/api/admin/unresolved-lids", "/api/admin/subscribe-tokens",
-      "/api/service-request/notify", "/api/moving/notify", "/api/re/welcome",
-      "/api/stk-push", "/api/store/seed", "/api/real-estate/seed",
-      "/api/offline-sale/notify",
-      "/api/promo/stock-drop",
-      "/api/seller/customers", "/api/seller/update-status",
-      "/api/seller/withdraw", "/api/seller/recover-pin",
-      "/api/ad-transaction/:paymentRef", "/api/update-stock",
-      "/api/test-offline-sale-whatsapp", "/api/test-subscription-confirm-whatsapp",
-      "/_health",
+    fixes: [
+      // [v2.6.5] restored in v2.10.0
+      "RESTORE v2.6.5 — POST /api/admin/auto-promo/preview (Daily Preview)",
+      "RESTORE v2.6.5 — POST /api/admin/occasions/preview",
+      "RESTORE v2.6.5 — POST /api/whatsapp/send-media (Direct Message)",
+      "RESTORE v2.6.5 — POST /api/admin/notify-user",
+      "RESTORE v2.6.5 — POST /api/driver/decision",
+      "RESTORE v2.6.5 — All /api/test-* endpoints",
+      "RESTORE v2.6.5 — adminFlashNudgeTick (7am/7pm EAT)",
+      // [v2.9.0] preserved
+      "PRESERVE v2.9.0 — Token system (subscribeTokens)",
+      "PRESERVE v2.9.0 — LID fallback escalation",
+      "PRESERVE v2.9.0 — Buyer subscriptions",
+      "PRESERVE v2.9.0 — POST /api/whatsapp/webhook",
+      "PRESERVE v2.9.0 — POST /api/offline-sale/notify",
+      "PRESERVE v2.9.0 — POST /api/promo/stock-drop",
+      "PRESERVE v2.9.0 — /api/seller/customers*",
+      // [NEW v2.10.0]
+      "NEW v2.10.0 — GET + POST both served for /preview endpoints",
+      "NEW v2.10.0 — GET /api/admin/marketing/calendar",
+      "NEW v2.10.0 — GET/POST /api/admin/campaigns",
+      "NEW v2.10.0 — GET/POST /api/admin/content-library",
+      "NEW v2.10.0 — GET /api/admin/delivery-logs",
+      "NEW v2.10.0 — GET/POST/DELETE /api/admin/sticker-studio",
     ],
     uptime: process.uptime(),
   });
@@ -5628,7 +6861,7 @@ process.on("uncaughtException", (err) => console.error("Uncaught:", err));
 process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 
 // ============================
-// Keep-alive
+// Keep-alive — [v2.6.5]
 // ============================
 (function keepAlive() {
   const disable = process.env.KEEP_ALIVE === "0" || process.env.KEEP_ALIVE === "false";
@@ -5668,22 +6901,86 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
   console.log("🌀 Smart keep-alive active (pauses 11pm–5am EAT)");
 })();
 
+// ============================
+// Schedulers — [v2.6.5]
+// ============================
 autoPromoStartScheduler({ SCAN_MS: 60 * 1000 });
 occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
+
+// ============================
+// Admin flash-sales nudge — [v2.6.5]
+// Fires at 7am & 7pm EAT.
+// ============================
+let adminFlashNudgeLastKey = null;
+const ADMIN_FLASH_NUDGE_HOURS = [7, 19];
+
+async function adminFlashNudgeTick() {
+  try {
+    const hourEAT = autoPromoHourEAT();
+    const dateKey = autoPromoNowEAT().toISOString().slice(0, 10);
+    if (!ADMIN_FLASH_NUDGE_HOURS.includes(hourEAT)) return;
+    const key = `${dateKey}-${hourEAT}`;
+    if (adminFlashNudgeLastKey === key) return;
+
+    const hpSnap = await db.collection("homepage").doc("content").get();
+    const hp = hpSnap.exists ? hpSnap.data() : {};
+    const sales = Array.isArray(hp.flashSales) ? hp.flashSales : [];
+    const nowD = new Date();
+    const active = sales.filter(s => {
+      const st = s.startDate?.toDate ? s.startDate.toDate() : new Date(s.startDate);
+      const en = s.endDate?.toDate ? s.endDate.toDate() : new Date(s.endDate);
+      return st <= nowD && en >= nowD;
+    });
+
+    const campaign = autoPromoGetActiveCampaign();
+    const adminUrl = `${WEBSITE_URL.replace(/\/$/, "")}/admin/dashboard/flash-sales`;
+
+    let body;
+    if (active.length === 0) {
+      body = [
+        "🚨 *FLASH SALES NEED ATTENTION*", "",
+        "0 active flash sales right now.",
+        "Homepage rail is empty.",
+        campaign ? `\nToday's campaign: *${campaign.name}*` : "",
+        `\n👉 ${adminUrl}`,
+      ].filter(Boolean).join("\n");
+    } else {
+      const manual = active.filter(s => !s.autoCreated).length;
+      const auto = active.filter(s => s.autoCreated).length;
+      body = [
+        "📊 *Daily Flash Sales Check-In*", "",
+        `✅ Active: *${active.length}* (${manual} manual, ${auto} auto)`,
+        campaign ? `🎯 Today's campaign: *${campaign.name}*` : "",
+        `\n👉 ${adminUrl}`,
+      ].filter(Boolean).join("\n");
+    }
+
+    enqueueWhatsApp(ADMIN_PHONE, body, { kind: "admin-flash-nudge", hourEAT });
+    adminFlashNudgeLastKey = key;
+    console.log(`📣 Admin flash nudge sent (hour=${hourEAT})`);
+  } catch (e) {
+    console.error("📣 Admin nudge failed:", e.message);
+  }
+}
+
+setInterval(adminFlashNudgeTick, 5 * 60 * 1000).unref?.();
+setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
+console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
 
 // ============================
 // Server start
 // ============================
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.9.0`);
+  console.log(`🚀 Server on port ${PORT} — v2.10.0`);
   console.log(`📧 Brevo: ${BREVO_API_KEY ? "✅" : "❌"}`);
   console.log(`📱 WhatsApp (WAHA): ${WAHA_URL ? "✅" : "❌"}`);
-  console.log(`👥 Buyer subscriptions: ✅ (phone → sellerId → categoryId)`);
-  console.log(`🎟️ Subscribe tokens: ✅ (wa.me link + reply-chain both work)`);
-  console.log(`💬 LID fallback: ✅ (3 escalating messages, 2h repeat cooldown)`);
-  console.log(`🎯 Seller-scoped STOCK: ✅`);
-  console.log(`📨 Webhook: POST /api/whatsapp/webhook`);
-  console.log(`🔧 Diagnostics: GET /api/admin/unresolved-lids`);
+  console.log(`🤖 AutoPromo: v2.6.5 base + GET previews (v2.10.0)`);
+  console.log(`✏️  Overrides: /api/admin/marketing-overrides`);
+  console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
+  console.log(`🎟️ Subscribe tokens: ✅`);
+  console.log(`💬 LID fallback: ✅ (escalating, 3 messages)`);
+  console.log(`👥 Buyer subscriptions: ✅`);
+  console.log(`🆕 v2.10.0 additions: calendar, campaigns CRUD, content library, delivery logs, sticker studio`);
 });
 
 const shutdown = () => {
