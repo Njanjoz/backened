@@ -1,11 +1,16 @@
 // server.js — MarketMix backend
-// v2.10.6 — override time-move fix + minute-pinned firing
+// v2.10.7 — Option B: non-promo occasions persistent, editable, fire from plan
 //
 // [v2.6.5]  base · [v2.9.0] token/LID/subscriptions · [v2.10.0] calendar/campaigns/content-library
 // [v2.10.4] subcollection slot storage + day-view endpoint
 // [v2.10.6] Two fixes:
 //   1. Override time-move updates slot.hourEAT so the tick's hour query finds it
 //   2. Tick also fires minute-pinned overrides (time == currentHHMM)
+// [v2.10.7] Option B — non-promo occasions:
+//   1. Non-promo slots written to scheduledPromos/{date}/slots/ at plan time
+//   2. day-view reads them from the plan instead of building them fresh
+//   3. The promo tick fires them too — separate occasionStartScheduler disabled
+//   4. Frontend can edit/skip/reset them via the same override flow
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -622,8 +627,10 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo Engine v2.10.6
+   AutoPromo Engine v2.10.7
    Subcollection-backed plan + fire-time override overlay.
+   Non-promo (occasion) slots are persisted in the same plan and
+   fire through the same tick.
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -1418,6 +1425,59 @@ async function computePlanSlotsForDate(dateStr, settings) {
     }
   }
 
+  // v2.10.7 — also persist non-promo (occasion) slots in the plan
+  try {
+    const occSettings = await occasionLoadSettings();
+    if (occSettings.enabled) {
+      const { dated, recurring } = resolveOccasionsForDate({
+        month,
+        day,
+        weekday: dow,
+        year: targetDate.getUTCFullYear(),
+        movableDates: occSettings.movableDates || {},
+        includeRecurring: !!occSettings.sendRecurring,
+      });
+      for (const group of groups) {
+        for (const occ of [...dated, ...recurring]) {
+          const message = buildOccasionMessage(occ, {
+            shopLink: occSettings.siteUrl || WEBSITE_URL,
+          });
+          if (!message) continue;
+          const isRecurring = !!occ.recurring;
+          const isSensitive = !!occ.sensitive;
+          const baseHour = isRecurring ? 3 : 9;
+          const time = `${String(baseHour).padStart(2, "0")}:00`;
+          const slotId = `${dateStr}_${time}_${group.id}_occ_${occ.key}`;
+          slots.push({
+            slotId,
+            dateEAT: dateStr,
+            time,
+            hourEAT: baseHour,
+            slotKind: isSensitive ? "non-promo" : "occasion",
+            templateId: null,
+            groupId: group.id,
+            groupName: group.name,
+            occasionKey: occ.key,
+            occasionName: occ.name,
+            sensitive: isSensitive,
+            productId: null,
+            productName: occ.name,
+            imageUrl: null,
+            caption: message,
+            skipped: false,
+            overridden: false,
+            status: "pending",
+            sentAt: null,
+            sentMessageId: null,
+            error: null,
+          });
+        }
+      }
+    }
+  } catch (occErr) {
+    console.warn("[plan] occasion slots skipped:", occErr.message);
+  }
+
   return { slots, autoSlotHours, campaign, perGroupPerDay };
 }
 
@@ -1561,7 +1621,7 @@ async function regeneratePlanPreservingOverrides(dateStr, settings) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Scheduler tick — v2.10.6: minute-pinned override firing
+   Scheduler tick — v2.10.7: fires promo + non-promo from the plan
    ═══════════════════════════════════════════════════════════════ */
 
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
@@ -1692,41 +1752,58 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     for (let i = 0; i < pending.length; i++) {
       const { slotId, slot } = pending[i];
 
+      // v2.10.7 — non-promo slots check the legacy occasion log too
+      const isNonPromoSlot = slot.slotKind === "occasion" || slot.slotKind === "non-promo";
+      if (isNonPromoSlot && slot.occasionKey) {
+        const already = await occasionWasSentToday(slot.occasionKey);
+        if (already) {
+          await patchPlanSlot(todayEAT, slotId, { status: "sent", sentAt: admin.firestore.FieldValue.serverTimestamp(), note: "pre-existing occasion log" }).catch(() => {});
+          result.skippedGroups.push({ groupId: slot.groupId, reason: "occasion-already-sent" });
+          continue;
+        }
+      }
+
       const freshSnap = await metaRef.collection("slots").doc(slotId).get();
       if (!freshSnap.exists || freshSnap.data().status !== "pending") {
         result.skippedGroups.push({ groupId: slot.groupId, reason: "status-changed" });
         continue;
       }
 
+      // v2.10.7 — non-promo slots have no product; skip product resolution
+      const isNonPromo = slot.slotKind === "occasion" || slot.slotKind === "non-promo";
+
       let product = null;
-      if (slot.productId) {
-        const p = await db.collection("products").doc(slot.productId).get();
-        if (p.exists) {
-          const data = p.data();
-          const qty = Number(data.quantity) || 0;
-          const variantStock = Array.isArray(data.variants)
-            ? data.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0)
-            : 0;
-          if ((qty > 0 || variantStock > 0) && data.isPublished !== false) {
-            product = { id: p.id, ...data };
+      let substitution = null;
+
+      if (!isNonPromo) {
+        if (slot.productId) {
+          const p = await db.collection("products").doc(slot.productId).get();
+          if (p.exists) {
+            const data = p.data();
+            const qty = Number(data.quantity) || 0;
+            const variantStock = Array.isArray(data.variants)
+              ? data.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0)
+              : 0;
+            if ((qty > 0 || variantStock > 0) && data.isPublished !== false) {
+              product = { id: p.id, ...data };
+            }
           }
         }
-      }
 
-      let substitution = null;
-      if (!product) {
-        const fallback = await autoPromoPickProduct({ group: { id: slot.groupId } });
-        if (fallback) {
-          product = fallback;
-          substitution = { slotId, originalProductId: slot.productId, substitutedProductId: fallback.id };
-          result.substitutions.push(substitution);
+        if (!product) {
+          const fallback = await autoPromoPickProduct({ group: { id: slot.groupId } });
+          if (fallback) {
+            product = fallback;
+            substitution = { slotId, originalProductId: slot.productId, substitutedProductId: fallback.id };
+            result.substitutions.push(substitution);
+          }
         }
-      }
 
-      if (!product) {
-        await patchPlanSlot(todayEAT, slotId, { status: "failed", error: "no-product-at-fire-time" }).catch(() => {});
-        result.skippedGroups.push({ groupId: slot.groupId, reason: "no-product" });
-        continue;
+        if (!product) {
+          await patchPlanSlot(todayEAT, slotId, { status: "failed", error: "no-product-at-fire-time" }).catch(() => {});
+          result.skippedGroups.push({ groupId: slot.groupId, reason: "no-product" });
+          continue;
+        }
       }
 
       let caption = slot.caption;
@@ -1743,12 +1820,12 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       try {
         if (imageUrl) {
           enqueueWhatsAppImage(slot.groupId, imageUrl, caption, {
-            kind: "auto-promo", templateId: slot.templateId, productId: product.id,
+            kind: "auto-promo", templateId: slot.templateId, productId: product?.id || null,
             groupId: slot.groupId, slotId, overridden: !!slot.overridden,
           });
         } else {
           enqueueWhatsApp(slot.groupId, caption, {
-            kind: "auto-promo", templateId: slot.templateId, productId: product.id,
+            kind: "auto-promo", templateId: slot.templateId, productId: product?.id || null,
             groupId: slot.groupId, slotId, overridden: !!slot.overridden,
           });
         }
@@ -1756,8 +1833,8 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
         await patchPlanSlot(todayEAT, slotId, {
           status: "sent",
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          productId: product.id,
-          productName: product.name || null,
+          productId: product?.id || null,
+          productName: product?.name || slot.occasionName || null,
           imageUrl,
           caption,
           overridden: !!slot.overridden,
@@ -1766,7 +1843,10 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
         await db.collection("autoPromoLogs").add({
           groupId: slot.groupId, groupName: slot.groupName,
-          productId: product.id, productName: product.name || null,
+          productId: product?.id || null, productName: product?.name || null,
+          occasionKey: slot.occasionKey || null,
+          occasionName: slot.occasionName || null,
+          slotKind: slot.slotKind,
           imageUrlSent: imageUrl || null,
           templateId: slot.templateId,
           campaign: plan.campaign?.name || null,
@@ -1780,7 +1860,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
         result.sent++;
         result.messages.push({
-          group: slot.groupName, product: product.name,
+          group: slot.groupName, product: product?.name || slot.occasionName || null,
           templateId: slot.templateId, slotTime: slot.time,
           overridden: !!slot.overridden, substituted: !!substitution,
         });
@@ -3667,7 +3747,7 @@ app.post("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 app.get("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 
 /* ═══════════════════════════════════════════════════════════════
-   DAY VIEW
+   DAY VIEW — v2.10.7: non-promo slots come from the persisted plan
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/auto-promo/day-view", async (req, res) => {
   try {
@@ -3689,58 +3769,14 @@ app.get("/api/admin/auto-promo/day-view", async (req, res) => {
     const overrides = await loadOverridesForDate(dateStr);
     const displaySlots = rawSlots.map(s => applyOverrideToSlot(s, overrides, dateStr));
 
-    const { dated, recurring } = resolveOccasionsForDate({
-      month: targetDate.getUTCMonth() + 1,
-      day: targetDate.getUTCDate(),
-      weekday: targetDate.getUTCDay(),
-      year: targetDate.getUTCFullYear(),
-      movableDates: occSettings.movableDates || {},
-      includeRecurring: !!occSettings.sendRecurring,
-    });
-
-    const occasionSlots = [];
+    // v2.10.7 — non-promo slots now come from the persisted plan
+    const occasionSlots = displaySlots.filter(
+      s => s.slotKind === "occasion" || s.slotKind === "non-promo"
+    );
+    const promoDisplaySlots = displaySlots.filter(s => s.slotKind === "promo");
     const occEnabled = !!occSettings.enabled;
 
-    if (occEnabled) {
-      const groupIdsSeen = new Set(displaySlots.map(s => s.groupId));
-      const groupsForOccasions = [];
-      for (const gid of groupIdsSeen) {
-        const sample = displaySlots.find(s => s.groupId === gid);
-        if (sample) groupsForOccasions.push({ id: gid, name: sample.groupName });
-      }
-      for (const group of groupsForOccasions) {
-        for (const occ of [...dated, ...recurring]) {
-          const message = buildOccasionMessage(occ, { shopLink: occSettings.siteUrl || WEBSITE_URL });
-          if (!message) continue;
-          const isRecurring = !!occ.recurring;
-          const isSensitive = !!occ.sensitive;
-          const baseHour = isRecurring ? 3 : 9;
-          occasionSlots.push({
-            slotId: `${dateStr}_${String(baseHour).padStart(2, "0")}:00_${group.id}_occ_${occ.key}`,
-            dateEAT: dateStr,
-            time: `${String(baseHour).padStart(2, "0")}:00`,
-            hourEAT: baseHour,
-            slotKind: isSensitive ? "non-promo" : "occasion",
-            templateId: null,
-            groupId: group.id,
-            groupName: group.name,
-            occasionKey: occ.key,
-            occasionName: occ.name,
-            sensitive: isSensitive,
-            productId: null,
-            productName: occ.name,
-            imageUrl: null,
-            caption: message,
-            skipped: false,
-            overridden: false,
-            status: "pending",
-            sentAt: null,
-          });
-        }
-      }
-    }
-
-    const allSlots = [...displaySlots, ...occasionSlots].sort((a, b) => {
+    const allSlots = [...promoDisplaySlots, ...occasionSlots].sort((a, b) => {
       const t = a.time.localeCompare(b.time);
       if (t !== 0) return t;
       return (a.groupName || "").localeCompare(b.groupName || "");
@@ -3756,7 +3792,8 @@ app.get("/api/admin/auto-promo/day-view", async (req, res) => {
       autoSlotHours: plan.autoSlotHours || [],
       campaign: plan.campaign || null,
       overridesLoaded: overrides.size,
-      promoSlots: displaySlots.length,
+      overridesApplied: displaySlots.filter(s => s.overridden).length,
+      promoSlots: promoDisplaySlots.length,
       occasionSlots: occasionSlots.length,
       slots: allSlots,
     });
@@ -5344,17 +5381,18 @@ app.delete("/api/admin/sticker-studio/:id", async (req, res) => {
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.10.6",
+    version: "v2.10.7",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
     autoPromo: {
       enabled: true,
-      version: "v2.10.6",
+      version: "v2.10.7",
       planCollection: "scheduledPromos",
       planShape: "manifest + slots subcollection (no arrays)",
       overrideTimeMoveUpdatesHourEAT: true,
       minutePinnedOverridesFire: true,
+      nonPromoSlotsPersisted: true,
       dayViewEndpoint: "GET /api/admin/auto-promo/day-view?date=YYYY-MM-DD",
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -5362,6 +5400,7 @@ app.get("/_health", (req, res) => {
     occasions: {
       enabled: true,
       totalOccasions: OCCASION_LIBRARY.length,
+      schedulerDisabled: true,
     },
     whatsappQueue: waQueue.length,
     fixes: [
@@ -5370,6 +5409,8 @@ app.get("/_health", (req, res) => {
       "v2.10.4 — dedupe selectedGroupIds so a group cannot fire multiple times per tick",
       "v2.10.6 — Override time-move updates hourEAT",
       "v2.10.6 — Tick also fires minute-pinned overrides (time == HH:MM)",
+      "v2.10.7 — Non-promo occasions persisted in plan, editable, fire via promo tick",
+      "v2.10.7 — occasionStartScheduler disabled (no duplicate sends)",
     ],
     uptime: process.uptime(),
   });
@@ -5419,7 +5460,9 @@ process.on("unhandledRejection", (r) => console.error("Unhandled:", r));
 })();
 
 autoPromoStartScheduler({ SCAN_MS: 60 * 1000 });
-occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
+// v2.10.7 — occasion scheduler disabled; non-promo slots now fire
+// through the plan-based AutoPromo tick
+// occasionStartScheduler({ SCAN_MS: 30 * 60 * 1000 });
 
 let adminFlashNudgeLastKey = null;
 const ADMIN_FLASH_NUDGE_HOURS = [7, 19];
@@ -5462,10 +5505,10 @@ setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
 console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
 
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.10.6`);
-  console.log(`🤖 AutoPromo: v2.10.6 — override time-move + minute-pinned firing`);
+  console.log(`🚀 Server on port ${PORT} — v2.10.7`);
+  console.log(`🤖 AutoPromo: v2.10.7 — non-promo occasions fire from plan`);
   console.log(`📅 Plan collection: scheduledPromos/{date} + slots/*`);
-  console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
+  console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions (scheduler disabled)`);
 });
 
 const shutdown = () => {
