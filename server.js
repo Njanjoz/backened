@@ -1,25 +1,11 @@
 // server.js — MarketMix backend
-// v2.10.4 — subcollection slot storage + day-view endpoint
+// v2.10.6 — override time-move fix + minute-pinned firing
 //
 // [v2.6.5]  base · [v2.9.0] token/LID/subscriptions · [v2.10.0] calendar/campaigns/content-library
-// [v2.10.4] Two fixes only:
-//   1. scheduledPromos/{date}/slots/{slotId} — one doc per slot (kills array sentinel bug)
-//   2. GET /api/admin/auto-promo/day-view — Daily Preview endpoint
-//
-// ┌──────────────────────────────────────────────────────────────────────────┐
-// │ INCIDENT REFERENCE                                                       │
-// │                                                                          │
-// │ Problem A — Duplicate WhatsApp sends every 60s.                          │
-// │   Root cause: FieldValue.serverTimestamp() written inside                │
-// │   scheduledPromos/{date}.slots[] array. Firestore rejects the write.     │
-// │   The slot stays status:"pending" and re-fires on every tick.            │
-// │   Fix: slots become independent docs in a subcollection. Sentinel works. │
-// │                                                                          │
-// │ Problem B — Daily Preview shows "Not Found".                             │
-// │   Root cause: frontend calls GET /api/admin/auto-promo/day-view,         │
-// │   which does not exist on the deployed backend.                          │
-// │   Fix: add the endpoint.                                                 │
-// └──────────────────────────────────────────────────────────────────────────┘
+// [v2.10.4] subcollection slot storage + day-view endpoint
+// [v2.10.6] Two fixes:
+//   1. Override time-move updates slot.hourEAT so the tick's hour query finds it
+//   2. Tick also fires minute-pinned overrides (time == currentHHMM)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -636,7 +622,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo Engine v2.10.4
+   AutoPromo Engine v2.10.6
    Subcollection-backed plan + fire-time override overlay.
    ═══════════════════════════════════════════════════════════════ */
 
@@ -1318,13 +1304,11 @@ async function computePlanSlotsForDate(dateStr, settings) {
     return true;
   });
 
-  // v2.10.4: deduplicate selectedGroupIds so the same group cannot appear twice
   const rawPersistedIds = Array.isArray(settings.selectedGroupIds) ? settings.selectedGroupIds : [];
   const persistedIds = [...new Set(rawPersistedIds.filter(Boolean))];
   if (persistedIds.length > 0) {
     const allowed = new Set(persistedIds);
     groups = groups.filter(g => allowed.has(g.id));
-    // Include any selected IDs WAHA didn't return, deduplicated
     const missing = persistedIds.filter(id => !groups.some(g => g.id === id));
     for (const id of missing) groups.push({ id, name: "(selected)" });
   } else {
@@ -1577,7 +1561,7 @@ async function regeneratePlanPreservingOverrides(dateStr, settings) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Scheduler tick — v2.10.4: subcollection-backed, sentinel-safe
+   Scheduler tick — v2.10.6: minute-pinned override firing
    ═══════════════════════════════════════════════════════════════ */
 
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
@@ -1614,7 +1598,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           return { error: "groups-fetch-failed", detail: e.message };
         }
       }
-      // Deduplicate forced group IDs
       const seen = new Set();
       groups = groups.filter(g => {
         if (!g || !g.id) return false;
@@ -1661,15 +1644,22 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     const plan = await ensurePlan(todayEAT, settings, "scheduler");
     const metaRef = db.collection("scheduledPromos").doc(todayEAT);
 
-    const slotsSnap = await metaRef.collection("slots")
-      .where("hourEAT", "==", hourEAT)
-      .where("status", "==", "pending")
-      .get();
+    // v2.10.6: two queries — hourEAT==hour OR time==HH:MM (minute-pinned overrides)
+    const [hourSnap, minuteSnap] = await Promise.all([
+      metaRef.collection("slots")
+        .where("hourEAT", "==", hourEAT)
+        .where("status", "==", "pending")
+        .get(),
+      metaRef.collection("slots")
+        .where("time", "==", currentHHMM)
+        .where("status", "==", "pending")
+        .get(),
+    ]);
 
     const overrides = await loadOverridesForDate(todayEAT);
     const seen = new Set();
     const pending = [];
-    for (const d of slotsSnap.docs) {
+    for (const d of [...hourSnap.docs, ...minuteSnap.docs]) {
       if (seen.has(d.id)) continue;
       seen.add(d.id);
       const slot = d.data();
@@ -1763,7 +1753,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           });
         }
 
-        // Sentinel-safe: slot is its own doc, not array element
         await patchPlanSlot(todayEAT, slotId, {
           status: "sent",
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -3525,7 +3514,6 @@ app.post("/api/admin/auto-promo", async (req, res) => {
     const allowed = ["enabled", "perGroupPerDay", "minGapMinutes", "activeHours", "siteUrl", "selectedGroupIds", "activeCampaignName", "activeFrom", "activeUntil", "activeContentType", "activeSendTimes"];
     const patch = {};
     for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
-    // v2.10.4 — dedupe selectedGroupIds before saving
     if (Array.isArray(patch.selectedGroupIds)) {
       patch.selectedGroupIds = [...new Set(patch.selectedGroupIds.filter(Boolean))];
     }
@@ -3679,9 +3667,7 @@ app.post("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 app.get("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 
 /* ═══════════════════════════════════════════════════════════════
-   DAY VIEW — new in v2.10.4
-   GET /api/admin/auto-promo/day-view?date=YYYY-MM-DD
-   Returns promo slots + occasion slots (if enabled) in one call.
+   DAY VIEW
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/auto-promo/day-view", async (req, res) => {
   try {
@@ -3878,7 +3864,11 @@ app.post("/api/admin/marketing-overrides", async (req, res) => {
       if (productName !== undefined) patch.productName = productName;
       if (imageUrl !== undefined) patch.imageUrl = imageUrl;
       if (caption !== undefined) patch.caption = caption;
-      if (time !== undefined) patch.time = time;
+      if (time !== undefined) {
+        // v2.10.6 — recompute hourEAT so the tick's hour query finds it
+        patch.time = time;
+        patch.hourEAT = parseInt(String(time).split(":")[0], 10);
+      }
       if (skipped !== undefined) {
         patch.skipped = skipped;
         patch.status = skipped ? "skipped" : "pending";
@@ -5354,15 +5344,17 @@ app.delete("/api/admin/sticker-studio/:id", async (req, res) => {
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.10.4",
+    version: "v2.10.6",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
     autoPromo: {
       enabled: true,
-      version: "v2.10.4",
+      version: "v2.10.6",
       planCollection: "scheduledPromos",
       planShape: "manifest + slots subcollection (no arrays)",
+      overrideTimeMoveUpdatesHourEAT: true,
+      minutePinnedOverridesFire: true,
       dayViewEndpoint: "GET /api/admin/auto-promo/day-view?date=YYYY-MM-DD",
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
@@ -5376,7 +5368,8 @@ app.get("/_health", (req, res) => {
       "v2.10.4 — scheduledPromos/{date}/slots/{slotId} subcollection (kills array sentinel bug)",
       "v2.10.4 — GET /api/admin/auto-promo/day-view (Daily Preview)",
       "v2.10.4 — dedupe selectedGroupIds so a group cannot fire multiple times per tick",
-      "v2.10.4 — de-dup groups in tick + preview",
+      "v2.10.6 — Override time-move updates hourEAT",
+      "v2.10.6 — Tick also fires minute-pinned overrides (time == HH:MM)",
     ],
     uptime: process.uptime(),
   });
@@ -5469,8 +5462,8 @@ setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
 console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
 
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.10.4`);
-  console.log(`🤖 AutoPromo: v2.10.4 — subcollection slots, deduped groups`);
+  console.log(`🚀 Server on port ${PORT} — v2.10.6`);
+  console.log(`🤖 AutoPromo: v2.10.6 — override time-move + minute-pinned firing`);
   console.log(`📅 Plan collection: scheduledPromos/{date} + slots/*`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
