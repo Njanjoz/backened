@@ -1,5 +1,5 @@
 // server.js — MarketMix backend
-// v2.10.5 — v2.10.4 rich copy + subcollection slots (no arrays)
+// v2.10.6 — override time-move fix + minute-pinned firing
 //
 // [v2.6.5]  base · [v2.9.0] token/LID/subscriptions · [v2.10.0] calendar/campaigns/content-library
 // [v2.10.1] slot-aware base + unified override keys + full-length copy
@@ -7,19 +7,18 @@
 // [v2.10.3] overrides applied at fire time · GET /api/admin/auto-promo/day-view
 // [v2.10.4] restored long-form occasion texts and WhatsApp templates
 // [v2.10.5] scheduledPromos/{date}/slots/{slotId} subcollection — kills array sentinel bug
+// [v2.10.6] override time-move updates hourEAT; tick also fires minute-pinned overrides
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
-// │ v2.10.5 CHANGES                                                          │
+// │ v2.10.6 CHANGES                                                          │
 // │                                                                          │
-// │ • scheduledPromos/{date} is now a MANIFEST (no arrays).                  │
-// │ • Each slot lives at scheduledPromos/{date}/slots/{slotId}.              │
-// │   Writes are partial, atomic per-slot, sentinel-safe.                    │
-// │ • ensurePlan / patchPlanSlot / regeneratePlanPreservingOverrides /       │
-// │   autoPromoRunTick / preview / day-view all use the subcollection.       │
-// │ • Concurrent ticks can no longer race and lose data.                     │
-// │ • serverTimestamp() inside slot docs now works (was the root cause of    │
-// │   "patchPlanSlot after send failed" and duplicate minute-by-minute       │
-// │   fires).                                                                │
+// │ • POST /api/admin/marketing-overrides — when an override sets `time`,    │
+// │   the plan slot's `hourEAT` is recomputed so the tick's hour query       │
+// │   finds it.                                                              │
+// │ • autoPromoRunTick — after the primary hourEAT==HOUR query, a second    │
+// │   query for time==HH:MM is merged in, so overrides pinned to a specific  │
+// │   minute fire on that exact minute even if hourEAT is stale.             │
+// │ • Everything else identical to v2.10.5.                                  │
 // └──────────────────────────────────────────────────────────────────────────┘
 
 const express = require("express");
@@ -637,7 +636,7 @@ function personalizeBulkMessage(template, { name } = {}) {
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   AutoPromo Engine v2.10.5 — subcollection-backed plan
+   AutoPromo Engine v2.10.6
    ═══════════════════════════════════════════════════════════════ */
 
 const AUTO_PROMO_MAX_PER_GROUP_PER_DAY = 4;
@@ -1390,7 +1389,6 @@ async function computePlanSlotsForDate(dateStr, settings) {
   return { slots, autoSlotHours, campaign, perGroupPerDay };
 }
 
-// v2.10.5 — manifest + slot subcollection. No arrays. Sentinel-safe.
 async function ensurePlan(dateStr, settings, generatedBy = "preview") {
   const metaRef = db.collection("scheduledPromos").doc(dateStr);
   const metaSnap = await metaRef.get();
@@ -1434,7 +1432,6 @@ async function ensurePlan(dateStr, settings, generatedBy = "preview") {
   return { id: metaRef.id, ...manifest };
 }
 
-// v2.10.5 — read manifest + subcollection, return old shape
 async function loadPlan(dateStr) {
   const metaRef = db.collection("scheduledPromos").doc(dateStr);
   const metaSnap = await metaRef.get();
@@ -1446,7 +1443,6 @@ async function loadPlan(dateStr) {
   return { id: metaRef.id, ...metaSnap.data(), slots };
 }
 
-// v2.10.5 — single-doc write, sentinel-safe
 async function patchPlanSlot(dateStr, slotId, patch) {
   const ref = db
     .collection("scheduledPromos").doc(dateStr)
@@ -1463,7 +1459,6 @@ async function patchPlanSlot(dateStr, slotId, patch) {
   return { slotId, ...patch };
 }
 
-// v2.10.5 — regenerate manifest + slots, preserving overridden slots
 async function regeneratePlanPreservingOverrides(dateStr, settings) {
   const metaRef = db.collection("scheduledPromos").doc(dateStr);
   const metaSnap = await metaRef.get();
@@ -1534,7 +1529,7 @@ async function regeneratePlanPreservingOverrides(dateStr, settings) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Scheduler tick — v2.10.5: subcollection-backed, override at fire
+   Scheduler tick — v2.10.6: hour + minute-pinned queries
    ═══════════════════════════════════════════════════════════════ */
 
 async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forceProductId = null } = {}) {
@@ -1556,7 +1551,7 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
 
     const todayEAT = autoPromoDateStrEAT();
 
-    // ── FORCED RUN (Run-now button) ──
+    // ── FORCED RUN ──
     if (bypassPlan) {
       let groups = forceGroupIds || [];
       if (!groups.length) {
@@ -1605,19 +1600,28 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
       return result;
     }
 
-    // ── NORMAL PATH — plan is subcollection-backed ──
+    // ── NORMAL PATH ──
     const plan = await ensurePlan(todayEAT, settings, "scheduler");
     const metaRef = db.collection("scheduledPromos").doc(todayEAT);
 
-    // Query: pending slots for this exact hour (indexed)
-    const slotsSnap = await metaRef.collection("slots")
-      .where("hourEAT", "==", hourEAT)
-      .where("status", "==", "pending")
-      .get();
+    // v2.10.6: two queries — hourEAT==hour OR time==HH:MM (minute-pinned overrides)
+    const [hourSnap, minuteSnap] = await Promise.all([
+      metaRef.collection("slots")
+        .where("hourEAT", "==", hourEAT)
+        .where("status", "==", "pending")
+        .get(),
+      metaRef.collection("slots")
+        .where("time", "==", currentHHMM)
+        .where("status", "==", "pending")
+        .get(),
+    ]);
 
     const overrides = await loadOverridesForDate(todayEAT);
+    const seen = new Set();
     const pending = [];
-    for (const d of slotsSnap.docs) {
+    for (const d of [...hourSnap.docs, ...minuteSnap.docs]) {
+      if (seen.has(d.id)) continue;
+      seen.add(d.id);
       const slot = d.data();
       if (slot.skipped) continue;
       const merged = applyOverrideToSlot(slot, overrides, todayEAT);
@@ -1648,14 +1652,12 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
     for (let i = 0; i < pending.length; i++) {
       const { slotId, slot } = pending[i];
 
-      // Defensive re-check
       const freshSnap = await metaRef.collection("slots").doc(slotId).get();
       if (!freshSnap.exists || freshSnap.data().status !== "pending") {
         result.skippedGroups.push({ groupId: slot.groupId, reason: "status-changed" });
         continue;
       }
 
-      // Stock check + substitution
       let product = null;
       if (slot.productId) {
         const p = await db.collection("products").doc(slot.productId).get();
@@ -1711,7 +1713,6 @@ async function autoPromoRunTick({ WA_MAX_PER_RUN = 8, forceGroupIds = null, forc
           });
         }
 
-        // Sentinel-safe: slot is its own doc, not array element
         await patchPlanSlot(todayEAT, slotId, {
           status: "sent",
           sentAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1778,7 +1779,7 @@ function autoPromoStartScheduler({ SCAN_MS = 60 * 1000 } = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Occasion Engine — full-length copy (v2.10.4)
+   Occasion Engine — full-length copy
    ═══════════════════════════════════════════════════════════════ */
 
 const OCCASION_LIBRARY = [
@@ -2072,7 +2073,7 @@ function occasionStartScheduler({ SCAN_MS = 30 * 60 * 1000 } = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   WhatsApp message templates — full-length copy (v2.10.4)
+   WhatsApp message templates — full-length copy
    ═══════════════════════════════════════════════════════════════ */
 
 function storePaymentConfirmedWhatsApp({ customerName, amount, paymentReference }) {
@@ -3616,8 +3617,7 @@ app.post("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 app.get("/api/admin/auto-promo/preview", handleAutoPromoPreview);
 
 /* ═══════════════════════════════════════════════════════════════
-   DAY VIEW — v2.10.5 (subcollection-backed via loadPlan)
-   GET /api/admin/auto-promo/day-view?date=YYYY-MM-DD
+   DAY VIEW
    ═══════════════════════════════════════════════════════════════ */
 app.get("/api/admin/auto-promo/day-view", async (req, res) => {
   try {
@@ -3732,7 +3732,6 @@ app.post("/api/admin/auto-promo/run-now", async (req, res) => {
   }
 });
 
-// v2.10.5 — reads via loadPlan
 app.get("/api/admin/auto-promo/plan", async (req, res) => {
   try {
     const date = req.query.date || autoPromoDateStrEAT();
@@ -3815,7 +3814,11 @@ app.post("/api/admin/marketing-overrides", async (req, res) => {
       if (productName !== undefined) patch.productName = productName;
       if (imageUrl !== undefined) patch.imageUrl = imageUrl;
       if (caption !== undefined) patch.caption = caption;
-      if (time !== undefined) patch.time = time;
+      if (time !== undefined) {
+        // v2.10.6 — recompute hourEAT so the tick's hour query finds it
+        patch.time = time;
+        patch.hourEAT = parseInt(String(time).split(":")[0], 10);
+      }
       if (skipped !== undefined) {
         patch.skipped = skipped;
         patch.status = skipped ? "skipped" : "pending";
@@ -5291,39 +5294,36 @@ app.delete("/api/admin/sticker-studio/:id", async (req, res) => {
 app.get("/_health", (req, res) => {
   res.json({
     ok: true,
-    version: "v2.10.5",
+    version: "v2.10.6",
     timestamp: Date.now(),
     services: { firebase: true, brevo: !!BREVO_API_KEY, intasend: true, waha: !!WAHA_URL },
     firestore: { shop: !!db, realestate: !!reDb },
     autoPromo: {
       enabled: true,
-      version: "v2.10.5",
+      version: "v2.10.6",
       planCollection: "scheduledPromos",
       planShape: "manifest + slots subcollection (no arrays)",
       overridesAppliedAtFireTime: true,
+      overrideTimeMoveUpdatesHourEAT: true,
+      minutePinnedOverridesFire: true,
       dayViewEndpoint: "GET /api/admin/auto-promo/day-view?date=YYYY-MM-DD",
       templates: Object.keys(AutoPromoTemplates),
       campaignCalendar: AUTO_PROMO_CAMPAIGNS.length,
-      nightBucketPool: ["T5", "T18", "T17", "T4"],
     },
     occasions: {
       enabled: true,
       totalOccasions: OCCASION_LIBRARY.length,
-      recurringWeekly: OCCASION_LIBRARY.filter(o => o.recurring === "weekly").length,
-      movable: OCCASION_LIBRARY.filter(o => o.movable).length,
-      sensitive: OCCASION_LIBRARY.filter(o => o.sensitive === true).length,
     },
     whatsappQueue: waQueue.length,
     fixes: [
-      "v2.10.2 — scheduledPromos/{date} plan collection (preview = delivery)",
-      "v2.10.2 — Idempotency via slot.status",
-      "v2.10.2 — Stock-out substitution at fire time",
-      "v2.10.2 — T19/T20 removed from auto-promo pool",
+      "v2.10.1 — Unified override key (date_slot_groupId)",
+      "v2.10.2 — scheduledPromos/{date} plan collection",
       "v2.10.3 — Overrides apply at fire time",
       "v2.10.3 — GET /api/admin/auto-promo/day-view",
-      "v2.10.4 — Full-length occasion + WhatsApp copy restored",
-      "v2.10.5 — Subcollection slot storage (no arrays) — kills array sentinel bug",
-      "v2.10.5 — Concurrent-tick safe; serverTimestamp() works in slot docs",
+      "v2.10.4 — Full-length occasion + WhatsApp copy",
+      "v2.10.5 — Subcollection slot storage (no arrays)",
+      "v2.10.6 — Override time-move updates hourEAT",
+      "v2.10.6 — Tick also fires minute-pinned overrides",
     ],
     uptime: process.uptime(),
   });
@@ -5416,8 +5416,8 @@ setTimeout(adminFlashNudgeTick, 30 * 1000).unref?.();
 console.log("📣 Admin flash nudge armed (7am & 7pm EAT)");
 
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT} — v2.10.5`);
-  console.log(`🤖 AutoPromo: v2.10.5 — subcollection slots (no arrays)`);
+  console.log(`🚀 Server on port ${PORT} — v2.10.6`);
+  console.log(`🤖 AutoPromo: v2.10.6 — override time-move + minute-pinned firing`);
   console.log(`📅 Plan collection: scheduledPromos/{date} + slots/*`);
   console.log(`🎯 Occasion engine: ${OCCASION_LIBRARY.length} occasions`);
 });
