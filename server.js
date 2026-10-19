@@ -4708,16 +4708,16 @@ app.post("/api/intasend-callback", async (req, res) => {
               `Review booking on MarketMix: ${adminLink}`,
             ].join("\n");
             const sellerMessage = isCompletionPayment || orderData.bookingMode === "direct_booking"
-              ? `Hello ${sellerName}, the customer has paid for the site-seeing package at ${propertyTitle}. Please add the visit details on MarketMix: ${visitFormLink}`
+              ? `Hello ${sellerName}, the customer has paid for the site-seeing package at ${propertyTitle}. ${orderData.bookingMode === "direct_booking" ? "Vacancy was not verified and is not guaranteed; please reconfirm with the owner before the visit." : "Availability was confirmed and approved."} After the tour and admin approval, your package balance is the package amount less 15% agency commission and the 3% collection fee. Please add the visit details on MarketMix: ${visitFormLink}`
               : [
                   `Hello ${sellerName}, a paid site-seeing request has been received.`,
                   `Property: ${propertyTitle}`,
                   `Customer: ${customerName} · ${customerPhone || "No phone recorded"}`,
                   `Package: ${booking.packageTitle || orderData.packageTitle || "Site Seeing"}`,
-                  "Please submit the current availability and unit count on the MarketMix website. Add any rent, move-in or listing changes for admin review.",
+                  "To confirm availability, use the MarketMix form to capture live photos and a video of the empty room, enter the available unit count, and submit any changes for admin review. The KSh 25 confirmation payment is sent only after admin approves the evidence.",
                   `Open availability form: ${sellerFormLink}`,
                 ].join("\n");
-            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment || orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. The seller will send your visit details on WhatsApp.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller confirms availability.`, { kind: "site-seeing-buyer-paid", api_ref });
+            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. The seller will send your visit details on WhatsApp.` : orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Vacancy was not verified and is not guaranteed. The seller will contact you to coordinate the visit.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller submits live photos and a YouTube video and admin reviews the vacancy.`, { kind: "site-seeing-buyer-paid", api_ref });
             enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "site-seeing-admin-paid", api_ref });
             if (sellerPhone) enqueueWhatsApp(sellerPhone, sellerMessage, { kind: "site-seeing-seller-paid", api_ref, sellerId });
           }
@@ -4882,6 +4882,54 @@ app.get("/api/transaction/:invoiceId", async (req, res) => {
     return res.json({ success: true, data: docs.docs[0].data() });
   } catch (e) {
     return sendServerError(res, e, "Transaction lookup failed");
+  }
+});
+
+app.post("/api/site-seeing/agent-withdraw", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); } catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const requestedAmount = Number(req.body?.amount);
+    const phoneNumber = normalizePhoneForWa(req.body?.phoneNumber || "");
+    if (!Number.isInteger(requestedAmount) || requestedAmount <= 0) return res.status(400).json({ success: false, message: "Enter a whole shilling amount to withdraw." });
+    if (!phoneNumber) return res.status(400).json({ success: false, message: "Enter a valid Kenyan M-Pesa number." });
+    const withdrawalFee = requestedAmount < 100 ? 10 : requestedAmount >= 5000 ? 30 : 20;
+    const netPayout = requestedAmount - withdrawalFee;
+    if (netPayout <= 0) return res.status(400).json({ success: false, message: "Withdrawal amount must be greater than the withdrawal fee." });
+    const profileSnap = await reDb.collection("users").doc(decoded.uid).get();
+    const profile = profileSnap.data() || {};
+    if (!profileSnap.exists) return res.status(403).json({ success: false, message: "Agent account required." });
+    const walletRef = reDb.collection("agentViewingWallets").doc(decoded.uid);
+    const withdrawalRef = reDb.collection("agentViewingWithdrawals").doc();
+    await reDb.runTransaction(async (transaction) => {
+      const walletSnap = await transaction.get(walletRef);
+      const balance = Number(walletSnap.data()?.withdrawableBalance || 0);
+      if (balance < requestedAmount) throw new Error("Insufficient viewing balance.");
+      transaction.update(walletRef, { withdrawableBalance: balance - requestedAmount, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      transaction.create(withdrawalRef, { withdrawalId: withdrawalRef.id, sellerId: decoded.uid, sellerName: profile.fullName || profile.name || profile.displayName || "MarketMix Agent", phone: phoneNumber, requestedAmount, withdrawalFee, netPayout, currency: "KES", status: "PROCESSING", createdAt: admin.firestore.FieldValue.serverTimestamp(), idempotencyKey: `MM-SVW-${withdrawalRef.id}`.slice(0, 70) });
+    });
+    let provider;
+    try {
+      provider = await intasend.payouts().mpesa({ currency: "KES", requires_approval: "NO", transactions: [{ name: String(profile.fullName || profile.name || "MarketMix Agent").replace(/[^a-zA-Z0-9 _:-]/g, "").slice(0, 80), account: phoneNumber, amount: String(netPayout), narrative: "MarketMix Viewing Earnings", idempotency_key: `MM-SVW-${withdrawalRef.id}`.slice(0, 70) }] });
+    } catch (providerError) {
+      await reDb.runTransaction(async (transaction) => {
+        const [withdrawalSnap, walletSnap] = await Promise.all([transaction.get(withdrawalRef), transaction.get(walletRef)]);
+        if (withdrawalSnap.data()?.status === "PROCESSING") {
+          transaction.update(walletRef, { withdrawableBalance: Number(walletSnap.data()?.withdrawableBalance || 0) + requestedAmount, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+          transaction.update(withdrawalRef, { status: "PAYOUT_FAILED", errorMessage: String(providerError?.message || providerError).slice(0, 300), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        }
+      });
+      return res.status(502).json({ success: false, message: "M-Pesa payout failed. The amount was returned to your viewing balance." });
+    }
+    await withdrawalRef.update({ status: "PAYOUT_INITIATED", trackingId: provider?.tracking_id || null, providerStatus: provider?.status || null, providerResponse: provider || null, initiatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    enqueueWhatsApp(phoneNumber, `MarketMix agent withdrawal initiated. Amount: KSh ${requestedAmount}. Withdrawal fee: KSh ${withdrawalFee}. M-Pesa payout: KSh ${netPayout}. Reference: ${provider?.tracking_id || withdrawalRef.id}`, { kind: "site-seeing-agent-withdrawal", sellerId: decoded.uid, withdrawalId: withdrawalRef.id });
+    return res.json({ success: true, withdrawalId: withdrawalRef.id, requestedAmount, withdrawalFee, netPayout, trackingId: provider?.tracking_id || null, status: "PAYOUT_INITIATED" });
+  } catch (error) {
+    if (error?.message === "Insufficient viewing balance.") return res.status(400).json({ success: false, message: error.message });
+    return sendServerError(res, error, "Could not process agent viewing withdrawal");
   }
 });
 
@@ -5867,7 +5915,7 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     const isCompletion = Boolean(completionBookingId);
     const completionRef = isCompletion ? reDb.collection("sightseeingBookings").doc(completionBookingId) : null;
     const completionSnap = completionRef ? await completionRef.get() : null;
-    if (isCompletion && (!completionSnap.exists || completionSnap.data()?.userId !== decoded.uid || completionSnap.data()?.availabilityStatus !== "available")) return res.status(409).json({ success: false, message: "This booking is not approved to continue yet." });
+    if (isCompletion && (!completionSnap.exists || completionSnap.data()?.userId !== decoded.uid || completionSnap.data()?.availabilityStatus !== "available" || completionSnap.data()?.availabilityApproved !== true)) return res.status(409).json({ success: false, message: "This booking is not approved to continue yet." });
     if (isCompletion && String(completionSnap.data()?.packageId) !== String(packageId)) return res.status(409).json({ success: false, message: "Continue with the package saved in your original request." });
     const depositAmount = isCompletion || bookingMode === "direct_booking" ? totalPrice : 50;
     const bookingId = isCompletion ? completionBookingId : `SS_${Date.now()}_${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
@@ -5945,10 +5993,12 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
 
     const { available, availableUnits = 0, notes = "" } = req.body || {};
     const evidencePhotoUrls = Array.isArray(req.body?.evidencePhotoUrls) ? req.body.evidencePhotoUrls.filter((url) => typeof url === "string" && url.startsWith("https://")).slice(0, 5) : [];
+    const availabilityVideoUrl = String(req.body?.availabilityVideoUrl || "").trim();
     const units = Number(availableUnits);
     if (typeof available !== "boolean") return res.status(400).json({ success: false, message: "Choose whether a unit is available." });
     if (available && (!Number.isInteger(units) || units < 1 || units > 10000)) return res.status(400).json({ success: false, message: "Enter a valid number of available units." });
-    if (available && evidencePhotoUrls.length === 0) return res.status(400).json({ success: false, message: "Upload at least one current photo of the available unit." });
+    if (available && evidencePhotoUrls.length === 0) return res.status(400).json({ success: false, message: "Upload current photos of the available unit." });
+    if (available && !/^https:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=[A-Za-z0-9_-]{11}|youtu\.be\/[A-Za-z0-9_-]{11})(?:[&#?].*)?$/.test(availabilityVideoUrl)) return res.status(400).json({ success: false, message: "Upload the live vacancy video to YouTube before submitting." });
 
     const bookingRef = reDb.collection("sightseeingBookings").doc(String(req.params.bookingId));
     const bookingSnap = await bookingRef.get();
@@ -5960,6 +6010,7 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
     const propertySnap = await reDb.collection("properties").doc(String(booking.propertyId)).get();
     const property = propertySnap.exists ? propertySnap.data() || {} : {};
     const sellerId = booking.sellerId || booking.agentId || property.agentId || property.userId || property.ownerId || property.sellerId || null;
+    const completionUrl = `${REAL_ESTATE_APP_URL}/site-seeing?propertyId=${encodeURIComponent(booking.propertyId || "")}&propertyIds=${encodeURIComponent((booking.propertyIds || [booking.propertyId]).join(","))}&bookingId=${encodeURIComponent(req.params.bookingId)}&packageId=${encodeURIComponent(booking.packageId || "")}&participantCount=${encodeURIComponent(booking.participantCount || 1)}`;
     const callerSnap = await reDb.collection("users").doc(decoded.uid).get();
     const caller = callerSnap.data() || {};
     const isAdmin = caller.role === "admin" || caller.userType === "admin" || (Array.isArray(caller.roles) && caller.roles.includes("admin"));
@@ -5985,6 +6036,8 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
         availabilityStatus: available ? "available" : "unavailable",
         availableUnits: available ? units : 0,
         availabilityEvidencePhotoUrls: available ? evidencePhotoUrls : [],
+        availabilityVideoUrl: available ? availabilityVideoUrl : null,
+        completionUrl: available ? completionUrl : null,
         availabilityNotes: String(notes || "").trim().slice(0, 1000),
         availabilityCheckedBy: decoded.uid,
         availabilityCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -6010,6 +6063,8 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
       `Seller phone: ${sellerPhone}`,
       `Availability: ${available ? `AVAILABLE · ${units} unit(s)` : "UNAVAILABLE"}`,
       `Seller notes: ${String(notes || "None").trim().slice(0, 600) || "None"}`,
+      `Vacancy photos: ${evidencePhotoUrls.join(" | ") || "None"}`,
+      `Vacancy video: ${available ? availabilityVideoUrl : "None"}`,
       `Vacancy confirmation credit: ${available && sellerId ? "KSh 25 after availability photo review and admin approval" : "None"}`,
       `Review and approve on MarketMix: ${adminLink}`,
     ].join("\n");
@@ -6039,11 +6094,13 @@ app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (re
     const bookingSnap = await bookingRef.get();
     if (!bookingSnap.exists) return res.status(404).json({ success: false, message: "Viewing request not found." });
     const booking = bookingSnap.data() || {};
-    if (!["available", "unavailable"].includes(booking.availabilityStatus)) return res.status(409).json({ success: false, message: "Wait for the seller to submit availability first." });
+    const isTourReview = booking.tourStatus === "awaiting_admin_tour_review";
+    if (!isTourReview && !["available", "unavailable"].includes(booking.availabilityStatus)) return res.status(409).json({ success: false, message: "Wait for the seller to submit availability first." });
     if (booking.adminCustomerUpdateStatus === "sent" && booking.tourStatus !== "awaiting_admin_tour_review") return res.status(409).json({ success: false, message: "This request has already been finalized." });
 
     let payout = null;
-    if (booking.availabilityStatus === "available") {
+    if (!isTourReview && booking.availabilityStatus === "available") {
+      if (!booking.availabilityVideoUrl || !(booking.availabilityEvidencePhotoUrls || []).length) return res.status(409).json({ success: false, message: "Availability approval requires both submitted photos and a YouTube video." });
       const sellerId = booking.sellerId || booking.agentId;
       if (!sellerId) return res.status(409).json({ success: false, message: "No seller account is linked to this booking." });
       const sellerSnap = await reDb.collection("users").doc(String(sellerId)).get();
@@ -6084,7 +6141,7 @@ app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (re
               transaction.set(reDb.collection("agentViewingEarnings").doc(String(req.params.bookingId)), { status: "payout_initiated", payoutId: payoutRef.id, paidTo: payoutPhone, payoutInitiatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
             }
           });
-          payout = { success: true, trackingId: provider?.tracking_id || null };
+          payout = { success: true, phone: payoutPhone, trackingId: provider?.tracking_id || null };
         } catch (providerError) {
           await payoutRef.update({ status: "PAYOUT_FAILED", errorMessage: String(providerError?.message || providerError).slice(0, 400), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
           throw new Error("The M-Pesa payout could not be started. The credit remains available for retry.");
@@ -6097,19 +6154,50 @@ app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (re
     const customerPhone = booking.customerPhone || booking.phoneNumber;
     const customerName = booking.customerName || booking.buyerName || "there";
     const propertyTitle = booking.propertyTitle || "the property";
-    const customerMessage = booking.availabilityStatus === "available"
-      ? `Good news, ${customerName} — ${propertyTitle} is available for ${booking.availableUnits || 1} unit(s), confirmed by MarketMix admin. Continue your booking and pay for your selected site-seeing package here: ${REAL_ESTATE_APP_URL}/site-seeing?propertyId=${encodeURIComponent(booking.propertyId || "")}&bookingId=${encodeURIComponent(req.params.bookingId)}&packageId=${encodeURIComponent(booking.packageId || "")}`
+    const customerMessage = isTourReview
+      ? `Your MarketMix site-seeing visit for ${propertyTitle} is marked complete after review of the submitted tour evidence. Thank you for using MarketMix.`
+      : booking.availabilityStatus === "available"
+      ? `Good news, ${customerName} — ${propertyTitle} is available for ${booking.availableUnits || 1} unit(s), confirmed by MarketMix admin. Vacancy photos: ${(booking.availabilityEvidencePhotoUrls || []).join(" | ") || "See your booking"}. Vacancy video: ${booking.availabilityVideoUrl || "See your booking"}. Book your site-seeing visit here: ${booking.completionUrl || `${REAL_ESTATE_APP_URL}/site-seeing?propertyId=${encodeURIComponent(booking.propertyId || "")}&bookingId=${encodeURIComponent(req.params.bookingId)}&packageId=${encodeURIComponent(booking.packageId || "")}`}`
       : `Update on your MarketMix viewing request for ${propertyTitle}: the seller reports that it is not currently available. Browse other properties here: ${REAL_ESTATE_APP_URL}/site-seeing`;
-    if (customerPhone && booking.adminCustomerUpdateStatus !== "sent") enqueueWhatsApp(customerPhone, customerMessage, { kind: "site-seeing-admin-customer-update", bookingId: req.params.bookingId });
+    if (customerPhone && (isTourReview || booking.adminCustomerUpdateStatus !== "sent")) enqueueWhatsApp(customerPhone, customerMessage, { kind: "site-seeing-admin-customer-update", bookingId: req.params.bookingId });
+    let tourEarning = null;
+    if (isTourReview) {
+      const sellerId = booking.assignedAgentId || booking.agentId || booking.sellerId;
+      if (!sellerId) return res.status(409).json({ success: false, message: "No assigned agent is linked to this completed tour." });
+      const grossAmount = Number(booking.packagePaymentAmount || booking.directPaymentAmount || booking.totalPrice || booking.packagePrice || 0);
+      if (!Number.isFinite(grossAmount) || grossAmount <= 0) return res.status(409).json({ success: false, message: "The paid site-seeing package amount is missing; cannot calculate the agent earning." });
+      const agencyCommissionAmount = Math.floor(grossAmount * 0.15);
+      const collectionFeeAmount = Math.ceil(grossAmount * 0.03);
+      const netAmount = Math.max(0, grossAmount - agencyCommissionAmount - collectionFeeAmount);
+      const earningRef = reDb.collection("agentViewingEarnings").doc(String(req.params.bookingId));
+      const walletRef = reDb.collection("agentViewingWallets").doc(String(sellerId));
+      let newlyCredited = false;
+      await reDb.runTransaction(async (transaction) => {
+        const [earningSnap, walletSnap] = await Promise.all([transaction.get(earningRef), transaction.get(walletRef)]);
+        if (earningSnap.exists && ["tour_approved", "payout_initiated", "paid"].includes(String(earningSnap.data()?.status || ""))) return;
+        transaction.set(walletRef, { withdrawableBalance: admin.firestore.FieldValue.increment(netAmount), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        transaction.set(earningRef, { bookingId: String(req.params.bookingId), sellerId, grossAmount, agencyCommissionRate: 0.15, agencyCommissionAmount, collectionFeeRate: 0.03, collectionFeeAmount, netAmount, currency: "KES", status: "tour_approved", creditedAt: admin.firestore.FieldValue.serverTimestamp(), createdAt: earningSnap.exists ? earningSnap.data()?.createdAt || admin.firestore.FieldValue.serverTimestamp() : admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        newlyCredited = true;
+      });
+      tourEarning = { grossAmount, agencyCommissionAmount, collectionFeeAmount, netAmount };
+      if (newlyCredited) {
+        const sellerSnap = await reDb.collection("users").doc(String(sellerId)).get();
+        const seller = sellerSnap.data() || {};
+        const sellerPhone = seller.mpesaPhone || seller.phoneNumber || seller.phone || seller.contactPhone || booking.sellerPhone || booking.ownerPhone;
+        if (sellerPhone) enqueueWhatsApp(sellerPhone, `Your MarketMix site-seeing tour was approved. Package amount: KSh ${grossAmount}. Agency commission (15%): KSh ${agencyCommissionAmount}. Collection fee (3%): KSh ${collectionFeeAmount}. KSh ${netAmount} has been added to your viewing balance. Withdrawal fees apply when you cash out.`, { kind: "site-seeing-tour-earning-approved", bookingId: req.params.bookingId });
+      }
+    }
+    if (payout?.success && !payout.alreadyInitiated) enqueueWhatsApp(payout.phone || booking.sellerPhone || booking.ownerPhone, `MarketMix vacancy evidence approved. Your KSh 25 confirmation payout has been initiated to M-Pesa. If the customer books and completes the site-seeing tour, your package earnings are paid after admin approval, less 15% agency commission and the 3% collection fee.`, { kind: "site-seeing-vacancy-payout", bookingId: req.params.bookingId });
     await bookingRef.set({
       adminCustomerUpdateStatus: "sent", adminCustomerUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(isTourReview ? { tourCompleted: true, tourEvidenceReviewStatus: "approved", agentAssignmentLocked: false, assignmentReleasedAt: admin.firestore.FieldValue.serverTimestamp() } : booking.availabilityStatus === "available" ? { availabilityApproved: true, availabilityApprovedAt: admin.firestore.FieldValue.serverTimestamp(), availabilityApprovedBy: decoded.uid } : {}),
       adminCustomerUpdatedBy: decoded.uid,
-      status: booking.tourStatus === "awaiting_admin_tour_review" ? "completed" : booking.availabilityStatus === "available" ? "awaiting_customer_completion" : "property_unavailable",
+      status: isTourReview ? "completed" : booking.availabilityStatus === "available" ? "awaiting_customer_completion" : "property_unavailable",
       bookingStatus: booking.tourStatus === "awaiting_admin_tour_review" ? "completed" : booking.availabilityStatus === "available" ? "awaiting_customer_completion" : "property_unavailable",
       ...(booking.tourStatus === "awaiting_admin_tour_review" ? { tourCompleted: true, tourCompletedAt: admin.firestore.FieldValue.serverTimestamp(), tourEvidenceReviewStatus: "approved", agentAssignmentLocked: false, assignmentReleasedAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
-    return res.json({ success: true, bookingId: req.params.bookingId, customerNotified: Boolean(customerPhone), payout });
+    return res.json({ success: true, bookingId: req.params.bookingId, customerNotified: Boolean(customerPhone), payout, tourEarning });
   } catch (e) {
     return sendServerError(res, e, "Could not finalize site-seeing availability");
   }
@@ -6172,7 +6260,7 @@ app.post("/api/bookings/site-seeing/:bookingId/complete-tour", async (req, res) 
     if (booking.tourStatus === "awaiting_admin_tour_review" || booking.tourCompleted === true) return res.json({ success: true, bookingId, status: booking.tourStatus, alreadySubmitted: true });
     await bookingRef.set({ status: "awaiting_admin_tour_review", bookingStatus: "awaiting_admin_tour_review", tourStatus: "awaiting_admin_tour_review", tourEvidenceUrls: evidenceUrls, tourEvidenceSubmittedBy: decoded.uid, tourEvidenceSubmittedAt: admin.firestore.FieldValue.serverTimestamp(), agentAssignmentLocked: true, tourEvidenceReviewStatus: "pending_admin_review", updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     const adminLink = `${REAL_ESTATE_APP_URL}/admin/sightseeing-bookings?bookingId=${encodeURIComponent(bookingId)}`;
-    enqueueWhatsApp(ADMIN_PHONE, `Tour evidence needs review\\nBooking: ${bookingId}\\nProperty: ${booking.propertyTitle || "Property"}\\nAgent payout: KSh 25 pending approval\\nReview: ${adminLink}`, { kind: "site-seeing-tour-evidence-review", bookingId });
+    enqueueWhatsApp(ADMIN_PHONE, `Tour evidence needs review\\nBooking: ${bookingId}\\nProperty: ${booking.propertyTitle || "Property"}\\nAgent site-seeing payment: pending admin approval after tour evidence\\nReview: ${adminLink}`, { kind: "site-seeing-tour-evidence-review", bookingId });
     return res.json({ success: true, bookingId, status: "awaiting_admin_tour_review", assignmentReleased: false });  } catch (e) { return sendServerError(res, e, "Could not complete site-seeing tour"); }
 });
 app.post("/api/bookings/site-seeing/confirm", async (req, res) => {
