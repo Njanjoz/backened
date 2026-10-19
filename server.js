@@ -6169,14 +6169,14 @@ app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (re
       const agencyCommissionAmount = Math.floor(grossAmount * 0.15);
       const collectionFeeAmount = Math.ceil(grossAmount * 0.03);
       const netAmount = Math.max(0, grossAmount - agencyCommissionAmount - collectionFeeAmount);
-      const earningRef = reDb.collection("agentViewingEarnings").doc(String(req.params.bookingId));
+      const earningRef = reDb.collection("agentViewingEarnings").doc(`${String(req.params.bookingId)}__tour`);
       const walletRef = reDb.collection("agentViewingWallets").doc(String(sellerId));
       let newlyCredited = false;
       await reDb.runTransaction(async (transaction) => {
         const [earningSnap, walletSnap] = await Promise.all([transaction.get(earningRef), transaction.get(walletRef)]);
         if (earningSnap.exists && ["tour_approved", "payout_initiated", "paid"].includes(String(earningSnap.data()?.status || ""))) return;
         transaction.set(walletRef, { withdrawableBalance: admin.firestore.FieldValue.increment(netAmount), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        transaction.set(earningRef, { bookingId: String(req.params.bookingId), sellerId, grossAmount, agencyCommissionRate: 0.15, agencyCommissionAmount, collectionFeeRate: 0.03, collectionFeeAmount, netAmount, currency: "KES", status: "tour_approved", creditedAt: admin.firestore.FieldValue.serverTimestamp(), createdAt: earningSnap.exists ? earningSnap.data()?.createdAt || admin.firestore.FieldValue.serverTimestamp() : admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        transaction.set(earningRef, { bookingId: String(req.params.bookingId), earningKind: "site_seeing_tour", sellerId, grossAmount, agencyCommissionRate: 0.15, agencyCommissionAmount, collectionFeeRate: 0.03, collectionFeeAmount, netAmount, currency: "KES", status: "tour_approved", creditedAt: admin.firestore.FieldValue.serverTimestamp(), createdAt: earningSnap.exists ? earningSnap.data()?.createdAt || admin.firestore.FieldValue.serverTimestamp() : admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         newlyCredited = true;
       });
       tourEarning = { grossAmount, agencyCommissionAmount, collectionFeeAmount, netAmount };
