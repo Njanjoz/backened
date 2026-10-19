@@ -5353,6 +5353,55 @@ app.post("/api/moving/quote/respond", async (req,res) => {
     return res.json({success:true,message:action==="appeal"?"Counter-offer sent to MarketMix admin":"Quote response saved"});
   } catch(e) { console.error("Moving quote response failed:",e); return res.status(400).json({success:false,message:e.message||"Could not save quote response"}); }
 });
+// === Additive MarketMix Moving item-specific driver rate cards ===
+app.get("/api/moving/drivers/quotes-item-rates", async (req,res) => {
+  try {
+    const user=await movingAuth(req);
+    const vehicleId=String(req.query.vehicleId||"");
+    const pickup={lat:Number(req.query.pickupLat),lng:Number(req.query.pickupLng)};
+    const destination={lat:Number(req.query.destinationLat),lng:Number(req.query.destinationLng)};
+    const area={pickupCounty:String(req.query.pickupCounty||""),pickupSubCounty:String(req.query.pickupSubCounty||""),pickupWard:String(req.query.pickupWard||""),pickupArea:String(req.query.pickupArea||""),pickupCoordinates:pickup};
+    let itemCounts={};
+    try { const parsed=JSON.parse(String(req.query.itemCounts||"{}")); if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))itemCounts=parsed; } catch {}
+    if(!["motorbike","tuk","pickup","lorry"].includes(vehicleId)||![pickup.lat,pickup.lng,destination.lat,destination.lng].every(Number.isFinite)||!itemCounts||typeof itemCounts!=="object"||Array.isArray(itemCounts))return res.status(400).json({success:false,message:"Choose a vehicle, valid trip pins, and belongings"});
+    const straightKm=movingPointKm(pickup,destination);
+    if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
+    const routeKm=Math.round(straightKm*1.15*10)/10;
+    const all=await reDb.collection("users").where("driverApproved","==",true).get();
+    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.id!==user.uid&&d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)&&movingCanCarry(d,{items:itemCounts})).map(d=>{
+      const p=d.driverProfile||{},ratePerKm=Number(p.ratePerKm||0),itemRates=p.itemRates&&typeof p.itemRates==="object"?p.itemRates:{};
+      const itemFeeBreakdown=Object.fromEntries(Object.entries(itemCounts).filter(([,count])=>Number(count)>0).map(([item,count])=>[item,Math.max(0,Number(itemRates[item])||0)*Number(count)]));
+      const itemFeeTotal=Object.values(itemFeeBreakdown).reduce((sum,fee)=>sum+fee,0),distanceFare=routeKm*ratePerKm,quote=Math.ceil((distanceFare+itemFeeTotal)/50)*50;
+      const from=movingPointKm(p.workCoordinates||d.workCoordinates,pickup),last=d.driverLastSeenAt?.toMillis?.()||0;
+      return {id:d.id,name:String(d.name||d.displayName||"Local driver").slice(0,80),vehicleId:p.vehicleId,vehicleTemplate:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),photoUrl:String(p.photoUrl||"").slice(0,500),ratePerKm,itemRates,itemFeeBreakdown,itemFeeTotal,distanceFare,driverDistanceKm:from==null?null:Math.round(from*10)/10,routeKm,quote,online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
+    }).filter(d=>d.ratePerKm>0&&Number.isFinite(d.quote)).sort((a,b)=>Number(b.online)-Number(a.online)||a.quote-b.quote);
+    return res.json({success:true,drivers});
+  } catch(e) { console.error("Moving item-rate driver quote search failed:",e); return res.status(500).json({success:false,message:e.message||"Could not find drivers"}); }
+});
+
+app.post("/api/moving/dispatch-quote-item-rates", async (req,res) => {
+  try {
+    const user=await movingAuth(req),{requestId}=req.body||{};
+    if(!requestId)return res.status(400).json({success:false,message:"Missing requestId"});
+    const ref=reDb.collection("transportRequests").doc(String(requestId)),snap=await ref.get();
+    if(!snap.exists)return res.status(404).json({success:false,message:"Request not found"});
+    const request=snap.data();
+    if(request.userId!==user.uid)return res.status(403).json({success:false,message:"Not allowed"});
+    if(!request.quotedDriverId||!["REQUESTED","QUOTED"].includes(request.status)||request.driverUserId)return res.status(409).json({success:false,message:"Request is no longer open"});
+    const driverSnap=await reDb.collection("users").doc(request.quotedDriverId).get(),driver=driverSnap.data()||{},p=driver.driverProfile||{};
+    if(!driverSnap.exists||driver.driverApproved!==true||p.vehicleId!==request.vehicleId||!movingMatches(driver,request)||!movingCanCarry(driver,request)||!(Number(p.ratePerKm)>0))return res.status(409).json({success:false,message:"Selected driver or rate card is no longer available"});
+    const straightKm=movingPointKm(request.pickupCoordinates,request.destinationCoordinates);
+    if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
+    const routeKm=Math.round(straightKm*1.15*10)/10,ratePerKm=Number(p.ratePerKm),itemRates=p.itemRates&&typeof p.itemRates==="object"?p.itemRates:{};
+    const itemFeeBreakdown=Object.fromEntries(Object.entries(request.items||{}).filter(([,count])=>Number(count)>0).map(([item,count])=>[item,Math.max(0,Number(itemRates[item])||0)*Number(count)]));
+    const itemFeeTotal=Object.values(itemFeeBreakdown).reduce((sum,fee)=>sum+fee,0),distanceFare=routeKm*ratePerKm,quote=Math.ceil((distanceFare+itemFeeTotal)/50)*50;
+    await ref.update({offerDriverIds:[request.quotedDriverId],quotedPrice:quote,quotedRouteKm:routeKm,quotedRatePerKm:ratePerKm,quotedItemRates:itemRates,quotedItemFeeBreakdown:itemFeeBreakdown,quotedItemFeeTotal:itemFeeTotal,quotedDistanceFare:distanceFare,quoteModel:"driver-distance-plus-item-rates-v2",quotedDriverName:driver.name||driver.displayName||"Driver",offerDispatchMode:driver.driverOnline===true?"online":"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    const phone=driver.phoneNumber||driver.phone||p.phone;
+    if(phone)enqueueWhatsApp(phone,["🚚 *MarketMix Moving — item-rate quote request*",(request.userName||"A customer")+" selected your "+(request.vehicleLabel||p.vehicleId)+" rate card.","Pickup: "+(request.pickupLabel||"See dashboard"),"Destination: "+(request.destinationLabel||request.destinationTitle||"See dashboard"),"Trip: "+routeKm+" km · Distance rate: KSh "+ratePerKm+"/km · Item fees: KSh "+itemFeeTotal.toLocaleString("en-KE")+" · Quote: KSh "+quote.toLocaleString("en-KE"),"Open: https://marketmix-realestates.vercel.app/driver/dashboard"].join(String.fromCharCode(10)),{kind:"moving-driver-item-rate-quote",requestId,driverId:request.quotedDriverId,quote});
+    return res.json({success:true,quote,routeKm,ratePerKm,itemFeeTotal,itemFeeBreakdown,driverId:request.quotedDriverId});
+  } catch(e) { console.error("Dispatch moving item-rate quote failed:",e); return res.status(500).json({success:false,message:e.message||"Could not send the selected driver quote"}); }
+});
+// === End additive MarketMix Moving item-specific driver rate cards ===
 // === End MarketMix Moving quote section ===
 
 app.post("/api/moving/notify", async (req, res) => {
