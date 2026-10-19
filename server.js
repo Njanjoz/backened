@@ -5185,6 +5185,23 @@ function movingPointKm(a, b) {
   return Math.round(6371 * 2 * Math.atan2(Math.sqrt(x),Math.sqrt(1-x)) * 10) / 10;
 }
 
+// Additive generic alert for unmatched requests; sensitive trip/driver details stay in admin Firestore view.
+async function notifyMovingNoMatchAdmin(requestId) {
+  const notificationRef = reDb.collection("adminNotifications").doc("transport_no_match_" + requestId);
+  const notificationSnap = await notificationRef.get();
+  if (notificationSnap.exists && notificationSnap.data()?.whatsappQueued === true) return;
+  const message = "⚠️ MarketMix Moving: no compatible driver was found for request " + requestId +
+    ". Review the request and nearby contacts securely in the admin portal: https://marketmix-realestates.vercel.app/admin/transport-requests";
+  const whatsappQueued = enqueueWhatsApp(ADMIN_PHONE, message, { kind: "moving-no-driver-match-admin", requestId });
+  await notificationRef.set({
+    kind: "moving-no-driver-match", requestId, title: "No compatible driver found",
+    message: "A move request has no compatible nearby driver. Open the admin transport requests page to review its details and nearby contacts.",
+    whatsappQueued: Boolean(whatsappQueued), status: whatsappQueued ? "SENT_TO_QUEUE" : "PENDING",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...(notificationSnap.exists ? {} : { createdAt: admin.firestore.FieldValue.serverTimestamp() })
+  }, { merge: true });
+}
+// === End additive fallback notification ===
 app.post("/api/moving/dispatch", async (req,res) => {
   try {
     const user = await movingAuth(req), {requestId} = req.body || {};
@@ -5203,6 +5220,7 @@ app.post("/api/moving/dispatch", async (req,res) => {
         return {driverId:d.id,name:String(d.name||d.displayName||"Driver").slice(0,80),phone:String(d.phoneNumber||d.phone||p.phone||"").slice(0,32),vehicleLabel:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),canCarryItems:Array.isArray(p.canCarryItems)?p.canCarryItems:[],cargoCapacity:p.cargoCapacity&&typeof p.cargoCapacity==="object"?p.cargoCapacity:{},driverDistanceKm:movingPointKm(d.driverLiveLocation||p.workCoordinates||d.workCoordinates,request.pickupCoordinates),online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
       }).sort((a,b)=>Number(b.online)-Number(a.online)||(a.driverDistanceKm??Infinity)-(b.driverDistanceKm??Infinity)).slice(0,30);
       await reDb.collection("transportCapacityAlerts").doc(requestId).set({requestId,status:"PENDING",customerName:String(request.userName||"Customer").slice(0,120),pickupLabel:String(request.pickupLabel||"").slice(0,200),destinationLabel:String(request.destinationLabel||request.destinationTitle||"").slice(0,200),vehicleLabel:String(request.vehicleLabel||"").slice(0,60),items:Object.entries(request.items||{}).filter(([,q])=>Number(q)>0).map(([id,quantity])=>({id,quantity:Number(quantity)})),nearbyDrivers:contacts,nearbyDriverCount:nearby.length,createdAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
+      await notifyMovingNoMatchAdmin(requestId).catch(error => console.error("No-match admin notification failed:", error));
       await ref.update({offerDriverIds:[],offerDispatchMode:"admin-capacity-review",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
       return res.json({success:true,mode:"admin-capacity-review",drivers:[],capacityAlert:true});
     }
