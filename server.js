@@ -5151,6 +5151,78 @@ app.post("/api/service-request/notify", async (req, res) => {
   }
 });
 
+async function movingAuth(req) {
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) throw new Error("Unauthorized");
+  return verifyAnyToken(h.slice(7));
+}
+const movingNorm = v => String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ");
+function movingMatches(driver, request) {
+  const p = driver.driverProfile || {}, county = movingNorm(p.workCounty || driver.workCounty), pickupCounty = movingNorm(request.pickupCounty);
+  if (county && pickupCounty && county !== pickupCounty) return false;
+  for (const [a, b] of [["workSubCounty","pickupSubCounty"],["workWard","pickupWard"],["workArea","pickupArea"]]) {
+    const x = movingNorm(p[a] || driver[a]), y = movingNorm(request[b]);
+    if (x && y && x === y) return true;
+  }
+  const home = p.workCoordinates || driver.workCoordinates, point = request.pickupCoordinates;
+  if (home && point && Number.isFinite(Number(home.lat)) && Number.isFinite(Number(home.lng))) {
+    const r = n => n * Math.PI / 180, dl = r(Number(point.lat)-Number(home.lat)), dn = r(Number(point.lng)-Number(home.lng)), a = r(Number(home.lat)), b = r(Number(point.lat));
+    const v = Math.sin(dl/2)**2 + Math.cos(a)*Math.cos(b)*Math.sin(dn/2)**2;
+    if (6371 * 2 * Math.atan2(Math.sqrt(v),Math.sqrt(1-v)) <= 35) return true;
+  }
+  return Boolean(county && pickupCounty && county === pickupCounty);
+}
+app.post("/api/moving/dispatch", async (req,res) => {
+  try {
+    const user = await movingAuth(req), {requestId} = req.body || {};
+    if (!requestId) return res.status(400).json({success:false,message:"Missing requestId"});
+    const ref = reDb.collection("transportRequests").doc(requestId), snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({success:false,message:"Request not found"});
+    const request = snap.data();
+    if (request.userId !== user.uid) return res.status(403).json({success:false,message:"Not allowed"});
+    if (!["REQUESTED","QUOTED"].includes(request.status) || request.driverUserId) return res.status(409).json({success:false,message:"Request is no longer open"});
+    const all = await reDb.collection("users").where("driverApproved","==",true).get();
+    const matched = all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>movingMatches(d,request));
+    const cutoff = Date.now()-300000, online = matched.filter(d=>d.driverOnline===true && (d.driverLastSeenAt?.toMillis?.()||0)>=cutoff), selected = online.length ? online : matched;
+    await ref.update({offerDriverIds:selected.map(d=>d.id),offerDispatchMode:online.length?"online":"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    return res.json({success:true,mode:online.length?"online":"registered-area",drivers:selected.map(({id,phoneNumber,phone,driverProfile})=>({id,phoneNumber,phone,driverProfile}))});
+  } catch(e) { console.error("Moving dispatch error:",e); return res.status(500).json({success:false,message:e.message||"Driver matching failed"}); }
+});
+app.get("/api/moving/driver/offers", async (req,res) => {
+  try {
+    const user=await movingAuth(req), userSnap=await reDb.collection("users").doc(user.uid).get();
+    if (!userSnap.exists || userSnap.data()?.driverApproved!==true) return res.status(403).json({success:false,message:"Driver account not approved yet"});
+    const pending=await reDb.collection("transportRequests").where("status","in",["QUOTED","REQUESTED"]).get(), refs=[];
+    for (const d of pending.docs) { const r=d.data(); if (!r.driverUserId && movingMatches(userSnap.data(),r)) refs.push(d.ref); }
+    for(let i=0;i<refs.length;i+=450){const batch=reDb.batch();refs.slice(i,i+450).forEach(ref=>batch.update(ref,{offerDriverIds:admin.firestore.FieldValue.arrayUnion(user.uid),offerDispatchMode:"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()}));await batch.commit();}
+    const snap=await reDb.collection("transportRequests").where("offerDriverIds","array-contains",user.uid).get();
+    const offers=snap.docs.map(d=>({id:d.id,requestId:d.id,...d.data()})).filter(r=>["QUOTED","REQUESTED"].includes(r.status)&&!r.driverUserId);
+    return res.json({success:true,offers});
+  } catch(e) { console.error("List moving offers error:",e); return res.status(500).json({success:false,message:e.message||"Could not load offers"}); }
+});
+app.post("/api/moving/driver/accept", async (req,res) => {
+  try {
+    const user=await movingAuth(req),{requestId}=req.body||{};
+    if(!requestId)return res.status(400).json({success:false,message:"Missing requestId"});
+    const userSnap=await reDb.collection("users").doc(user.uid).get(), driver=userSnap.data()||{};
+    if(driver.driverApproved!==true)return res.status(403).json({success:false,message:"Driver not approved"});
+    const ref=reDb.collection("transportRequests").doc(requestId);
+    await reDb.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw Error("Request not found");const r=snap.data();if(r.driverUserId||!["QUOTED","REQUESTED"].includes(r.status))throw Error("Offer already claimed");if(!(r.offerDriverIds||[]).includes(user.uid))throw Error("Offer unavailable to this account");tx.update(ref,{driverUserId:user.uid,driverName:driver.name||driver.displayName||"Driver",driverPhone:driver.phoneNumber||driver.phone||driver.driverProfile?.phone||"",vehicleLabel:driver.driverProfile?.vehicleTemplate||driver.driverProfile?.vehicleId||"Vehicle",status:"DRIVER_ASSIGNED",assignedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});});
+    return res.json({success:true,message:"Offer accepted"});
+  } catch(e) { console.error("Accept moving offer error:",e); return res.status(409).json({success:false,message:e.message||"Could not accept offer"}); }
+});
+app.post("/api/moving/driver/decline", async (req,res) => {
+  try { const user=await movingAuth(req),{requestId,reason}=req.body||{}; if(!requestId)return res.status(400).json({success:false,message:"Missing requestId"}); const ref=reDb.collection("transportRequests").doc(requestId),snap=await ref.get(); if(!snap.exists)return res.status(404).json({success:false,message:"Request not found"}); if(!(snap.data().offerDriverIds||[]).includes(user.uid))return res.status(403).json({success:false,message:"Offer unavailable"}); await ref.update({declinedDrivers:admin.firestore.FieldValue.arrayUnion({driverId:user.uid,reason:reason||"Declined",at:new Date()}),updatedAt:admin.firestore.FieldValue.serverTimestamp()}); return res.json({success:true,message:"Offer declined"}); }
+  catch(e){console.error("Decline moving offer error:",e);return res.status(500).json({success:false,message:e.message||"Could not decline offer"});}
+});
+async function updateMovingTrip(req,res,status,timeField) {
+  try { const user=await movingAuth(req),{requestId}=req.body||{};if(!requestId)return res.status(400).json({success:false,message:"Missing requestId"});const ref=reDb.collection("transportRequests").doc(requestId),snap=await ref.get();if(!snap.exists||snap.data()?.driverUserId!==user.uid)return res.status(403).json({success:false,message:"Trip is not assigned to this driver"});await ref.update({status,[timeField]:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});return res.json({success:true});}
+  catch(e){console.error("Moving trip update error:",e);return res.status(500).json({success:false,message:e.message||"Could not update trip"});}
+}
+app.post("/api/moving/driver/start-trip",(req,res)=>updateMovingTrip(req,res,"IN_TRANSIT","startedAt"));
+app.post("/api/moving/driver/complete",(req,res)=>updateMovingTrip(req,res,"DELIVERED","completedAt"));
+
+
 app.post("/api/moving/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
