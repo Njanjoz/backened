@@ -5687,6 +5687,150 @@ app.get("/_health", (req, res) => {
   });
 });
 
+/* ═══════════════════════════════════════════════════════════════
+   SITE-SEEING BOOKINGS — v1
+   Checkout prepares a pending booking and payment order. The client
+   sends the M-Pesa prompt, polls the existing transaction endpoint,
+   then calls confirm after payment is paid.
+   ═══════════════════════════════════════════════════════════════ */
+
+app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+
+    const { propertyId, packageId, phoneNumber } = req.body || {};
+    if (!propertyId || !packageId || !phoneNumber) {
+      return res.status(400).json({ success: false, message: "propertyId, packageId and phoneNumber required" });
+    }
+    if (!isValidPhone(phoneNumber)) {
+      return res.status(400).json({ success: false, message: "Phone must be in 2547XXXXXXXX or 2541XXXXXXXX format" });
+    }
+
+    const [propertySnap, packageSnap, userSnap] = await Promise.all([
+      reDb.collection("properties").doc(String(propertyId)).get(),
+      reDb.collection("sightseeingPackages").doc(String(packageId)).get(),
+      reDb.collection("users").doc(decoded.uid).get(),
+    ]);
+    if (!propertySnap.exists) return res.status(404).json({ success: false, message: "Property not found" });
+
+    const defaultPackages = {
+      quick_view: { title: "Quick View", price: 100 },
+      assisted_view: { title: "Assisted View", price: 250 },
+      student_hunt: { title: "Student Hunt", price: 300 },
+      property_hunt: { title: "Property Hunt", price: 500 },
+      premium_hunt: { title: "Premium Hunt", price: 1000 },
+      group_viewing: { title: "Group Viewing", price: 150 },
+    };
+    const property = propertySnap.data() || {};
+    const pkg = packageSnap.exists
+      ? (packageSnap.data() || {})
+      : (defaultPackages[String(packageId)] || null);
+    if (!pkg) return res.status(404).json({ success: false, message: "Viewing package not found" });
+    if (pkg.active === false || pkg.enabled === false || pkg.isActive === false) {
+      return res.status(400).json({ success: false, message: "This viewing package is unavailable" });
+    }
+    const totalPrice = Number(pkg.price);
+    if (!Number.isFinite(totalPrice) || totalPrice < 50) {
+      return res.status(400).json({ success: false, message: "Package price must be at least KSh 50" });
+    }
+
+    const depositAmount = Math.ceil(totalPrice * 0.20);
+    const bookingId = `SS_${Date.now()}_${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+    const paymentRef = `PROP_SITESEEING_${bookingId}`;
+    const user = userSnap.exists ? (userSnap.data() || {}) : {};
+    const buyerEmail = decoded.email || user.email || null;
+    const buyerName = user.fullName || user.name || decoded.name || (buyerEmail ? buyerEmail.split("@")[0] : "Customer");
+    const ownerPhone = property.landlordPhone || property.phone || property.sellerPhone || property.ownerPhone || property.agentPhone || null;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    await reDb.collection("siteSeeingBookings").doc(bookingId).set({
+      bookingId, paymentRef, userId: decoded.uid, buyerName, buyerEmail,
+      phoneNumber, propertyId: propertySnap.id,
+      propertyTitle: property.title || property.name || "Property",
+      propertyLocation: property.location || property.address || null,
+      packageId: packageSnap.id, packageTitle: pkg.title || pkg.name || "Site Seeing",
+      totalPrice, depositAmount, remainingBalance: totalPrice - depositAmount,
+      paymentStatus: "pending", bookingStatus: "awaiting_payment",
+      ownerPhone, createdAt: now, updatedAt: now,
+    });
+
+    await db.collection("orders").doc(paymentRef).set({
+      orderId: paymentRef, orderType: "real_estate", isRealEstate: true,
+      isSiteSeeingBooking: true, bookingId, userId: decoded.uid,
+      userEmail: buyerEmail, buyerEmail, buyerName, phoneNumber,
+      totalAmount: depositAmount, packageTotal: totalPrice,
+      paymentKind: "site_seeing_deposit",
+      propertyId: propertySnap.id,
+      propertyTitle: property.title || property.name || "Property",
+      propertyLocation: property.location || property.address || null,
+      propertyType: "site_seeing", landlordName: property.landlordName || property.ownerName || null,
+      landlordPhone: ownerPhone, paymentStatus: "pending", state: "INITIATED",
+      createdAt: now, updatedAt: now,
+    });
+
+    return res.json({
+      success: true, bookingId, paymentRef, totalPrice, depositAmount,
+      remainingBalance: totalPrice - depositAmount,
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not prepare site-seeing booking");
+  }
+});
+
+app.post("/api/bookings/site-seeing/confirm", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+
+    const { paymentRef } = req.body || {};
+    if (!paymentRef || !String(paymentRef).startsWith("PROP_SITESEEING_SS_")) {
+      return res.status(400).json({ success: false, message: "Valid site-seeing paymentRef required" });
+    }
+
+    const orderSnap = await db.collection("orders").doc(String(paymentRef)).get();
+    if (!orderSnap.exists || orderSnap.data()?.isSiteSeeingBooking !== true) {
+      return res.status(404).json({ success: false, message: "Site-seeing payment not found" });
+    }
+    const order = orderSnap.data() || {};
+    if (order.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This booking belongs to another user" });
+    if (order.paymentStatus !== "paid") return res.status(409).json({ success: false, message: "Payment is not confirmed yet" });
+
+    const bookingRef = reDb.collection("siteSeeingBookings").doc(String(order.bookingId));
+    const bookingSnap = await bookingRef.get();
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, message: "Booking record not found" });
+
+    const booking = bookingSnap.data() || {};
+    if (booking.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This booking belongs to another user" });
+    await bookingRef.set({
+      paymentStatus: "paid", bookingStatus: "queued_for_agent_confirmation",
+      mpesaReference: order.mpesaReference || null,
+      confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return res.json({
+      success: true, bookingId: booking.bookingId,
+      paymentRef, totalPrice: booking.totalPrice,
+      depositAmount: booking.depositAmount,
+      remainingBalance: booking.remainingBalance,
+      mpesaReference: order.mpesaReference || null,
+      bookingStatus: "queued_for_agent_confirmation",
+    });
+  } catch (e) {
+    return sendServerError(res, e, "Could not confirm site-seeing booking");
+  }
+});
 app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
 
 process.on("uncaughtException", (err) => console.error("Uncaught:", err));
