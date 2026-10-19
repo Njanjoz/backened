@@ -5173,10 +5173,11 @@ function movingMatches(driver, request) {
   return Boolean(county && pickupCounty && county === pickupCounty);
 }
 function movingCanCarry(driver, request) {
-  const supported = driver.driverProfile?.canCarryItems;
-  const requested = Object.entries(request.items || {}).filter(([, quantity]) => Number(quantity) > 0).map(([item]) => item);
-  return requested.length > 0 && Array.isArray(supported) && requested.every(item => supported.includes(item));
-}function movingPointKm(a, b) {
+  const profile = driver.driverProfile || {}, supported = Array.isArray(profile.canCarryItems) ? profile.canCarryItems : [], capacity = profile.cargoCapacity && typeof profile.cargoCapacity === "object" ? profile.cargoCapacity : {};
+  const requested = Object.entries(request.items || {}).filter(([, quantity]) => Number(quantity) > 0);
+  return requested.length > 0 && requested.every(([item, quantity]) => { const max=Number(capacity[item] ?? (supported.includes(item) ? 1 : 0)); return max>0 && max>=Number(quantity); });
+}
+function movingPointKm(a, b) {
   if (!a || !b || ![a.lat,a.lng,b.lat,b.lng].every(v => Number.isFinite(Number(v)))) return null;
   const rad = n => n * Math.PI / 180, dl = rad(Number(b.lat)-Number(a.lat)), dn = rad(Number(b.lng)-Number(a.lng));
   const la = rad(Number(a.lat)), lb = rad(Number(b.lat));
@@ -5199,7 +5200,7 @@ app.post("/api/moving/dispatch", async (req,res) => {
     if (!matched.length) {
       const contacts = nearby.map(d=>{
         const p=d.driverProfile||{}, last=d.driverLastSeenAt?.toMillis?.()||0;
-        return {driverId:d.id,name:String(d.name||d.displayName||"Driver").slice(0,80),phone:String(d.phoneNumber||d.phone||p.phone||"").slice(0,32),vehicleLabel:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),canCarryItems:Array.isArray(p.canCarryItems)?p.canCarryItems:[],driverDistanceKm:movingPointKm(d.driverLiveLocation||p.workCoordinates||d.workCoordinates,request.pickupCoordinates),online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
+        return {driverId:d.id,name:String(d.name||d.displayName||"Driver").slice(0,80),phone:String(d.phoneNumber||d.phone||p.phone||"").slice(0,32),vehicleLabel:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),canCarryItems:Array.isArray(p.canCarryItems)?p.canCarryItems:[],cargoCapacity:p.cargoCapacity&&typeof p.cargoCapacity==="object"?p.cargoCapacity:{},driverDistanceKm:movingPointKm(d.driverLiveLocation||p.workCoordinates||d.workCoordinates,request.pickupCoordinates),online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
       }).sort((a,b)=>Number(b.online)-Number(a.online)||(a.driverDistanceKm??Infinity)-(b.driverDistanceKm??Infinity)).slice(0,30);
       await reDb.collection("transportCapacityAlerts").doc(requestId).set({requestId,status:"PENDING",customerName:String(request.userName||"Customer").slice(0,120),pickupLabel:String(request.pickupLabel||"").slice(0,200),destinationLabel:String(request.destinationLabel||request.destinationTitle||"").slice(0,200),vehicleLabel:String(request.vehicleLabel||"").slice(0,60),items:Object.entries(request.items||{}).filter(([,q])=>Number(q)>0).map(([id,quantity])=>({id,quantity:Number(quantity)})),nearbyDrivers:contacts,nearbyDriverCount:nearby.length,createdAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
       await ref.update({offerDriverIds:[],offerDispatchMode:"admin-capacity-review",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
@@ -5290,12 +5291,14 @@ app.get("/api/moving/drivers/quotes", async (req,res) => {
     const destination={lat:Number(req.query.destinationLat),lng:Number(req.query.destinationLng)};
     const area={pickupCounty:String(req.query.pickupCounty||""),pickupSubCounty:String(req.query.pickupSubCounty||""),pickupWard:String(req.query.pickupWard||""),pickupArea:String(req.query.pickupArea||""),pickupCoordinates:pickup};
     const itemTypes=String(req.query.itemTypes||"").split(",").map(x=>x.trim()).filter(Boolean);
+    let itemCounts=Object.fromEntries(itemTypes.map(item=>[item,1]));
+    try { const parsed=JSON.parse(String(req.query.itemCounts||"")); if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))itemCounts=parsed; } catch {}
     if(!["motorbike","tuk","pickup","lorry"].includes(vehicleId)||![pickup.lat,pickup.lng,destination.lat,destination.lng].every(Number.isFinite))return res.status(400).json({success:false,message:"Choose a vehicle and valid trip map pins"});
     const straightKm=movingPointKm(pickup,destination);
     if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
     const routeKm=Math.round(straightKm*1.15*10)/10;
     const all=await reDb.collection("users").where("driverApproved","==",true).get();
-    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)&&movingCanCarry(d,{items:Object.fromEntries(itemTypes.map(item=>[item,1]))})).map(d=>{
+    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)&&movingCanCarry(d,{items:itemCounts})).map(d=>{
       const p=d.driverProfile||{},ratePerKm=Number(p.ratePerKm||0),from=movingPointKm(p.workCoordinates||d.workCoordinates,pickup),last=d.driverLastSeenAt?.toMillis?.()||0;
       return {id:d.id,name:String(d.name||d.displayName||"Local driver").slice(0,80),vehicleId:p.vehicleId,vehicleTemplate:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),photoUrl:String(p.photoUrl||"").slice(0,500),ratePerKm,driverDistanceKm:from,routeKm,quote:Math.ceil(routeKm*ratePerKm/50)*50,online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
     }).filter(d=>d.ratePerKm>0&&Number.isFinite(d.quote)).sort((a,b)=>Number(b.online)-Number(a.online)||a.quote-b.quote);
