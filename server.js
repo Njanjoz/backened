@@ -5267,6 +5267,76 @@ app.post("/api/moving/driver/start-trip",(req,res)=>updateMovingTrip(req,res,"IN
 app.post("/api/moving/driver/complete",(req,res)=>updateMovingTrip(req,res,"DELIVERED","completedAt"));
 
 
+// === MarketMix Moving: driver rate quotes and customer quote decisions ===
+app.get("/api/moving/drivers/quotes", async (req,res) => {
+  try {
+    await movingAuth(req);
+    const vehicleId=String(req.query.vehicleId||"");
+    const pickup={lat:Number(req.query.pickupLat),lng:Number(req.query.pickupLng)};
+    const destination={lat:Number(req.query.destinationLat),lng:Number(req.query.destinationLng)};
+    const area={pickupCounty:String(req.query.pickupCounty||""),pickupSubCounty:String(req.query.pickupSubCounty||""),pickupWard:String(req.query.pickupWard||""),pickupArea:String(req.query.pickupArea||""),pickupCoordinates:pickup};
+    if(!["motorbike","tuk","pickup","lorry"].includes(vehicleId)||![pickup.lat,pickup.lng,destination.lat,destination.lng].every(Number.isFinite))return res.status(400).json({success:false,message:"Choose a vehicle and valid trip map pins"});
+    const straightKm=movingPointKm(pickup,destination);
+    if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
+    const routeKm=Math.round(straightKm*1.15*10)/10;
+    const all=await reDb.collection("users").where("driverApproved","==",true).get();
+    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)).map(d=>{
+      const p=d.driverProfile||{},ratePerKm=Number(p.ratePerKm||0),from=movingPointKm(p.workCoordinates||d.workCoordinates,pickup),last=d.driverLastSeenAt?.toMillis?.()||0;
+      return {id:d.id,name:String(d.name||d.displayName||"Local driver").slice(0,80),vehicleId:p.vehicleId,vehicleTemplate:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),photoUrl:String(p.photoUrl||"").slice(0,500),ratePerKm,driverDistanceKm:from,routeKm,quote:Math.ceil(routeKm*ratePerKm/50)*50,online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
+    }).filter(d=>d.ratePerKm>0&&Number.isFinite(d.quote)).sort((a,b)=>Number(b.online)-Number(a.online)||a.quote-b.quote);
+    return res.json({success:true,drivers});
+  } catch(e) { console.error("Moving driver quote search failed:",e); return res.status(500).json({success:false,message:e.message||"Could not find drivers"}); }
+});
+
+app.post("/api/moving/dispatch-quote", async (req,res) => {
+  try {
+    const user=await movingAuth(req),{requestId}=req.body||{};
+    if(!requestId)return res.status(400).json({success:false,message:"Missing requestId"});
+    const ref=reDb.collection("transportRequests").doc(requestId),snap=await ref.get();
+    if(!snap.exists)return res.status(404).json({success:false,message:"Request not found"});
+    const request=snap.data();
+    if(request.userId!==user.uid)return res.status(403).json({success:false,message:"Not allowed"});
+    if(!["REQUESTED","QUOTED"].includes(request.status)||request.driverUserId)return res.status(409).json({success:false,message:"Request is no longer open"});
+    if(!request.quotedDriverId)return res.status(400).json({success:false,message:"Select a driver quote first"});
+    const driverSnap=await reDb.collection("users").doc(request.quotedDriverId).get(),driver=driverSnap.data()||{},p=driver.driverProfile||{};
+    if(!driverSnap.exists||driver.driverApproved!==true||p.vehicleId!==request.vehicleId||!movingMatches(driver,request)||!(Number(p.ratePerKm)>0))return res.status(409).json({success:false,message:"Selected driver or rate card is no longer available"});
+    const straightKm=movingPointKm(request.pickupCoordinates,request.destinationCoordinates);
+    if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
+    const routeKm=Math.round(straightKm*1.15*10)/10,rate=Number(p.ratePerKm),quote=Math.ceil(routeKm*rate/50)*50;
+    await ref.update({offerDriverIds:[request.quotedDriverId],quotedPrice:quote,quotedRouteKm:routeKm,quotedRatePerKm:rate,quotedDriverName:driver.name||driver.displayName||"Driver",offerDispatchMode:driver.driverOnline===true?"online":"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    const phone=driver.phoneNumber||driver.phone||p.phone;
+    if(phone)enqueueWhatsApp(phone,["🚚 *MarketMix Moving — driver rate quote request*",(request.userName||"A customer")+" selected your "+(request.vehicleLabel||p.vehicleId)+" rate card.","Pickup: "+(request.pickupLabel||"See dashboard"),"Destination: "+(request.destinationLabel||request.destinationTitle||"See dashboard"),"Trip: "+routeKm+" km · Your rate: KSh "+rate+"/km · Quote: KSh "+quote.toLocaleString("en-KE"),"Open: https://marketmix-realestates.vercel.app/driver/dashboard"].join(String.fromCharCode(10)),{kind:"moving-driver-rate-quote",requestId,driverId:request.quotedDriverId,quote});
+    return res.json({success:true,quote,routeKm,driverId:request.quotedDriverId});
+  } catch(e) { console.error("Dispatch selected moving quote failed:",e); return res.status(500).json({success:false,message:e.message||"Could not send selected quote"}); }
+});
+
+app.post("/api/moving/quote/respond", async (req,res) => {
+  try {
+    const user=await movingAuth(req),{requestId,action,counterOffer,message=""}=req.body||{};
+    if(!requestId||!["accept","decline","appeal"].includes(action))return res.status(400).json({success:false,message:"Choose a valid quote response"});
+    if(action==="appeal"&&!(Number(counterOffer)>0))return res.status(400).json({success:false,message:"Enter your counter-offer amount"});
+    const ref=reDb.collection("transportRequests").doc(String(requestId));
+    await reDb.runTransaction(async tx=>{
+      const snap=await tx.get(ref);
+      if(!snap.exists)throw Error("Move request not found");
+      const r=snap.data();
+      if(r.userId!==user.uid||r.status!=="QUOTED"||!r.quotedDriverId||(r.quoteDecision&&r.quoteDecision!=="PENDING"))throw Error("This quote is no longer awaiting your response");
+      if(action==="decline"){tx.update(ref,{status:"CANCELLED",quoteDecision:"DECLINED",quoteRespondedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});return;}
+      const driverRef=reDb.collection("users").doc(r.quotedDriverId),driverSnap=await tx.get(driverRef);
+      if(!driverSnap.exists)throw Error("Selected driver unavailable");
+      const d=driverSnap.data(),p=d.driverProfile||{},phone=d.phoneNumber||d.phone||p.phone||"";
+      if(action==="accept"){
+        if(d.driverApproved!==true)throw Error("Selected driver is no longer approved");
+        tx.update(ref,{driverUserId:r.quotedDriverId,driverName:d.name||d.displayName||"Driver",driverPhone:phone,vehicleLabel:p.vehicleTemplate||r.vehicleLabel||"Vehicle",status:"DRIVER_ASSIGNED",quoteDecision:"ACCEPTED",assignedAt:admin.firestore.FieldValue.serverTimestamp(),quoteRespondedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+        return;
+      }
+      tx.update(ref,{quoteDecision:"APPEALED",quoteAppeal:{status:"PENDING",customerOffer:Math.round(Number(counterOffer)),message:String(message||"").slice(0,500),originalQuote:Number(r.quotedPrice||0),driverUserId:r.quotedDriverId,driverName:d.name||d.displayName||"Driver",driverPhone:phone,driverVehicle:p.vehicleTemplate||r.vehicleLabel||"Vehicle",createdAt:admin.firestore.FieldValue.serverTimestamp()},quoteRespondedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    });
+    return res.json({success:true,message:action==="appeal"?"Counter-offer sent to MarketMix admin":"Quote response saved"});
+  } catch(e) { console.error("Moving quote response failed:",e); return res.status(400).json({success:false,message:e.message||"Could not save quote response"}); }
+});
+// === End MarketMix Moving quote section ===
+
 app.post("/api/moving/notify", async (req, res) => {
   try {
     const { requestId } = req.body || {};
