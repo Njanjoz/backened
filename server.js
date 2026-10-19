@@ -5172,7 +5172,11 @@ function movingMatches(driver, request) {
   }
   return Boolean(county && pickupCounty && county === pickupCounty);
 }
-function movingPointKm(a, b) {
+function movingCanCarry(driver, request) {
+  const supported = driver.driverProfile?.canCarryItems;
+  const requested = Object.entries(request.items || {}).filter(([, quantity]) => Number(quantity) > 0).map(([item]) => item);
+  return requested.length > 0 && Array.isArray(supported) && requested.every(item => supported.includes(item));
+}function movingPointKm(a, b) {
   if (!a || !b || ![a.lat,a.lng,b.lat,b.lng].every(v => Number.isFinite(Number(v)))) return null;
   const rad = n => n * Math.PI / 180, dl = rad(Number(b.lat)-Number(a.lat)), dn = rad(Number(b.lng)-Number(a.lng));
   const la = rad(Number(a.lat)), lb = rad(Number(b.lat));
@@ -5190,7 +5194,17 @@ app.post("/api/moving/dispatch", async (req,res) => {
     if (request.userId !== user.uid) return res.status(403).json({success:false,message:"Not allowed"});
     if (!["REQUESTED","QUOTED"].includes(request.status) || request.driverUserId) return res.status(409).json({success:false,message:"Request is no longer open"});
     const all = await reDb.collection("users").where("driverApproved","==",true).get();
-    const matched = all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>movingMatches(d,request));
+    const nearby = all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>movingMatches(d,request));
+    const matched = nearby.filter(d=>movingCanCarry(d,request));
+    if (!matched.length) {
+      const contacts = nearby.map(d=>{
+        const p=d.driverProfile||{}, last=d.driverLastSeenAt?.toMillis?.()||0;
+        return {driverId:d.id,name:String(d.name||d.displayName||"Driver").slice(0,80),phone:String(d.phoneNumber||d.phone||p.phone||"").slice(0,32),vehicleLabel:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),canCarryItems:Array.isArray(p.canCarryItems)?p.canCarryItems:[],driverDistanceKm:movingPointKm(d.driverLiveLocation||p.workCoordinates||d.workCoordinates,request.pickupCoordinates),online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
+      }).sort((a,b)=>Number(b.online)-Number(a.online)||(a.driverDistanceKm??Infinity)-(b.driverDistanceKm??Infinity)).slice(0,30);
+      await reDb.collection("transportCapacityAlerts").doc(requestId).set({requestId,status:"PENDING",customerName:String(request.userName||"Customer").slice(0,120),pickupLabel:String(request.pickupLabel||"").slice(0,200),destinationLabel:String(request.destinationLabel||request.destinationTitle||"").slice(0,200),vehicleLabel:String(request.vehicleLabel||"").slice(0,60),items:Object.entries(request.items||{}).filter(([,q])=>Number(q)>0).map(([id,quantity])=>({id,quantity:Number(quantity)})),nearbyDrivers:contacts,nearbyDriverCount:nearby.length,createdAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
+      await ref.update({offerDriverIds:[],offerDispatchMode:"admin-capacity-review",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+      return res.json({success:true,mode:"admin-capacity-review",drivers:[],capacityAlert:true});
+    }
     const cutoff = Date.now()-300000, online = matched.filter(d=>d.driverOnline===true && (d.driverLastSeenAt?.toMillis?.()||0)>=cutoff), selected = online.length ? online : matched;
     await ref.update({offerDriverIds:selected.map(d=>d.id),offerDispatchMode:online.length?"online":"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
     const journeyKm = movingPointKm(request.pickupCoordinates, request.destinationCoordinates);
@@ -5237,10 +5251,10 @@ app.get("/api/moving/driver/offers", async (req,res) => {
     const user=await movingAuth(req), userSnap=await reDb.collection("users").doc(user.uid).get();
     if (!userSnap.exists || userSnap.data()?.driverApproved!==true) return res.status(403).json({success:false,message:"Driver account not approved yet"});
     const pending=await reDb.collection("transportRequests").where("status","in",["QUOTED","REQUESTED"]).get(), refs=[];
-    for (const d of pending.docs) { const r=d.data(); if (!r.driverUserId && movingMatches(userSnap.data(),r)) refs.push(d.ref); }
+    for (const d of pending.docs) { const r=d.data(); if (!r.driverUserId && movingMatches(userSnap.data(),r) && movingCanCarry(userSnap.data(),r)) refs.push(d.ref); }
     for(let i=0;i<refs.length;i+=450){const batch=reDb.batch();refs.slice(i,i+450).forEach(ref=>batch.update(ref,{offerDriverIds:admin.firestore.FieldValue.arrayUnion(user.uid),offerDispatchMode:"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()}));await batch.commit();}
     const snap=await reDb.collection("transportRequests").where("offerDriverIds","array-contains",user.uid).get();
-    const offers=snap.docs.map(d=>({id:d.id,requestId:d.id,...d.data()})).filter(r=>["QUOTED","REQUESTED"].includes(r.status)&&!r.driverUserId);
+    const offers=snap.docs.map(d=>({id:d.id,requestId:d.id,...d.data()})).filter(r=>["QUOTED","REQUESTED"].includes(r.status)&&!r.driverUserId&&movingCanCarry(userSnap.data(),r));
     return res.json({success:true,offers});
   } catch(e) { console.error("List moving offers error:",e); return res.status(500).json({success:false,message:e.message||"Could not load offers"}); }
 });
@@ -5251,7 +5265,7 @@ app.post("/api/moving/driver/accept", async (req,res) => {
     const userSnap=await reDb.collection("users").doc(user.uid).get(), driver=userSnap.data()||{};
     if(driver.driverApproved!==true)return res.status(403).json({success:false,message:"Driver not approved"});
     const ref=reDb.collection("transportRequests").doc(requestId);
-    await reDb.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw Error("Request not found");const r=snap.data();if(r.driverUserId||!["QUOTED","REQUESTED"].includes(r.status))throw Error("Offer already claimed");if(!(r.offerDriverIds||[]).includes(user.uid))throw Error("Offer unavailable to this account");tx.update(ref,{driverUserId:user.uid,driverName:driver.name||driver.displayName||"Driver",driverPhone:driver.phoneNumber||driver.phone||driver.driverProfile?.phone||"",vehicleLabel:driver.driverProfile?.vehicleTemplate||driver.driverProfile?.vehicleId||"Vehicle",status:"DRIVER_ASSIGNED",assignedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});});
+    await reDb.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw Error("Request not found");const r=snap.data();if(r.driverUserId||!["QUOTED","REQUESTED"].includes(r.status))throw Error("Offer already claimed");if(!(r.offerDriverIds||[]).includes(user.uid))throw Error("Offer unavailable to this account");if(!movingCanCarry(driver,r))throw Error("Your vehicle cargo listing does not include all item types in this move");tx.update(ref,{driverUserId:user.uid,driverName:driver.name||driver.displayName||"Driver",driverPhone:driver.phoneNumber||driver.phone||driver.driverProfile?.phone||"",vehicleLabel:driver.driverProfile?.vehicleTemplate||driver.driverProfile?.vehicleId||"Vehicle",status:"DRIVER_ASSIGNED",assignedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});});
     return res.json({success:true,message:"Offer accepted"});
   } catch(e) { console.error("Accept moving offer error:",e); return res.status(409).json({success:false,message:e.message||"Could not accept offer"}); }
 });
@@ -5275,12 +5289,13 @@ app.get("/api/moving/drivers/quotes", async (req,res) => {
     const pickup={lat:Number(req.query.pickupLat),lng:Number(req.query.pickupLng)};
     const destination={lat:Number(req.query.destinationLat),lng:Number(req.query.destinationLng)};
     const area={pickupCounty:String(req.query.pickupCounty||""),pickupSubCounty:String(req.query.pickupSubCounty||""),pickupWard:String(req.query.pickupWard||""),pickupArea:String(req.query.pickupArea||""),pickupCoordinates:pickup};
+    const itemTypes=String(req.query.itemTypes||"").split(",").map(x=>x.trim()).filter(Boolean);
     if(!["motorbike","tuk","pickup","lorry"].includes(vehicleId)||![pickup.lat,pickup.lng,destination.lat,destination.lng].every(Number.isFinite))return res.status(400).json({success:false,message:"Choose a vehicle and valid trip map pins"});
     const straightKm=movingPointKm(pickup,destination);
     if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
     const routeKm=Math.round(straightKm*1.15*10)/10;
     const all=await reDb.collection("users").where("driverApproved","==",true).get();
-    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)).map(d=>{
+    const drivers=all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>d.driverProfile?.vehicleId===vehicleId&&movingMatches(d,area)&&movingCanCarry(d,{items:Object.fromEntries(itemTypes.map(item=>[item,1]))})).map(d=>{
       const p=d.driverProfile||{},ratePerKm=Number(p.ratePerKm||0),from=movingPointKm(p.workCoordinates||d.workCoordinates,pickup),last=d.driverLastSeenAt?.toMillis?.()||0;
       return {id:d.id,name:String(d.name||d.displayName||"Local driver").slice(0,80),vehicleId:p.vehicleId,vehicleTemplate:String(p.vehicleTemplate||p.vehicleId||"Vehicle").slice(0,60),plate:String(p.plate||"").slice(0,20),photoUrl:String(p.photoUrl||"").slice(0,500),ratePerKm,driverDistanceKm:from,routeKm,quote:Math.ceil(routeKm*ratePerKm/50)*50,online:d.driverOnline===true&&last>=Date.now()-300000,workArea:[p.workArea,p.workSubCounty,p.workCounty].filter(Boolean).join(", ")};
     }).filter(d=>d.ratePerKm>0&&Number.isFinite(d.quote)).sort((a,b)=>Number(b.online)-Number(a.online)||a.quote-b.quote);
@@ -5299,7 +5314,7 @@ app.post("/api/moving/dispatch-quote", async (req,res) => {
     if(!["REQUESTED","QUOTED"].includes(request.status)||request.driverUserId)return res.status(409).json({success:false,message:"Request is no longer open"});
     if(!request.quotedDriverId)return res.status(400).json({success:false,message:"Select a driver quote first"});
     const driverSnap=await reDb.collection("users").doc(request.quotedDriverId).get(),driver=driverSnap.data()||{},p=driver.driverProfile||{};
-    if(!driverSnap.exists||driver.driverApproved!==true||p.vehicleId!==request.vehicleId||!movingMatches(driver,request)||!(Number(p.ratePerKm)>0))return res.status(409).json({success:false,message:"Selected driver or rate card is no longer available"});
+    if(!driverSnap.exists||driver.driverApproved!==true||p.vehicleId!==request.vehicleId||!movingMatches(driver,request)||!movingCanCarry(driver,request)||!(Number(p.ratePerKm)>0))return res.status(409).json({success:false,message:"Selected driver or rate card is no longer available"});
     const straightKm=movingPointKm(request.pickupCoordinates,request.destinationCoordinates);
     if(straightKm==null)return res.status(400).json({success:false,message:"Could not calculate trip distance"});
     const routeKm=Math.round(straightKm*1.15*10)/10,rate=Number(p.ratePerKm),quote=Math.ceil(routeKm*rate/50)*50;
