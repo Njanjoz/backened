@@ -5172,6 +5172,14 @@ function movingMatches(driver, request) {
   }
   return Boolean(county && pickupCounty && county === pickupCounty);
 }
+function movingPointKm(a, b) {
+  if (!a || !b || ![a.lat,a.lng,b.lat,b.lng].every(v => Number.isFinite(Number(v)))) return null;
+  const rad = n => n * Math.PI / 180, dl = rad(Number(b.lat)-Number(a.lat)), dn = rad(Number(b.lng)-Number(a.lng));
+  const la = rad(Number(a.lat)), lb = rad(Number(b.lat));
+  const x = Math.sin(dl/2)**2 + Math.cos(la)*Math.cos(lb)*Math.sin(dn/2)**2;
+  return Math.round(6371 * 2 * Math.atan2(Math.sqrt(x),Math.sqrt(1-x)) * 10) / 10;
+}
+
 app.post("/api/moving/dispatch", async (req,res) => {
   try {
     const user = await movingAuth(req), {requestId} = req.body || {};
@@ -5185,6 +5193,42 @@ app.post("/api/moving/dispatch", async (req,res) => {
     const matched = all.docs.map(d=>({id:d.id,...d.data()})).filter(d=>movingMatches(d,request));
     const cutoff = Date.now()-300000, online = matched.filter(d=>d.driverOnline===true && (d.driverLastSeenAt?.toMillis?.()||0)>=cutoff), selected = online.length ? online : matched;
     await ref.update({offerDriverIds:selected.map(d=>d.id),offerDispatchMode:online.length?"online":"registered-area",offerDispatchedAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    const journeyKm = movingPointKm(request.pickupCoordinates, request.destinationCoordinates);
+    const freshCutoff = Date.now() - 5 * 60 * 1000;
+    for (const driver of selected) {
+      const profile = driver.driverProfile || {};
+      const phone = driver.phoneNumber || driver.phone || profile.phone;
+      if (!phone) {
+        console.warn("Move offer has no driver phone:", driver.id);
+        continue;
+      }
+      const livePoint = driver.driverLiveLocation;
+      const registeredPoint = profile.workCoordinates || driver.workCoordinates;
+      const onlineNow = driver.driverOnline === true && (driver.driverLastSeenAt?.toMillis?.() || 0) >= freshCutoff;
+      const fromKm = movingPointKm(livePoint || registeredPoint, request.pickupCoordinates);
+      const areaLabel = profile.workArea || profile.workWard || profile.workSubCounty || profile.workCounty || "your registered service area";
+      const fromText = fromKm != null
+        ? "Approx. distance from your " + (livePoint && onlineNow ? "live location" : "registered area pin") + ": " + fromKm + " km"
+        : "Service area: " + areaLabel;
+      const journeyText = journeyKm != null
+        ? "Approx. straight-line journey distance: " + journeyKm + " km"
+        : "Journey distance: open the trip for route details";
+      const message = [
+        "🚚 *MarketMix Moving — New move request*",
+        "A move was requested by " + (request.userName || "a MarketMix customer") + ".",
+        "",
+        "Pickup: " + (request.pickupLabel || "See request"),
+        fromText,
+        "Destination: " + (request.destinationLabel || request.destinationTitle || "See request"),
+        journeyText,
+        "Vehicle: " + (request.vehicleLabel || "Provider to confirm"),
+        "Items: " + (request.itemCount || 0),
+        "",
+        "Review and accept the offer: https://marketmix-realestates.vercel.app/driver/dashboard",
+      ].join("\n");
+      enqueueWhatsApp(phone, message, { kind: "driver-move-offer", requestId, driverId: driver.id, distanceFromPickupKm: fromKm, journeyStraightLineKm: journeyKm });
+    }
+
     return res.json({success:true,mode:online.length?"online":"registered-area",drivers:selected.map(({id,phoneNumber,phone,driverProfile})=>({id,phoneNumber,phone,driverProfile}))});
   } catch(e) { console.error("Moving dispatch error:",e); return res.status(500).json({success:false,message:e.message||"Driver matching failed"}); }
 });
