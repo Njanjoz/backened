@@ -2868,7 +2868,7 @@ const validateSubscriptionPayment = (data) => {
   if (!amount || !phoneNumber || !fullName || !email || !orderId || !planId || !sellerId) {
     return { valid: false, message: "Missing required fields" };
   }
-  const amt = parsePositiveNumber(amount);
+  let amt = parsePositiveNumber(amount);
   if (!amt) return { valid: false, message: "Invalid amount" };
   if (!isValidPhone(phoneNumber)) return { valid: false, message: "Invalid phone" };
   if (!email.includes("@")) return { valid: false, message: "Invalid email" };
@@ -3393,12 +3393,24 @@ app.post("/api/send-proposal-status", async (req, res) => {
 app.post("/api/stk-push", async (req, res) => {
   try {
     const { amount, phoneNumber, fullName, email, orderId } = req.body || {};
-    const amt = parsePositiveNumber(amount);
+    let amt = parsePositiveNumber(amount);
     if (!amt) return res.status(400).json({ success: false, message: "Invalid amount" });
     if (!isValidPhone(phoneNumber)) return res.status(400).json({ success: false, message: "Invalid phone" });
     if (!fullName) return res.status(400).json({ success: false, message: "Full name required" });
     if (!email || !email.includes("@")) return res.status(400).json({ success: false, message: "Invalid email" });
     if (!orderId) return res.status(400).json({ success: false, message: "Missing orderId" });
+    const storedOrderSnap = await db.collection("orders").doc(String(orderId)).get();
+    const storedOrder = storedOrderSnap.exists ? storedOrderSnap.data() || {} : null;
+    if (storedOrder?.isSiteSeeingBooking === true) {
+      const authHeader = req.headers.authorization || "";
+      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+      let paymentUser;
+      try { paymentUser = token ? await verifyAnyToken(token) : null; } catch { paymentUser = null; }
+      if (!paymentUser || paymentUser.uid !== storedOrder.userId) return res.status(403).json({ success: false, message: "Sign in with the account that created this viewing payment." });
+      if (storedOrder.paymentStatus !== "pending") return res.status(409).json({ success: false, message: "This viewing payment is not pending." });
+      amt = parsePositiveNumber(storedOrder.totalAmount);
+      if (!amt) return res.status(409).json({ success: false, message: "The saved viewing payment amount is invalid." });
+    }
     const [firstName, ...rest] = fullName.trim().split(" ");
     const lastName = rest.join(" ") || "N/A";
     let response;
@@ -4579,10 +4591,13 @@ app.post("/api/offline-sale/notify", async (req, res) => {
 app.post("/api/intasend-callback", async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
+    const configuredChallenge = String(process.env.INTASEND_WEBHOOK_CHALLENGE || "").trim();
+    if (!configuredChallenge) return res.status(503).send("IntaSend webhook challenge is not configured");
+    if (String(req.body.challenge || "").trim() !== configuredChallenge) return res.status(401).send("Invalid IntaSend webhook challenge");
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
     let paymentStatus = "pending";
     if (state === "COMPLETE") paymentStatus = "paid";
-    if (["FAILED", "CANCELLED"].includes(state)) paymentStatus = "failed";
+    if (["FAILED", "CANCELLED", "CANCELED"].includes(state)) paymentStatus = "failed";
 
     if (isSubscriptionRef(api_ref)) {
       const ref = db.collection("subscriptions").doc(api_ref);
@@ -4616,6 +4631,24 @@ app.post("/api/intasend-callback", async (req, res) => {
 
     if (!orderSnap.exists) return res.status(404).send("Order not found");
     const orderData = orderSnap.data();
+    if (["paid", "failed", "review_required"].includes(String(orderData.paymentStatus || "").toLowerCase()) && state !== "COMPLETE") return res.send("OK");
+    if (orderData.isSiteSeeingBooking === true && state === "COMPLETE") {
+      const expectedAmount = Number(orderData.totalAmount);
+      const receivedAmount = Number(req.body.value);
+      const currency = String(req.body.currency || "").toUpperCase();
+      if (!Number.isFinite(expectedAmount) || !Number.isFinite(receivedAmount) || Math.abs(expectedAmount - receivedAmount) > 0.01 || currency !== "KES") {
+        await orderRef.update({ paymentStatus: "review_required", state: "PAYMENT_DETAILS_MISMATCH", receivedAmount: Number.isFinite(receivedAmount) ? receivedAmount : null, receivedCurrency: currency || null, callbackInvoiceId: req.body.invoice_id || null, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        const mismatchBookingRef = reDb.collection("sightseeingBookings").doc(String(orderData.bookingId));
+        const mismatchBookingSnap = await mismatchBookingRef.get();
+        if (mismatchBookingSnap.exists) {
+          const mismatchBooking = mismatchBookingSnap.data() || {};
+          const packagePayment = orderData.isCompletion || orderData.bookingMode === "direct_booking";
+          await mismatchBookingRef.set(packagePayment ? { packagePaymentStatus: "review_required" } : { availabilityPaymentStatus: "review_required" }, { merge: true });
+          await mismatchBookingRef.collection("payments").doc(String(api_ref)).set({ paymentRef: api_ref, bookingId: String(orderData.bookingId), userId: orderData.userId, amount: Number.isFinite(receivedAmount) ? receivedAmount : null, expectedAmount, currency: currency || null, paymentStatus: "review_required", paymentKind: packagePayment ? "sightseeing_package" : "sightseeing_availability_check", mpesaReference: mpesa_reference || null, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        }        console.error("Site-seeing payment callback mismatch", { api_ref, expectedAmount, receivedAmount, currency });
+        return res.send("OK");
+      }
+    }
     await orderRef.update({ paymentStatus, mpesaReference: mpesa_reference || null, state, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
     // SITE-SEEING PAYMENTS ONLY: bookings live in the real-estate Firebase
@@ -4627,12 +4660,12 @@ app.post("/api/intasend-callback", async (req, res) => {
         if (bookingSnap.exists) {
           const booking = bookingSnap.data() || {};
           const isCompletionPayment = orderData.isCompletion === true;
-          const firstConfirmation = isCompletionPayment ? !booking.completionPaymentReference : booking.paymentStatus !== "paid";
+          const firstConfirmation = isCompletionPayment ? !booking.completionPaymentReference : orderData.bookingMode === "direct_booking" ? !booking.directPaymentReference : booking.paymentStatus !== "paid";
           await bookingRef.set({
             paymentStatus: "paid",
             bookingStatus: isCompletionPayment || orderData.bookingMode === "direct_booking" ? "meeting_details_pending" : "awaiting_availability",
             status: isCompletionPayment || orderData.bookingMode === "direct_booking" ? "meeting_details_pending" : "awaiting_availability",
-            ...(isCompletionPayment ? { completionPaymentReference: api_ref, completionMpesaReference: mpesa_reference || null, remainingBalance: 0, completedAt: admin.firestore.FieldValue.serverTimestamp() } : { availabilityStatus: "pending" }),
+            ...(isCompletionPayment ? { completionPaymentReference: api_ref, completionMpesaReference: mpesa_reference || null, packagePaymentReference: api_ref, packagePaymentAmount: Number(orderData.totalAmount || callbackAmount || 0), packagePaymentStatus: "paid", packagePaymentMpesaReference: mpesa_reference || null, remainingBalance: 0, completedAt: admin.firestore.FieldValue.serverTimestamp() } : orderData.bookingMode === "direct_booking" ? { packagePaymentReference: api_ref, packagePaymentAmount: Number(orderData.totalAmount || callbackAmount || 0), packagePaymentStatus: "paid", packagePaymentMpesaReference: mpesa_reference || null, directPaymentReference: api_ref, directPaymentAmount: Number(orderData.totalAmount || callbackAmount || 0), directMpesaReference: mpesa_reference || null } : { availabilityStatus: "pending", availabilityPaymentReference: api_ref, availabilityPaymentAmount: Number(orderData.totalAmount || callbackAmount || 0), availabilityPaymentStatus: "paid", availabilityMpesaReference: mpesa_reference || null }),
             ...((isCompletionPayment || orderData.bookingMode === "direct_booking") ? { assignedAgentId: booking.agentId || booking.sellerId || orderData.sellerId || null, agentAssignmentLocked: Boolean(booking.agentId || booking.sellerId || orderData.sellerId), tourCompleted: false } : {}),
             mpesaReference: mpesa_reference || null,
             paymentRef: api_ref,
@@ -4640,6 +4673,8 @@ app.post("/api/intasend-callback", async (req, res) => {
             confirmedAt: booking.confirmedAt || admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           }, { merge: true });
+
+          await bookingRef.collection("payments").doc(String(api_ref)).set({ paymentRef: api_ref, bookingId: String(orderData.bookingId), userId: orderData.userId, amount: Number(orderData.totalAmount || callbackAmount || 0), currency: "KES", paymentStatus: "paid", paymentKind: isCompletionPayment || orderData.bookingMode === "direct_booking" ? "sightseeing_package" : "sightseeing_availability_check", mpesaReference: mpesa_reference || null, invoiceId: req.body.invoice_id || null, updatedAt: admin.firestore.FieldValue.serverTimestamp(), createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
           if (firstConfirmation) {
             const receiptEmail = orderData.userEmail || orderData.buyerEmail || "";
@@ -4672,7 +4707,7 @@ app.post("/api/intasend-callback", async (req, res) => {
               `M-Pesa reference: ${mpesaRef}`,
               `Review booking on MarketMix: ${adminLink}`,
             ].join("\n");
-            const sellerMessage = isCompletionPayment
+            const sellerMessage = isCompletionPayment || orderData.bookingMode === "direct_booking"
               ? `Hello ${sellerName}, the customer has paid for the site-seeing package at ${propertyTitle}. Please add the visit details on MarketMix: ${visitFormLink}`
               : [
                   `Hello ${sellerName}, a paid site-seeing request has been received.`,
@@ -4682,12 +4717,24 @@ app.post("/api/intasend-callback", async (req, res) => {
                   "Please submit the current availability and unit count on the MarketMix website. Add any rent, move-in or listing changes for admin review.",
                   `Open availability form: ${sellerFormLink}`,
                 ].join("\n");
-            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. The seller will send your visit details on WhatsApp.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller confirms availability.`, { kind: "site-seeing-buyer-paid", api_ref });
+            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment || orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. The seller will send your visit details on WhatsApp.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller confirms availability.`, { kind: "site-seeing-buyer-paid", api_ref });
             enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "site-seeing-admin-paid", api_ref });
             if (sellerPhone) enqueueWhatsApp(sellerPhone, sellerMessage, { kind: "site-seeing-seller-paid", api_ref, sellerId });
           }
         } else {
           console.error(`Site-seeing booking ${orderData.bookingId} not found in real-estate Firebase`);
+        }
+      }
+      if (paymentStatus !== "paid") {
+        const bookingRef = reDb.collection("sightseeingBookings").doc(String(orderData.bookingId));
+        const bookingSnap = await bookingRef.get();
+        if (bookingSnap.exists) {
+          const failedBooking = bookingSnap.data() || {};
+          const packagePayment = orderData.isCompletion === true || orderData.bookingMode === "direct_booking";
+          await bookingRef.set(packagePayment
+            ? { packagePaymentStatus: paymentStatus, ...(orderData.bookingMode === "direct_booking" && paymentStatus === "failed" ? { paymentStatus: "failed", status: "payment_failed", bookingStatus: "payment_failed" } : {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+            : { availabilityPaymentStatus: paymentStatus, ...(paymentStatus === "failed" && failedBooking.paymentStatus !== "paid" ? { paymentStatus: "failed", status: "payment_failed", bookingStatus: "payment_failed" } : {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          await bookingRef.collection("payments").doc(String(api_ref)).set({ paymentRef: api_ref, bookingId: String(orderData.bookingId), userId: orderData.userId, amount: Number(orderData.totalAmount || 0), currency: "KES", paymentStatus, paymentKind: packagePayment ? "sightseeing_package" : "sightseeing_availability_check", mpesaReference: mpesa_reference || null, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         }
       }
       return res.send("OK");
@@ -5822,7 +5869,7 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     const completionSnap = completionRef ? await completionRef.get() : null;
     if (isCompletion && (!completionSnap.exists || completionSnap.data()?.userId !== decoded.uid || completionSnap.data()?.availabilityStatus !== "available")) return res.status(409).json({ success: false, message: "This booking is not approved to continue yet." });
     if (isCompletion && String(completionSnap.data()?.packageId) !== String(packageId)) return res.status(409).json({ success: false, message: "Continue with the package saved in your original request." });
-    const depositAmount = isCompletion || bookingMode === "direct_booking" ? totalPrice : 1;
+    const depositAmount = isCompletion || bookingMode === "direct_booking" ? totalPrice : 50;
     const bookingId = isCompletion ? completionBookingId : `SS_${Date.now()}_${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
     const paymentRef = `PROP_SITESEEING_${bookingId}_${Date.now()}`;
     const user = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -5844,6 +5891,7 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       packageName: pkg.title || pkg.name || "Site Seeing",
       bookingMode, totalPrice, depositAmount, remainingBalance: bookingMode === "availability_check" ? totalPrice : totalPrice - depositAmount,
       paymentStatus: "pending", bookingStatus: "awaiting_payment", status: "awaiting_payment",
+      ...(bookingMode === "availability_check" ? { availabilityPaymentReference: paymentRef, availabilityPaymentAmount: depositAmount, availabilityPaymentStatus: "pending", availabilityPaymentCreatedAt: now } : { packagePaymentReference: paymentRef, packagePaymentAmount: depositAmount, packagePaymentStatus: "pending", packagePaymentCreatedAt: now }),
       availabilityStatus: "pending", ownerPhone, sellerPhone: ownerPhone,
       landlordName: property.landlordName || property.ownerName || null,
       preferredViewingDate: req.body.preferredViewingDate || null,
@@ -5853,6 +5901,8 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       });
     }
 
+
+    if (isCompletion) await completionRef.set({ packagePaymentReference: paymentRef, packagePaymentAmount: depositAmount, packagePaymentStatus: "pending", packagePaymentCreatedAt: now, updatedAt: now }, { merge: true });
 
     await db.collection("orders").doc(paymentRef).set({
       orderId: paymentRef, orderType: "real_estate", isRealEstate: true,
@@ -6154,13 +6204,19 @@ app.post("/api/bookings/site-seeing/confirm", async (req, res) => {
 
     const booking = bookingSnap.data() || {};
     if (booking.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This booking belongs to another user" });
+    const isCompletion = order.isCompletion === true;
+    const isDirect = !isCompletion && order.bookingMode === "direct_booking";
+    const nextBookingStatus = isCompletion || isDirect ? "meeting_details_pending" : "awaiting_availability";
+    const amountPaid = Number(order.totalAmount || 0);
     await bookingRef.set({
-      paymentStatus: "paid", bookingStatus: order.isCompletion ? "meeting_details_pending" : "awaiting_availability", status: order.isCompletion ? "meeting_details_pending" : "awaiting_availability",
-      mpesaReference: order.mpesaReference || null,
-      confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+      paymentStatus: "paid", bookingStatus: nextBookingStatus, status: nextBookingStatus,
+      mpesaReference: order.mpesaReference || null, paymentRef,
+      paidAmount: amountPaid,
+      ...(isCompletion ? { packagePaymentReference: paymentRef, packagePaymentAmount: amountPaid, packagePaymentStatus: "paid", packagePaymentMpesaReference: order.mpesaReference || null, completionPaymentReference: paymentRef, completionMpesaReference: order.mpesaReference || null, remainingBalance: 0 } : isDirect ? { packagePaymentReference: paymentRef, packagePaymentAmount: amountPaid, packagePaymentStatus: "paid", packagePaymentMpesaReference: order.mpesaReference || null, directPaymentReference: paymentRef, directPaymentAmount: amountPaid, directMpesaReference: order.mpesaReference || null, remainingBalance: 0 } : { availabilityPaymentReference: paymentRef, availabilityPaymentAmount: amountPaid, availabilityPaymentStatus: "paid", availabilityMpesaReference: order.mpesaReference || null }),
+      confirmedAt: booking.confirmedAt || admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
-
+    await bookingRef.collection("payments").doc(String(paymentRef)).set({ paymentRef, bookingId: String(order.bookingId), userId: decoded.uid, amount: amountPaid, currency: "KES", paymentStatus: "paid", paymentKind: isCompletion || isDirect ? "sightseeing_package" : "sightseeing_availability_check", mpesaReference: order.mpesaReference || null, invoiceId: order.invoiceId || null, updatedAt: admin.firestore.FieldValue.serverTimestamp(), createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     return res.json({
       success: true, bookingId: booking.bookingId,
       paymentRef, completionPayment: order.isCompletion ? order.totalAmount : undefined, totalPrice: booking.totalPrice,
