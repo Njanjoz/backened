@@ -4837,6 +4837,11 @@ const handleIntaSendCallback = async (req, res) => {
   }
 };
 
+// Visit campaign callbacks use their isolated order handler; all other refs continue to the existing dual-server handler.
+app.post("/api/intasend-callback", (req, res, next) => {
+  if (String(req.body?.api_ref || "").startsWith("VC_")) return handleVisitCampaignCallback(req, res);
+  next();
+});
 app.post("/api/intasend-callback", handleIntaSendCallback);
 app.post("/api/intasend-realestate-callback", handleIntaSendCallback);
 
@@ -5912,9 +5917,9 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     const packageData = packageSnap.exists
       ? (packageSnap.data() || {})
       : (defaultPackages[String(packageId)] || null);
-    const pkg = ["quick_view", "assisted_view"].includes(String(packageId))
-      ? { ...(packageData || {}), ...defaultPackages[String(packageId)] }
-      : packageData;
+    const pkg = packageData
+      ? { ...(defaultPackages[String(packageId)] || {}), ...packageData }
+      : (defaultPackages[String(packageId)] || null);
     if (!pkg) return res.status(404).json({ success: false, message: "Viewing package not found" });
     if (pkg.active === false || pkg.enabled === false || pkg.isActive === false) {
       return res.status(400).json({ success: false, message: "This viewing package is unavailable" });
@@ -6094,6 +6099,154 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
   }
 });
 
+app.post("/api/bookings/site-seeing/:bookingId/refund-request", async (req, res) => {
+  const bookingId = String(req.params.bookingId || "");
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    if (!bookingId || bookingId.includes("/")) return res.status(400).json({ success: false, message: "Invalid booking reference" });
+    const bookingRef = reDb.collection("sightseeingBookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, message: "Booking not found" });
+    const booking = bookingSnap.data() || {};
+    if (booking.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This booking does not belong to your account" });
+    const paymentRef = String(req.body?.paymentRef || booking.completionPaymentReference || booking.packagePaymentReference || booking.directPaymentReference || booking.availabilityPaymentReference || "");
+    const bookingPaymentRefs = [booking.completionPaymentReference, booking.packagePaymentReference, booking.directPaymentReference, booking.availabilityPaymentReference];
+    if (!paymentRef || !bookingPaymentRefs.includes(paymentRef)) return res.status(409).json({ success: false, message: "Select a paid site-seeing payment belonging to this booking." });
+
+    const orderSnap = await db.collection("orders").doc(String(paymentRef)).get();
+    const payment = orderSnap.data() || {};
+    if (!orderSnap.exists || payment.userId !== decoded.uid || payment.isSiteSeeingBooking !== true || String(payment.bookingId) !== bookingId || payment.paymentStatus !== "paid" || !(payment.isCompletion || payment.bookingMode === "direct_booking" || payment.bookingMode === "availability_check" || payment.paymentKind === "sightseeing_availability_check")) {
+      return res.status(409).json({ success: false, message: "Only a confirmed site-seeing payment for this booking can be submitted for refund review." });
+    }
+    if (["REQUESTED", "PROCESSING", "PAYOUT_SENT", "PAYOUT_RETRYABLE"].includes(booking.refundStatus)) return res.status(409).json({ success: false, message: `A refund is already ${String(booking.refundStatus).toLowerCase().replace(/_/g, " ")}.` });
+    const grossAmount = Number(payment.totalAmount);
+    if (!Number.isFinite(grossAmount) || grossAmount <= 0) return res.status(409).json({ success: false, message: "Paid amount could not be verified." });
+    const maintenanceFee = Math.round(grossAmount * 0.05);
+    const phone = normalizePhoneForWa(payment.phoneNumber || booking.customerPhone || "");
+    const netAmount = Math.floor(grossAmount - maintenanceFee);
+    const idempotencyKey = `MM-TOUR-REFUND-${paymentRef}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 70);
+    if (netAmount < 1 || !/^254[17]\d{8}$/.test(String(phone || ""))) return res.status(409).json({ success: false, message: "Refund amount or customer M-Pesa number is invalid." });
+    const refundRef = reDb.collection("sightseeingRefunds").doc(`refund_${paymentRef}`);
+    await reDb.runTransaction(async (transaction) => {
+      const existing = await transaction.get(refundRef);
+      if (existing.exists) throw new Error("A refund request already exists for this booking.");
+      transaction.create(refundRef, { bookingId, paymentRef, userId: decoded.uid, grossAmount, phone, maintenanceRate: 0.05, maintenanceFee, feeAmount: maintenanceFee, netAmount, currency: "KES", idempotencyKey, status: "REQUESTED", requestedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      transaction.set(bookingRef, { refundStatus: "REQUESTED", refundPaymentReference: paymentRef, refundRequestedAmount: grossAmount, refundRequestedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    });
+    return res.json({ success: true, bookingId, refundStatus: "REQUESTED", grossAmount, maintenanceFee, estimatedRefund: netAmount });
+  } catch (error) {
+    const status = /already exists/.test(error.message) ? 409 : 400;
+    return res.status(status).json({ success: false, message: error.message || "Could not submit refund request" });
+  }
+});
+app.post("/api/bookings/site-seeing/:bookingId/refund", async (req, res) => {
+  let bookingId = String(req.params.bookingId || "");
+  let refundRef = null;
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Missing auth token" });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const adminSnap = await reDb.collection("users").doc(decoded.uid).get();
+    const adminProfile = adminSnap.data() || {};
+    if (!(adminProfile.role === "admin" || adminProfile.userType === "admin" || (Array.isArray(adminProfile.roles) && adminProfile.roles.includes("admin")))) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+    if (!bookingId || bookingId.includes("/")) return res.status(400).json({ success: false, message: "Invalid booking reference" });
+    const bookingRef = reDb.collection("sightseeingBookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, message: "Booking not found" });
+    const booking = bookingSnap.data() || {};
+    const paymentRef = booking.refundPaymentReference || booking.completionPaymentReference || booking.packagePaymentReference || booking.directPaymentReference || booking.availabilityPaymentReference || null;
+    if (!paymentRef) return res.status(409).json({ success: false, message: "No paid site-seeing payment is available to refund." });
+    const orderSnap = await db.collection("orders").doc(String(paymentRef)).get();
+    if (!orderSnap.exists) return res.status(409).json({ success: false, message: "Package payment record could not be verified." });
+    const payment = orderSnap.data() || {};
+    if (payment.isSiteSeeingBooking !== true || String(payment.bookingId) !== bookingId || payment.paymentStatus !== "paid" || !(payment.isCompletion || payment.bookingMode === "direct_booking" || payment.bookingMode === "availability_check" || payment.paymentKind === "sightseeing_availability_check")) {
+      return res.status(409).json({ success: false, message: "Only a confirmed site-seeing payment for this booking can be refunded." });
+    }
+    const grossAmount = Number(payment.totalAmount);
+    const feeAmount = Math.round(grossAmount * 0.05);
+    const netAmount = Math.floor(grossAmount - feeAmount);
+    const phone = normalizePhoneForWa(payment.phoneNumber || booking.customerPhone || "");
+    if (!Number.isFinite(grossAmount) || grossAmount <= 0 || netAmount < 1 || !/^254[17]\d{8}$/.test(String(phone || ""))) {
+      return res.status(409).json({ success: false, message: "Paid amount, refund amount, or customer M-Pesa number is invalid." });
+    }
+    const idempotencyKey = `MM-TOUR-REFUND-${paymentRef}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 70);
+    const requestedRefundRef = reDb.collection("sightseeingRefunds").doc(`refund_${paymentRef}`);
+    const requestedRefundSnap = await requestedRefundRef.get();
+    refundRef = requestedRefundSnap.exists ? requestedRefundRef : reDb.collection("sightseeingRefunds").doc(bookingId);
+    let shouldSend = false;
+    await reDb.runTransaction(async (transaction) => {
+      const existing = await transaction.get(refundRef);
+      if (existing.exists) {
+        const saved = existing.data() || {};
+        if (["PAYOUT_SENT", "PAID"].includes(saved.status)) throw new Error("A refund payout has already been initiated for this booking.");
+        if (saved.status === "PROCESSING") throw new Error("Refund payout is already processing. Check status before retrying.");
+        if (saved.paymentRef !== paymentRef || Number(saved.netAmount) !== netAmount) throw new Error("Saved refund details do not match this payment.");
+        transaction.update(refundRef, { status: "PROCESSING", retriedBy: decoded.uid, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      } else {
+        transaction.create(refundRef, { bookingId, paymentRef, userId: booking.userId || payment.userId, phone, grossAmount, maintenanceRate: 0.05, maintenanceFee: feeAmount, feeAmount, netAmount, currency: "KES", status: "PROCESSING", idempotencyKey, initiatedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+      transaction.set(bookingRef, { refundStatus: "PROCESSING", refundPaymentReference: paymentRef, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      shouldSend = true;
+    });
+    if (!shouldSend) return res.status(409).json({ success: false, message: "Refund was not prepared." });
+    let payout;
+    try {
+      payout = await intasend.payouts().mpesa({ currency: "KES", requires_approval: "NO", transactions: [{ name: String(payment.customerName || payment.buyerName || "MarketMix Customer").replace(/[^a-zA-Z0-9 _:-]/g, "").slice(0, 80), account: phone, amount: String(netAmount), narrative: `MarketMix tour refund ${bookingId.slice(0, 18)}`, idempotency_key: idempotencyKey }] });
+    } catch (providerError) {
+      await refundRef.set({ status: "PAYOUT_RETRYABLE", payoutError: String(providerError?.message || providerError).slice(0, 240), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      await bookingRef.set({ refundStatus: "PAYOUT_RETRYABLE", updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      throw providerError;
+    }
+    if (!payout?.tracking_id) {
+      await refundRef.set({ status: "PAYOUT_RETRYABLE", payoutError: "IntaSend did not return a tracking ID", providerResponse: payout || null, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      await bookingRef.set({ refundStatus: "PAYOUT_RETRYABLE", updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      return res.status(502).json({ success: false, message: "IntaSend did not confirm the refund payout request." });
+    }
+    await refundRef.set({ status: "PAYOUT_SENT", trackingId: payout.tracking_id, providerStatus: payout.status || "Processing", initiatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await bookingRef.set({ refundStatus: "PAYOUT_SENT", refundTrackingId: payout.tracking_id, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return res.json({ success: true, bookingId, refund: { grossAmount, feeAmount, netAmount, phone, status: "PAYOUT_SENT", trackingId: payout.tracking_id } });
+  } catch (error) {
+    console.error("Site-seeing refund initiation failed:", error);
+    const status = /already been initiated|already processing|Saved refund details/.test(error.message || "") ? 409 : 400;
+    return res.status(status).json({ success: false, message: error.message || "Could not initiate refund." });
+  }
+});
+
+app.post("/api/bookings/site-seeing/refund-webhook", async (req, res) => {
+  const challenge = String(process.env.INTASEND_WEBHOOK_CHALLENGE || "").trim();
+  if (!challenge || String(req.body?.challenge || "").trim() !== challenge || req.body?.topic !== "send_money_event") return res.status(401).json({ success: false });
+  try {
+    const batchRef = String(req.body.batch_reference || "");
+    const prefix = "MM-TOUR-REFUND-";
+    if (!batchRef.startsWith(prefix)) return res.json({ success: true, ignored: true });
+    const refundPaymentRef = batchRef.slice(prefix.length);
+    const newRefundRef = reDb.collection("sightseeingRefunds").doc(`refund_${refundPaymentRef}`);
+    const newRefundSnap = await newRefundRef.get();
+    const refundRef = newRefundSnap.exists ? newRefundRef : reDb.collection("sightseeingRefunds").doc(refundPaymentRef);
+    const refundSnap = await refundRef.get();
+    const bookingId = refundSnap.data()?.bookingId || refundPaymentRef;
+    if (!refundSnap.exists || refundSnap.data()?.trackingId !== req.body.tracking_id) return res.json({ success: true, ignored: true });
+    const providerStatus = String(req.body.status || "Processing");
+    const normalized = providerStatus.toLowerCase();
+    const status = normalized.includes("complete") || normalized.includes("success") ? "PAID" : normalized.includes("fail") || normalized.includes("cancel") ? "PAYOUT_FAILED" : "PAYOUT_SENT";
+    await refundRef.set({ status, providerStatus, providerPayload: { fileId: req.body.file_id || null, trackingId: req.body.tracking_id }, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await reDb.collection("sightseeingBookings").doc(bookingId).set({ refundStatus: status, refundUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Site-seeing refund webhook failed:", error);
+    return res.status(500).json({ success: false });
+  }
+});
 app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || "";
@@ -6337,6 +6490,179 @@ app.post("/api/bookings/site-seeing/confirm", async (req, res) => {
     });
   } catch (e) {
     return sendServerError(res, e, "Could not confirm site-seeing booking");
+  }
+});
+/* ═══════════════════════════════════════════════════════════════
+   VISIT CAMPAIGNS — isolated attendee registration and collections
+   Uses reDb for campaign records and db for payment orders.
+   Does not share site-seeing property bookings or seller payouts.
+   ═══════════════════════════════════════════════════════════════ */
+const VISIT_CAMPAIGN_PREFIX = "VC_";
+
+app.post("/api/visit-campaigns/:campaignId/checkout", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Sign in to register for this campaign." });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const campaignId = String(req.params.campaignId || "");
+    if (!campaignId || campaignId.includes("/")) return res.status(400).json({ success: false, message: "Invalid campaign reference." });
+    const campaignSnap = await reDb.collection("visitCampaigns").doc(campaignId).get();
+    if (!campaignSnap.exists) return res.status(404).json({ success: false, message: "Campaign not found." });
+    const campaign = campaignSnap.data() || {};
+    const eatToday = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    if (campaign.active === false || !campaign.startDate || !campaign.endDate || campaign.endDate < eatToday) {
+      return res.status(409).json({ success: false, message: "Registration for this campaign is closed." });
+    }
+    const attendeeName = String(req.body?.attendeeName || "").trim().slice(0, 120);
+    const rawPhone = String(req.body?.phoneNumber || "").trim();
+    const phone = normalizePhoneForWa(rawPhone);
+    const participantCount = Math.max(1, Math.min(10, Math.floor(Number(req.body?.participantCount) || 1)));
+    const unitPrice = Number(campaign.price);
+    if (!attendeeName || !phone || !isValidPhone(phone) || !Number.isSafeInteger(unitPrice) || unitPrice < 1 || unitPrice > 500000) {
+      return res.status(400).json({ success: false, message: "Enter your name, a valid Kenyan M-Pesa number, and select a valid campaign." });
+    }
+    const amount = unitPrice * participantCount;
+    if (!Number.isSafeInteger(amount) || amount > 500000) return res.status(400).json({ success: false, message: "The attendee total exceeds the payment limit." });
+    const ref = `${VISIT_CAMPAIGN_PREFIX}${Date.now()}_${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+    const profileSnap = await reDb.collection("users").doc(decoded.uid).get();
+    const profile = profileSnap.data() || {};
+    await db.collection("orders").doc(ref).create({
+      orderId: ref, orderType: "visit_campaign", isVisitCampaignBooking: true,
+      campaignId, campaignTitle: String(campaign.title || "Visit campaign").slice(0, 120),
+      campaignLocation: String(campaign.location || "").slice(0, 160), participantCount,
+      unitPrice, totalAmount: amount, userId: decoded.uid,
+      userEmail: decoded.email || profile.email || null,
+      buyerEmail: decoded.email || profile.email || null,
+      buyerName: attendeeName, customerName: attendeeName, phoneNumber: phone,
+      paymentStatus: "pending", state: "INITIATED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ success: true, paymentRef: ref, amount, participantCount, campaignTitle: campaign.title || "Visit campaign" });
+  } catch (error) {
+    console.error("Visit campaign checkout error:", error);
+    return sendServerError(res, error, "Could not prepare campaign registration");
+  }
+});
+
+app.post("/api/visit-campaigns/stk-push", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Sign in to continue." });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const paymentRef = String(req.body?.paymentRef || "");
+    if (!paymentRef.startsWith(VISIT_CAMPAIGN_PREFIX)) return res.status(400).json({ success: false, message: "Invalid campaign payment reference." });
+    const orderRef = db.collection("orders").doc(paymentRef);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return res.status(404).json({ success: false, message: "Campaign payment not found." });
+    const order = orderSnap.data() || {};
+    if (order.isVisitCampaignBooking !== true || order.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This payment does not belong to your account." });
+    if (order.paymentStatus !== "pending") return res.status(409).json({ success: false, message: "This campaign payment is no longer pending." });
+    if (!Number.isSafeInteger(Number(order.totalAmount)) || Number(order.totalAmount) < 1) return res.status(409).json({ success: false, message: "Saved campaign amount is invalid." });
+    const [firstName, ...rest] = String(order.customerName || order.buyerName || "Customer").split(/\s+/);
+    const response = await intasend.collection().mpesaStkPush({
+      first_name: firstName || "Customer", last_name: rest.join(" ") || "N/A",
+      email: order.userEmail || "customer@marketmixkenya.co.ke",
+      phone_number: order.phoneNumber, amount: Number(order.totalAmount),
+      mobile_tarrif: "BUSINESS-PAYS",
+      host: BACKEND_HOST, api_ref: paymentRef,
+    });
+    await orderRef.set({ invoiceId: response?.invoice?.invoice_id || null, status: "STK_PUSH_SENT", updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return res.json({ success: true, data: response, paymentRef });
+  } catch (error) {
+    console.error("Visit campaign STK push error:", error?.response || error);
+    return res.status(502).json({ success: false, message: "Could not send the M-Pesa prompt. Please retry." });
+  }
+});
+
+app.get("/api/visit-campaigns/payment/:paymentRef", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Sign in to check this payment." });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const paymentRef = String(req.params.paymentRef || "");
+    if (!paymentRef.startsWith(VISIT_CAMPAIGN_PREFIX)) return res.status(400).json({ success: false, message: "Invalid payment reference." });
+    const snap = await db.collection("orders").doc(paymentRef).get();
+    if (!snap.exists || snap.data()?.isVisitCampaignBooking !== true) return res.status(404).json({ success: false, message: "Campaign payment not found." });
+    if (snap.data()?.userId !== decoded.uid) return res.status(403).json({ success: false, message: "This payment does not belong to your account." });
+    return res.json({ success: true, paymentStatus: snap.data()?.paymentStatus || "pending", amount: snap.data()?.totalAmount, campaignId: snap.data()?.campaignId });
+  } catch (error) { return sendServerError(res, error, "Could not check campaign payment"); }
+});
+
+const handleVisitCampaignCallback = async (req, res) => {
+  try {
+    const challenge = String(process.env.INTASEND_WEBHOOK_CHALLENGE || "").trim();
+    if (!challenge || String(req.body?.challenge || "").trim() !== challenge) return res.status(401).send("Invalid webhook challenge");
+    const { api_ref, state } = req.body || {};
+    if (!api_ref || !String(api_ref).startsWith(VISIT_CAMPAIGN_PREFIX) || !state) return res.status(200).send("OK");
+    const orderRef = db.collection("orders").doc(String(api_ref));
+    const snap = await orderRef.get();
+    if (!snap.exists || snap.data()?.isVisitCampaignBooking !== true) return res.status(200).send("OK");
+    const order = snap.data() || {};
+    if (String(order.paymentStatus).toLowerCase() === "paid" && state !== "COMPLETE") return res.status(200).send("OK");
+    let paymentStatus = "pending";
+    let extra = {};
+    if (state === "COMPLETE") {
+      const received = Number(req.body.value);
+      const currency = String(req.body.currency || "").toUpperCase();
+      if (!Number.isFinite(received) || Math.abs(received - Number(order.totalAmount)) > 0.01 || currency !== "KES") {
+        paymentStatus = "review_required";
+        extra = { state: "PAYMENT_DETAILS_MISMATCH", receivedAmount: Number.isFinite(received) ? received : null, receivedCurrency: currency || null };
+      } else paymentStatus = "paid";
+    } else if (["FAILED", "CANCELLED", "CANCELED"].includes(String(state).toUpperCase())) paymentStatus = "failed";
+    await orderRef.set({ paymentStatus, state: extra.state || String(state), mpesaReference: req.body.mpesa_reference || req.body.provider_ref || null, ...extra, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return res.status(200).send("OK");
+  } catch (error) {
+    console.error("Visit campaign IntaSend callback error:", error);
+    return res.status(500).send("Callback processing failed");
+  }
+};
+app.post("/api/visit-campaigns/intasend-callback", handleVisitCampaignCallback);
+
+app.post("/api/visit-campaigns/confirm", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!idToken) return res.status(401).json({ success: false, message: "Sign in to confirm registration." });
+    let decoded;
+    try { decoded = await verifyAnyToken(idToken); }
+    catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
+    const paymentRef = String(req.body?.paymentRef || "");
+    if (!paymentRef.startsWith(VISIT_CAMPAIGN_PREFIX)) return res.status(400).json({ success: false, message: "Invalid payment reference." });
+    const orderRef = db.collection("orders").doc(paymentRef);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return res.status(404).json({ success: false, message: "Payment record not found." });
+    const order = orderSnap.data() || {};
+    if (order.userId !== decoded.uid || order.isVisitCampaignBooking !== true) return res.status(403).json({ success: false, message: "This registration does not belong to your account." });
+    if (order.paymentStatus !== "paid") return res.status(409).json({ success: false, message: "Payment provider has not confirmed this registration." });
+    const registrationRef = reDb.collection("visitCampaignRegistrations").doc(paymentRef);
+    const statsRef = reDb.collection("visitCampaignStats").doc(String(order.campaignId));
+    let alreadyRegistered = false;
+    await reDb.runTransaction(async (transaction) => {
+      const registrationSnap = await transaction.get(registrationRef);
+      if (registrationSnap.exists) { alreadyRegistered = true; return; }
+      transaction.create(registrationRef, {
+        campaignId: String(order.campaignId), campaignTitle: order.campaignTitle,
+        userId: decoded.uid, attendeeName: order.customerName, phoneNumber: order.phoneNumber,
+        participantCount: Number(order.participantCount) || 1, amount: Number(order.totalAmount),
+        paymentRef, mpesaReference: order.mpesaReference || null, status: "paid",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.set(statsRef, { registeredCount: admin.firestore.FieldValue.increment(Number(order.participantCount) || 1), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    });
+    return res.json({ success: true, paymentRef, campaignId: order.campaignId, participantCount: Number(order.participantCount) || 1, alreadyRegistered });
+  } catch (error) {
+    console.error("Visit campaign confirmation error:", error);
+    return sendServerError(res, error, "Could not confirm campaign registration");
   }
 });
 app.use((req, res) => res.status(404).json({ success: false, message: "Not Found" }));
