@@ -3422,6 +3422,11 @@ app.post("/api/stk-push", async (req, res) => {
       });
     } catch (intasendErr) {
       console.error("❌ IntaSend STK failed:", intasendErr?.response || intasendErr);
+      const failureReason = String(intasendErr?.response?.data?.message || intasendErr?.message || "IntaSend could not start the M-Pesa prompt.").slice(0, 220);
+      const payerPhone = phoneNumber || storedOrder?.phoneNumber || storedOrder?.shippingDetails?.phoneNumber || null;
+      const failureMessage = paymentReceiptWhatsApp({ success: false, orderData: storedOrder || {}, apiRef: orderId, amount: amt, reason: failureReason });
+      if (payerPhone) enqueueWhatsApp(payerPhone, failureMessage, { kind: "payment-stk-initiation-failed", api_ref: orderId });
+      enqueueWhatsApp(ADMIN_PHONE, `M-Pesa prompt initiation failed\nReference: ${orderId}\nCustomer: ${fullName}\nPhone: ${payerPhone || "Not provided"}\nAmount: KSh ${Number(amt || 0).toLocaleString("en-KE")}\nReason: ${failureReason}\nSupport: ${paymentSupportUrl(orderId)}`, { kind: "payment-stk-initiation-failed-admin", api_ref: orderId });
       return res.status(502).json({ success: false, message: "Payment provider error" });
     }
     await db.collection("orders").doc(orderId).set({
@@ -4588,6 +4593,55 @@ app.post("/api/offline-sale/notify", async (req, res) => {
   }
 });
 
+function paymentFailureReason(callbackBody = {}, orderData = {}) {
+  const raw = callbackBody.failed_reason || callbackBody.failure_reason || callbackBody.message || callbackBody.reason || orderData.paymentError || orderData.errorMessage || "The M-Pesa payment was not completed by the payment provider.";
+  return String(raw).replace(/[\r\n]+/g, " ").trim().slice(0, 220);
+}
+
+function paymentRetryUrl(orderData = {}, apiRef = "") {
+  const base = REAL_ESTATE_APP_URL;
+  if (orderData.isSiteSeeingBooking) {
+    const params = new URLSearchParams();
+    if (orderData.propertyId) params.set("propertyId", String(orderData.propertyId));
+    if (orderData.packageId) params.set("packageId", String(orderData.packageId));
+    if (orderData.isCompletion && orderData.bookingId) params.set("bookingId", String(orderData.bookingId));
+    if (Array.isArray(orderData.propertyIds) && orderData.propertyIds.length) params.set("propertyIds", orderData.propertyIds.join(","));
+    if (orderData.participantCount) params.set("participantCount", String(orderData.participantCount));
+    return `${base}/site-seeing/checkout${params.toString() ? `?${params.toString()}` : ""}`;
+  }
+  if (orderData.propertyId) return `${base}/property/${encodeURIComponent(orderData.propertyId)}`;
+  if (isMovingRef(apiRef) || orderData.isMoving === true) return `${base}/my-bookings?type=transport`;
+  if (orderData.isVisitCampaignBooking && orderData.campaignId) return `${base}/visit-campaigns/${encodeURIComponent(orderData.campaignId)}`;
+  return `${base}/my-bookings?type=payments`;
+}
+
+function paymentSupportUrl(apiRef) {
+  const phone = String(ADMIN_PHONE || "").replace(/\D/g, "");
+  const text = encodeURIComponent(`Hi MarketMix Support, I need help with payment ${apiRef}.`);
+  return phone ? `https://wa.me/${phone}?text=${text}` : `${REAL_ESTATE_APP_URL}/contact`;
+}
+
+function paymentReceiptWhatsApp({ success, orderData = {}, apiRef, amount, mpesaReference, reason = "" }) {
+  const amountText = Number(amount || 0).toLocaleString("en-KE");
+  const receiptUrl = `${REAL_ESTATE_RECEIPT_URL}/${encodeURIComponent(mpesaReference || apiRef)}`;
+  const supportUrl = paymentSupportUrl(apiRef);
+  if (success) return [
+    "🏠 *MarketMix Real Estates — Payment receipt*", "",
+    `Payment confirmed for ${orderData.propertyTitle || orderData.packageTitle || orderData.campaignTitle || "your MarketMix service"}.`,
+    `Amount: *KSh ${amountText}*`, `M-Pesa reference: ${mpesaReference || "Not provided"}`,
+    `Payment reference: ${apiRef}`, `Receipt: ${receiptUrl}`, "",
+    `Need help? Contact MarketMix Support: ${supportUrl}`,
+  ].join("\n");
+  return [
+    "⚠️ *MarketMix Real Estates — Payment not completed*", "",
+    `We could not confirm your payment for ${orderData.propertyTitle || orderData.packageTitle || orderData.campaignTitle || "your MarketMix service"}.`,
+    `Amount: KSh ${amountText}`, `Reference: ${apiRef}`, `Reason: ${reason || "The M-Pesa payment was not completed."}`, "",
+    `Retry payment: ${paymentRetryUrl(orderData, apiRef)}`,
+    `Contact MarketMix Support: ${supportUrl}`,
+    "If M-Pesa already deducted the amount, do not retry yet. Contact support and share this reference so we can check it.",
+  ].join("\n");
+}
+
 const handleIntaSendCallback = async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
@@ -4717,7 +4771,7 @@ const handleIntaSendCallback = async (req, res) => {
                   "To confirm availability, use the MarketMix form to capture live photos and a video of the empty room, enter the available unit count, and submit any changes for admin review. The KSh 25 confirmation payment is sent only after admin approves the evidence.",
                   `Open availability form: ${sellerFormLink}`,
                 ].join("\n");
-            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Visit details will be sent through MarketMix.` : orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Vacancy was not verified and is not guaranteed. Visit coordination will happen through MarketMix.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller submits live photos and a YouTube video and admin reviews the vacancy.`, { kind: "site-seeing-buyer-paid", api_ref });
+            if (customerPhone) enqueueWhatsApp(customerPhone, paymentReceiptWhatsApp({ success: true, orderData, apiRef: api_ref, amount: orderData.totalAmount || callbackAmount, mpesaReference: mpesa_reference }), { kind: "site-seeing-buyer-paid", api_ref });
             enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "site-seeing-admin-paid", api_ref });
             if (sellerPhone) enqueueWhatsApp(sellerPhone, sellerMessage, { kind: "site-seeing-seller-paid", api_ref, sellerId });
           }
@@ -4737,7 +4791,22 @@ const handleIntaSendCallback = async (req, res) => {
           await bookingRef.collection("payments").doc(String(api_ref)).set({ paymentRef: api_ref, bookingId: String(orderData.bookingId), userId: orderData.userId, amount: Number(orderData.totalAmount || 0), currency: "KES", paymentStatus, paymentKind: packagePayment ? "sightseeing_package" : "sightseeing_availability_check", mpesaReference: mpesa_reference || null, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         }
       }
+      if (paymentStatus === "failed") {
+        const failureReason = paymentFailureReason(req.body, orderData);
+        await orderRef.set({ paymentFailureReason: failureReason }, { merge: true }).catch(() => {});
+        const bookingRef = reDb.collection("sightseeingBookings").doc(String(orderData.bookingId));
+        const bookingSnap = await bookingRef.get().catch(() => null);
+        const booking = bookingSnap?.exists ? bookingSnap.data() || {} : {};
+        const customerPhone = booking.phoneNumber || orderData.phoneNumber || "";
+        const customerMessage = paymentReceiptWhatsApp({ success: false, orderData: { ...orderData, propertyTitle: booking.propertyTitle || orderData.propertyTitle }, apiRef: api_ref, amount: orderData.totalAmount, reason: failureReason });
+        if (customerPhone) enqueueWhatsApp(customerPhone, customerMessage, { kind: "site-seeing-payment-failed", api_ref, bookingId: orderData.bookingId });
+        const adminMessage = `Site-seeing payment failed\nReference: ${api_ref}\nBooking: ${orderData.bookingId || "—"}\nCustomer: ${orderData.buyerName || booking.buyerName || "—"}\nPhone: ${customerPhone || "Not provided"}\nAmount: KSh ${Number(orderData.totalAmount || 0).toLocaleString("en-KE")}\nReason: ${failureReason}\nReview: ${REAL_ESTATE_APP_URL}/admin/sightseeing-bookings?bookingId=${encodeURIComponent(orderData.bookingId || "")}`;
+        enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "site-seeing-payment-failed-admin", api_ref, bookingId: orderData.bookingId });
+      }
       return res.send("OK");
+    }
+
+    if (isWalletRef(api_ref) && state === "COMPLETE") {      return res.send("OK");
     }
 
     if (isWalletRef(api_ref) && state === "COMPLETE") {
@@ -4762,6 +4831,16 @@ const handleIntaSendCallback = async (req, res) => {
       } else {
         await walletRef.set({ sellerId, balance: amount, totalDeposited: amount, totalSpent: 0, reservedBalance: 0, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
       }
+    }
+
+    if (paymentStatus === "failed" && !isWalletRef(api_ref)) {
+      const failureReason = paymentFailureReason(req.body, orderData);
+      await orderRef.set({ paymentFailureReason: failureReason }, { merge: true }).catch(() => {});
+      const payerPhone = orderData.phoneNumber || orderData.shippingDetails?.phoneNumber || orderData.buyerPhone || null;
+      const failureMessage = paymentReceiptWhatsApp({ success: false, orderData, apiRef: api_ref, amount: orderData.totalAmount || callbackAmount, reason: failureReason });
+      if (payerPhone) enqueueWhatsApp(payerPhone, failureMessage, { kind: "payment-failed", api_ref });
+      const adminMessage = `MarketMix payment failed\nReference: ${api_ref}\nCustomer: ${orderData.buyerName || orderData.shippingDetails?.fullName || "—"}\nPhone: ${payerPhone || "Not provided"}\nAmount: KSh ${Number(orderData.totalAmount || callbackAmount || 0).toLocaleString("en-KE")}\nReason: ${failureReason}\nSupport: ${paymentSupportUrl(api_ref)}`;
+      enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "payment-failed-admin", api_ref });
     }
 
     if (state === "COMPLETE" && !isWalletRef(api_ref)) {
@@ -6099,7 +6178,12 @@ app.post("/api/bookings/site-seeing/:bookingId/availability", async (req, res) =
   }
 });
 
-app.post("/api/bookings/site-seeing/:bookingId/refund-request", async (req, res) => {
+const calculateSiteSeeingRefund = (grossAmount) => {
+  const maintenanceFee = Math.round(grossAmount * 0.05);
+  const amountAfterMaintenance = Math.max(0, Math.floor(grossAmount - maintenanceFee));
+  const withdrawalFee = amountAfterMaintenance <= 100 ? 10 : amountAfterMaintenance <= 1000 ? 20 : amountAfterMaintenance <= 3000 ? 30 : amountAfterMaintenance <= 5000 ? 50 : amountAfterMaintenance <= 80000 ? 100 : amountAfterMaintenance <= 120000 ? 500 : 1000;
+  return { maintenanceFee, withdrawalFee, feeAmount: maintenanceFee + withdrawalFee, netAmount: amountAfterMaintenance - withdrawalFee };
+};app.post("/api/bookings/site-seeing/:bookingId/refund-request", async (req, res) => {
   const bookingId = String(req.params.bookingId || "");
   try {
     const authHeader = req.headers.authorization || "";
@@ -6126,19 +6210,24 @@ app.post("/api/bookings/site-seeing/:bookingId/refund-request", async (req, res)
     if (["REQUESTED", "PROCESSING", "PAYOUT_SENT", "PAYOUT_RETRYABLE"].includes(booking.refundStatus)) return res.status(409).json({ success: false, message: `A refund is already ${String(booking.refundStatus).toLowerCase().replace(/_/g, " ")}.` });
     const grossAmount = Number(payment.totalAmount);
     if (!Number.isFinite(grossAmount) || grossAmount <= 0) return res.status(409).json({ success: false, message: "Paid amount could not be verified." });
-    const maintenanceFee = Math.round(grossAmount * 0.05);
+    const { maintenanceFee, withdrawalFee, feeAmount, netAmount } = calculateSiteSeeingRefund(grossAmount);
+    const viewingDate = String(booking.preferredViewingDate || "");
+    const viewingTime = String(booking.preferredViewingTime || "");
+    const scheduledViewingCandidate = /^\d{4}-\d{2}-\d{2}$/.test(viewingDate) && /^\d{2}:\d{2}$/.test(viewingTime) ? new Date(`${viewingDate}T${viewingTime}:00+03:00`) : null;
+    const scheduledViewingAt = scheduledViewingCandidate && Number.isFinite(scheduledViewingCandidate.getTime()) ? scheduledViewingCandidate : null;
+    const cancellationDeadline = scheduledViewingAt && Number.isFinite(scheduledViewingAt.getTime()) ? new Date(scheduledViewingAt.getTime() - 24 * 60 * 60 * 1000) : null;
+    const lateRequest = cancellationDeadline ? Date.now() > cancellationDeadline.getTime() : null;
     const phone = normalizePhoneForWa(payment.phoneNumber || booking.customerPhone || "");
-    const netAmount = Math.floor(grossAmount - maintenanceFee);
     const idempotencyKey = `MM-TOUR-REFUND-${paymentRef}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 70);
-    if (netAmount < 1 || !/^254[17]\d{8}$/.test(String(phone || ""))) return res.status(409).json({ success: false, message: "Refund amount or customer M-Pesa number is invalid." });
+    if (netAmount < 1 || !/^254[17]\d{8}$/.test(String(phone || ""))) return res.status(409).json({ success: false, message: "The payment is too small after fees, or the customer M-Pesa number is invalid." });
     const refundRef = reDb.collection("sightseeingRefunds").doc(`refund_${paymentRef}`);
     await reDb.runTransaction(async (transaction) => {
       const existing = await transaction.get(refundRef);
       if (existing.exists) throw new Error("A refund request already exists for this booking.");
-      transaction.create(refundRef, { bookingId, paymentRef, userId: decoded.uid, grossAmount, phone, maintenanceRate: 0.05, maintenanceFee, feeAmount: maintenanceFee, netAmount, currency: "KES", idempotencyKey, status: "REQUESTED", requestedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-      transaction.set(bookingRef, { refundStatus: "REQUESTED", refundPaymentReference: paymentRef, refundRequestedAmount: grossAmount, refundRequestedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      transaction.create(refundRef, { bookingId, paymentRef, userId: decoded.uid, grossAmount, phone, maintenanceRate: 0.05, maintenanceFee, withdrawalFee, feeAmount, netAmount, currency: "KES", idempotencyKey, scheduledViewingAt, cancellationDeadline, lateRequest, status: "REQUESTED", requestedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      transaction.set(bookingRef, { refundStatus: "REQUESTED", refundPaymentReference: paymentRef, refundRequestedAmount: grossAmount, refundRequestedMaintenanceFee: maintenanceFee, refundRequestedWithdrawalFee: withdrawalFee, refundRequestedNetAmount: netAmount, refundRequestLate: lateRequest, refundCancellationDeadline: cancellationDeadline, refundRequestedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     });
-    return res.json({ success: true, bookingId, refundStatus: "REQUESTED", grossAmount, maintenanceFee, estimatedRefund: netAmount });
+    return res.json({ success: true, bookingId, refundStatus: "REQUESTED", grossAmount, maintenanceFee, withdrawalFee, estimatedRefund: netAmount, lateRequest, cancellationDeadline });
   } catch (error) {
     const status = /already exists/.test(error.message) ? 409 : 400;
     return res.status(status).json({ success: false, message: error.message || "Could not submit refund request" });
@@ -6173,8 +6262,13 @@ app.post("/api/bookings/site-seeing/:bookingId/refund", async (req, res) => {
       return res.status(409).json({ success: false, message: "Only a confirmed site-seeing payment for this booking can be refunded." });
     }
     const grossAmount = Number(payment.totalAmount);
-    const feeAmount = Math.round(grossAmount * 0.05);
-    const netAmount = Math.floor(grossAmount - feeAmount);
+    const { maintenanceFee, withdrawalFee, feeAmount, netAmount } = calculateSiteSeeingRefund(grossAmount);
+    const viewingDate = String(booking.preferredViewingDate || "");
+    const viewingTime = String(booking.preferredViewingTime || "");
+    const scheduledViewingCandidate = /^\d{4}-\d{2}-\d{2}$/.test(viewingDate) && /^\d{2}:\d{2}$/.test(viewingTime) ? new Date(`${viewingDate}T${viewingTime}:00+03:00`) : null;
+    const scheduledViewingAt = scheduledViewingCandidate && Number.isFinite(scheduledViewingCandidate.getTime()) ? scheduledViewingCandidate : null;
+    const cancellationDeadline = scheduledViewingAt && Number.isFinite(scheduledViewingAt.getTime()) ? new Date(scheduledViewingAt.getTime() - 24 * 60 * 60 * 1000) : null;
+    const lateRequest = cancellationDeadline ? Date.now() > cancellationDeadline.getTime() : null;
     const phone = normalizePhoneForWa(payment.phoneNumber || booking.customerPhone || "");
     if (!Number.isFinite(grossAmount) || grossAmount <= 0 || netAmount < 1 || !/^254[17]\d{8}$/.test(String(phone || ""))) {
       return res.status(409).json({ success: false, message: "Paid amount, refund amount, or customer M-Pesa number is invalid." });
@@ -6193,7 +6287,7 @@ app.post("/api/bookings/site-seeing/:bookingId/refund", async (req, res) => {
         if (saved.paymentRef !== paymentRef || Number(saved.netAmount) !== netAmount) throw new Error("Saved refund details do not match this payment.");
         transaction.update(refundRef, { status: "PROCESSING", retriedBy: decoded.uid, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
       } else {
-        transaction.create(refundRef, { bookingId, paymentRef, userId: booking.userId || payment.userId, phone, grossAmount, maintenanceRate: 0.05, maintenanceFee: feeAmount, feeAmount, netAmount, currency: "KES", status: "PROCESSING", idempotencyKey, initiatedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        transaction.create(refundRef, { bookingId, paymentRef, userId: booking.userId || payment.userId, phone, grossAmount, maintenanceRate: 0.05, maintenanceFee, withdrawalFee, feeAmount, netAmount, currency: "KES", status: "PROCESSING", idempotencyKey, initiatedBy: decoded.uid, createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
       }
       transaction.set(bookingRef, { refundStatus: "PROCESSING", refundPaymentReference: paymentRef, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       shouldSend = true;
@@ -6214,7 +6308,7 @@ app.post("/api/bookings/site-seeing/:bookingId/refund", async (req, res) => {
     }
     await refundRef.set({ status: "PAYOUT_SENT", trackingId: payout.tracking_id, providerStatus: payout.status || "Processing", initiatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     await bookingRef.set({ refundStatus: "PAYOUT_SENT", refundTrackingId: payout.tracking_id, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    return res.json({ success: true, bookingId, refund: { grossAmount, feeAmount, netAmount, phone, status: "PAYOUT_SENT", trackingId: payout.tracking_id } });
+    return res.json({ success: true, bookingId, refund: { grossAmount, maintenanceFee, withdrawalFee, feeAmount, netAmount, phone, status: "PAYOUT_SENT", trackingId: payout.tracking_id } });
   } catch (error) {
     console.error("Site-seeing refund initiation failed:", error);
     const status = /already been initiated|already processing|Saved refund details/.test(error.message || "") ? 409 : 400;
@@ -6619,7 +6713,13 @@ const handleVisitCampaignCallback = async (req, res) => {
         extra = { state: "PAYMENT_DETAILS_MISMATCH", receivedAmount: Number.isFinite(received) ? received : null, receivedCurrency: currency || null };
       } else paymentStatus = "paid";
     } else if (["FAILED", "CANCELLED", "CANCELED"].includes(String(state).toUpperCase())) paymentStatus = "failed";
-    await orderRef.set({ paymentStatus, state: extra.state || String(state), mpesaReference: req.body.mpesa_reference || req.body.provider_ref || null, ...extra, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await orderRef.set({ paymentStatus, state: extra.state || String(state), mpesaReference: req.body.mpesa_reference || req.body.provider_ref || null, ...(paymentStatus === "failed" ? { paymentFailureReason: paymentFailureReason(req.body, order) } : {}), ...extra, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    if (paymentStatus === "paid" || paymentStatus === "failed") {
+      const campaignPhone = order.phoneNumber || order.customerPhone || null;
+      const campaignMessage = paymentReceiptWhatsApp({ success: paymentStatus === "paid", orderData: order, apiRef: api_ref, amount: order.totalAmount, mpesaReference: req.body.mpesa_reference || req.body.provider_ref || null, reason: paymentFailureReason(req.body, order) });
+      if (campaignPhone) enqueueWhatsApp(campaignPhone, campaignMessage, { kind: `visit-campaign-payment-${paymentStatus}`, api_ref });
+      if (paymentStatus === "failed") enqueueWhatsApp(ADMIN_PHONE, `Visit campaign payment failed\nReference: ${api_ref}\nCampaign: ${order.campaignTitle || order.campaignId || "—"}\nCustomer: ${order.customerName || "—"}\nPhone: ${campaignPhone || "Not provided"}\nReason: ${paymentFailureReason(req.body, order)}\nSupport: ${paymentSupportUrl(api_ref)}`, { kind: "visit-campaign-payment-failed-admin", api_ref });
+    }
     return res.status(200).send("OK");
   } catch (error) {
     console.error("Visit campaign IntaSend callback error:", error);
