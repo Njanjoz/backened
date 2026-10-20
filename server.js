@@ -5459,6 +5459,55 @@ async function notifyMovingNoMatchAdmin(requestId) {
   }, { merge: true });
 }
 // === End additive fallback notification ===
+app.post("/api/moving/admin/assign-quote", async (req,res) => {
+  try {
+    const user = await movingAuth(req);
+    const callerSnap = await reDb.collection("users").doc(user.uid).get();
+    const caller = callerSnap.exists ? callerSnap.data() || {} : {};
+    const isAdmin = caller.role === "admin" || caller.userType === "admin" || (Array.isArray(caller.roles) && caller.roles.includes("admin"));
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Admin access required" });
+
+    const { requestId, driverId, quoteMode, amount, ratePerKm } = req.body || {};
+    if (!requestId || !driverId || !["fixed", "per_km"].includes(quoteMode)) return res.status(400).json({ success: false, message: "Choose a request, driver, and quote type." });
+    const requestRef = reDb.collection("transportRequests").doc(String(requestId));
+    const alertRef = reDb.collection("transportCapacityAlerts").doc(String(requestId));
+    const [requestSnap, alertSnap, driverSnap] = await Promise.all([requestRef.get(), alertRef.get(), reDb.collection("users").doc(String(driverId)).get()]);
+    if (!requestSnap.exists || !alertSnap.exists) return res.status(404).json({ success: false, message: "Move request or capacity alert not found." });
+    if (!driverSnap.exists || driverSnap.data().driverApproved !== true) return res.status(409).json({ success: false, message: "Choose a currently approved driver." });
+
+    const request = requestSnap.data() || {};
+    if (!["REQUESTED", "QUOTED"].includes(request.status) || request.paymentStatus === "paid") return res.status(409).json({ success: false, message: "This move is no longer available for a new quote." });
+    const driver = driverSnap.data() || {};
+    const profile = driver.driverProfile || {};
+    const straightKm = movingPointKm(request.pickupCoordinates, request.destinationCoordinates);
+    if (quoteMode === "per_km" && (!Number.isFinite(straightKm) || !(Number(ratePerKm) > 0))) return res.status(400).json({ success: false, message: "A route and positive per-kilometre rate are required." });
+    const routeKm = Number.isFinite(straightKm) ? Math.round(straightKm * 1.15 * 10) / 10 : null;
+    const quote = quoteMode === "per_km" ? Math.ceil(routeKm * Number(ratePerKm)) : Math.ceil(Number(amount));
+    if (!Number.isFinite(quote) || quote < 1 || quote > 100000000) return res.status(400).json({ success: false, message: "Enter a valid quote amount." });
+
+    const driverName = String(driver.name || driver.displayName || "Driver").slice(0, 120);
+    const driverPhone = String(profile.phone || driver.phoneNumber || driver.phone || "").slice(0, 32);
+    const vehicleLabel = String(profile.vehicleTemplate || profile.vehicleId || request.vehicleLabel || "Vehicle").slice(0, 60);
+    await reDb.runTransaction(async tx => {
+      const fresh = await tx.get(requestRef);
+      if (!fresh.exists || !["REQUESTED", "QUOTED"].includes(fresh.data().status) || fresh.data().paymentStatus === "paid") throw new Error("This move is no longer available for a new quote.");
+      tx.update(requestRef, { status: "QUOTED", quotedPrice: quote, quoteMode, quoteRatePerKm: quoteMode === "per_km" ? Number(ratePerKm) : null, quotedRouteKm: routeKm, quotedDriverId: String(driverId), quotedDriverName: driverName, driverUserId: null, driverName, driverPhone, vehicleLabel, quoteDecision: "PENDING", adminAssignedDriver: true, driverAcceptsOnlinePayments: true, quotePublishedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      tx.update(alertRef, { status: "ASSIGNED", assignedDriverId: String(driverId), assignedDriverName: driverName, quoteAmount: quote, quoteMode, reviewedBy: user.uid, resolvedAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    });
+    const customerPhone = request.userPhone || request.phoneNumber || request.customerPhone || "";
+    const bookingUrl = `${REAL_ESTATE_APP_URL}/transport`;
+    const quoteDescription = quoteMode === "per_km" ? `${routeKm} km × KSh ${Number(ratePerKm).toLocaleString("en-KE")}/km` : "Fixed trip fare";
+    const customerMessage = `Your MarketMix moving quote is ready.\n\nDriver: ${driverName} · ${vehicleLabel}${driverPhone ? ` · ${driverPhone}` : ""}\nPickup: ${request.pickupLabel || "Pickup details to be confirmed"}\nDestination: ${request.destinationLabel || request.destinationTitle || "Destination details to be confirmed"}\nQuote: KSh ${quote.toLocaleString("en-KE")} (${quoteDescription})\n\nReview and accept the quote, then book and pay securely here: ${bookingUrl}`;
+    const whatsappQueued = customerPhone ? enqueueWhatsApp(customerPhone, customerMessage, { kind: "moving-admin-quote", requestId: String(requestId), driverId: String(driverId) }) : false;
+    const customerEmail = request.userEmail || request.customerEmail || "";
+    const emailSent = customerEmail ? await sendMovingConfirmationEmail({ ...request, quotedPrice: quote, status: "QUOTED", vehicleLabel, pickupLabel: request.pickupLabel, destinationLabel: request.destinationLabel, userName: request.userName }, customerEmail, String(requestId)) : false;
+    if (driverPhone) enqueueWhatsApp(driverPhone, `A MarketMix moving request was assigned to you.\nCustomer: ${request.userName || "Customer"}\nQuote: KSh ${quote.toLocaleString("en-KE")}\nPlease review the trip in your driver dashboard.`, { kind: "moving-admin-driver-assigned", requestId: String(requestId), driverId: String(driverId) });
+    return res.json({ success: true, quote, quoteMode, routeKm, driverName, driverPhone, bookingUrl, whatsappQueued, emailSent, hasPhone: !!customerPhone, hasEmail: !!customerEmail });
+  } catch (error) {
+    console.error("Admin moving assignment failed:", error);
+    return res.status(400).json({ success: false, message: error.message || "Could not assign driver and send quote." });
+  }
+});
 app.post("/api/moving/dispatch", async (req,res) => {
   try {
     const user = await movingAuth(req), {requestId} = req.body || {};
