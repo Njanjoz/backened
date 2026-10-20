@@ -4588,10 +4588,10 @@ app.post("/api/offline-sale/notify", async (req, res) => {
   }
 });
 
-app.post("/api/intasend-callback", async (req, res) => {
+const handleIntaSendCallback = async (req, res) => {
   try {
     const { api_ref, state, mpesa_reference } = req.body || {};
-    const configuredChallenge = String(process.env.INTASEND_WEBHOOK_CHALLENGE || "").trim();
+    const configuredChallenge = String((req.path === "/api/intasend-realestate-callback" ? process.env.INTASEND_REALESTATE_WEBHOOK_CHALLENGE : process.env.INTASEND_WEBHOOK_CHALLENGE) || "").trim();
     if (!configuredChallenge) return res.status(503).send("IntaSend webhook challenge is not configured");
     if (String(req.body.challenge || "").trim() !== configuredChallenge) return res.status(401).send("Invalid IntaSend webhook challenge");
     if (!api_ref || !state) return res.status(400).send("Missing api_ref or state");
@@ -4712,12 +4712,12 @@ app.post("/api/intasend-callback", async (req, res) => {
               : [
                   `Hello ${sellerName}, a paid site-seeing request has been received.`,
                   `Property: ${propertyTitle}`,
-                  `Customer: ${customerName} · ${customerPhone || "No phone recorded"}`,
+                  `Customer: ${customerName}`,
                   `Package: ${booking.packageTitle || orderData.packageTitle || "Site Seeing"}`,
                   "To confirm availability, use the MarketMix form to capture live photos and a video of the empty room, enter the available unit count, and submit any changes for admin review. The KSh 25 confirmation payment is sent only after admin approves the evidence.",
                   `Open availability form: ${sellerFormLink}`,
                 ].join("\n");
-            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. The seller will send your visit details on WhatsApp.` : orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Vacancy was not verified and is not guaranteed. The seller will contact you to coordinate the visit.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller submits live photos and a YouTube video and admin reviews the vacancy.`, { kind: "site-seeing-buyer-paid", api_ref });
+            if (customerPhone) enqueueWhatsApp(customerPhone, isCompletionPayment ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Visit details will be sent through MarketMix.` : orderData.bookingMode === "direct_booking" ? `🏠 MarketMix Real Estates\nYour site-seeing package payment is confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. Vacancy was not verified and is not guaranteed. Visit coordination will happen through MarketMix.` : `🏠 MarketMix Real Estates\nPayment confirmed for ${propertyTitle}. Amount: KSh ${amount}. M-Pesa ref: ${mpesaRef}. Booking: ${bookingId}. We will update you after the seller submits live photos and a YouTube video and admin reviews the vacancy.`, { kind: "site-seeing-buyer-paid", api_ref });
             enqueueWhatsApp(ADMIN_PHONE, adminMessage, { kind: "site-seeing-admin-paid", api_ref });
             if (sellerPhone) enqueueWhatsApp(sellerPhone, sellerMessage, { kind: "site-seeing-seller-paid", api_ref, sellerId });
           }
@@ -4835,7 +4835,10 @@ app.post("/api/intasend-callback", async (req, res) => {
     console.error("❌ Callback error:", e);
     return res.status(500).send("Callback processing failed");
   }
-});
+};
+
+app.post("/api/intasend-callback", handleIntaSendCallback);
+app.post("/api/intasend-realestate-callback", handleIntaSendCallback);
 
 app.get("/api/ad-transaction/:paymentRef", async (req, res) => {
   const paymentRef = req.params.paymentRef;
@@ -5874,7 +5877,7 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     try { decoded = await verifyAnyToken(idToken); }
     catch { return res.status(401).json({ success: false, message: "Invalid auth token" }); }
 
-    const { propertyId, packageId, phoneNumber, customerName } = req.body || {};
+    const { propertyId, propertyIds = [], packageId, phoneNumber, customerName } = req.body || {};
     if (!propertyId || !packageId || !phoneNumber) {
       return res.status(400).json({ success: false, message: "propertyId, packageId and phoneNumber required" });
     }
@@ -5882,12 +5885,19 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       return res.status(400).json({ success: false, message: "Phone must be in 2547XXXXXXXX or 2541XXXXXXXX format" });
     }
 
-    const [propertySnap, packageSnap, userSnap] = await Promise.all([
-      reDb.collection("properties").doc(String(propertyId)).get(),
+    const uniquePropertyIds = [...new Set((Array.isArray(propertyIds) ? propertyIds : []).map(String).filter(Boolean))];
+    if (!uniquePropertyIds.includes(String(propertyId))) uniquePropertyIds.unshift(String(propertyId));
+    const isMultiPackage = ["assisted_view", "student_hunt", "property_hunt", "premium_hunt"].includes(String(packageId));
+    const maxProperties = String(packageId) === "assisted_view" ? 2 : String(packageId) === "premium_hunt" ? 6 : 4;
+    if (uniquePropertyIds.length > (isMultiPackage ? maxProperties : 1)) {
+      return res.status(400).json({ success: false, message: `This package supports up to ${isMultiPackage ? maxProperties : 1} properties.` });
+    }
+    const [propertySnaps, packageSnap, userSnap] = await Promise.all([
+      Promise.all(uniquePropertyIds.map((id) => reDb.collection("properties").doc(id).get())),
       reDb.collection("sightseeingPackages").doc(String(packageId)).get(),
       reDb.collection("users").doc(decoded.uid).get(),
     ]);
-    if (!propertySnap.exists) return res.status(404).json({ success: false, message: "Property not found" });
+    if (propertySnaps.some((snap) => !snap.exists)) return res.status(404).json({ success: false, message: "One or more selected properties could not be found" });
 
     const defaultPackages = {
       quick_view: { title: "Quick View", price: 100 },
@@ -5897,10 +5907,14 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       premium_hunt: { title: "Premium Hunt", price: 1000 },
       group_viewing: { title: "Group Viewing", price: 150 },
     };
-    const property = propertySnap.data() || {};
-    const pkg = packageSnap.exists
+    const tourProperties = propertySnaps.map((snap) => ({ id: snap.id, ...snap.data() }));
+    const property = tourProperties.find((item) => item.id === String(propertyId)) || tourProperties[0];
+    const packageData = packageSnap.exists
       ? (packageSnap.data() || {})
       : (defaultPackages[String(packageId)] || null);
+    const pkg = ["quick_view", "assisted_view"].includes(String(packageId))
+      ? { ...(packageData || {}), ...defaultPackages[String(packageId)] }
+      : packageData;
     if (!pkg) return res.status(404).json({ success: false, message: "Viewing package not found" });
     if (pkg.active === false || pkg.enabled === false || pkg.isActive === false) {
       return res.status(400).json({ success: false, message: "This viewing package is unavailable" });
@@ -5929,18 +5943,19 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     if (!isCompletion) {
       await reDb.collection("sightseeingBookings").doc(bookingId).set({
       bookingId, paymentRef, userId: decoded.uid, buyerName, buyerEmail,
-      customerName: buyerName, customerPhone: phoneNumber,
-      phoneNumber, propertyId: propertySnap.id,
+      customerName: buyerName,
+      propertyId: property.id, propertyIds: uniquePropertyIds,
+      tourProperties: tourProperties.map((item) => ({ id: item.id, title: item.title || item.name || "Property", location: item.location || item.address || null })),
       sellerId: property.agentId || property.userId || property.ownerId || property.sellerId || null,
       agentId: property.agentId || property.userId || property.ownerId || property.sellerId || null,
       propertyTitle: property.title || property.name || "Property",
       propertyLocation: property.location || property.address || null,
-      packageId: packageSnap.id, packageTitle: pkg.title || pkg.name || "Site Seeing",
+      packageId: String(packageId), packageTitle: pkg.title || pkg.name || "Site Seeing",
       packageName: pkg.title || pkg.name || "Site Seeing",
       bookingMode, totalPrice, depositAmount, remainingBalance: bookingMode === "availability_check" ? totalPrice : totalPrice - depositAmount,
       paymentStatus: "pending", bookingStatus: "awaiting_payment", status: "awaiting_payment",
       ...(bookingMode === "availability_check" ? { availabilityPaymentReference: paymentRef, availabilityPaymentAmount: depositAmount, availabilityPaymentStatus: "pending", availabilityPaymentCreatedAt: now } : { packagePaymentReference: paymentRef, packagePaymentAmount: depositAmount, packagePaymentStatus: "pending", packagePaymentCreatedAt: now }),
-      availabilityStatus: "pending", ownerPhone, sellerPhone: ownerPhone,
+      availabilityStatus: "pending",
       landlordName: property.landlordName || property.ownerName || null,
       preferredViewingDate: req.body.preferredViewingDate || null,
       preferredViewingTime: req.body.preferredViewingTime || null,
@@ -5958,7 +5973,8 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       userEmail: buyerEmail, buyerEmail, buyerName, phoneNumber,
       totalAmount: depositAmount, packageTotal: totalPrice,
       paymentKind: isCompletion ? "sightseeing_booking_completion" : "site_seeing_deposit",
-      propertyId: propertySnap.id,
+      propertyId: property.id, propertyIds: uniquePropertyIds,
+      tourProperties: tourProperties.map((item) => ({ id: item.id, title: item.title || item.name || "Property", location: item.location || item.address || null })),
       propertyTitle: property.title || property.name || "Property",
       propertyLocation: property.location || property.address || null,
       propertyType: "site_seeing", landlordName: property.landlordName || property.ownerName || null,
@@ -6151,7 +6167,8 @@ app.post("/api/bookings/site-seeing/:bookingId/admin-notify-customer", async (re
       }
     }
 
-    const customerPhone = booking.customerPhone || booking.phoneNumber;
+    const customerPaymentSnap = await db.collection("orders").where("bookingId", "==", String(req.params.bookingId)).limit(1).get();
+    const customerPhone = customerPaymentSnap.docs[0]?.data()?.phoneNumber || "";
     const customerName = booking.customerName || booking.buyerName || "there";
     const propertyTitle = booking.propertyTitle || "the property";
     const customerMessage = isTourReview
@@ -6231,7 +6248,9 @@ app.post("/api/bookings/site-seeing/:bookingId/meeting-details", async (req, res
     await bookingRef.set({ meetingDetails: meeting, status: "confirmed", tourStatus: "scheduled", assignedAgentId: assignedAgentId || null, agentAssignmentLocked: Boolean(assignedAgentId), tourCompleted: false, meetingDetailsSentAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     const amount = Number(booking.totalPrice || booking.packagePrice || 0);
     const message = `MARKETMIX SITE-SEEING — VISIT DETAILS\nBooking: ${req.params.bookingId}\nProperty: ${booking.propertyTitle || "Property"}\nPackage: ${booking.packageTitle || booking.packageName || "Viewing"}\n\nMeet at: ${meeting.meetingPoint}\nTime: ${meeting.meetingTime}\nLandmark: ${meeting.landmark}\nEstimated extra cost per person: ${cost == null ? "To be agreed directly" : `KSh ${cost.toLocaleString()}`}\n${meeting.notes ? `Notes: ${meeting.notes}\n` : ""}Agent: ${agent.fullName || agent.name || agent.displayName || "Assigned agent"}\n\nPAYMENT RECEIPT\nBooking: ${req.params.bookingId}\nPackage paid: KSh ${amount.toLocaleString()}\nM-Pesa ref: ${booking.completionMpesaReference || booking.directMpesaReference || booking.mpesaReference || "See M-Pesa confirmation"}\nPayment status: Paid\nThank you for booking with MarketMix Real Estates.`;
-    const queued = booking.customerPhone || booking.phoneNumber ? enqueueWhatsApp(booking.customerPhone || booking.phoneNumber, message, { kind: "site-seeing-visit-details", bookingId: req.params.bookingId }) : false;
+    const customerPaymentSnap = await db.collection("orders").where("bookingId", "==", String(req.params.bookingId)).limit(1).get();
+    const customerPhone = customerPaymentSnap.docs[0]?.data()?.phoneNumber || "";
+    const queued = customerPhone ? enqueueWhatsApp(customerPhone, message, { kind: "site-seeing-visit-details", bookingId: req.params.bookingId }) : false;
     return res.json({ success: true, bookingId: req.params.bookingId, customerNotified: Boolean(queued) });
   } catch (e) { return sendServerError(res, e, "Could not save site-seeing visit details"); }
 });
