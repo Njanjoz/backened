@@ -4899,7 +4899,7 @@ app.post("/api/site-seeing/agent-withdraw", async (req, res) => {
     const phoneNumber = normalizePhoneForWa(req.body?.phoneNumber || "");
     if (!Number.isInteger(requestedAmount) || requestedAmount <= 0) return res.status(400).json({ success: false, message: "Enter a whole shilling amount to withdraw." });
     if (!phoneNumber) return res.status(400).json({ success: false, message: "Enter a valid Kenyan M-Pesa number." });
-    const withdrawalFee = requestedAmount < 100 ? 10 : requestedAmount >= 5000 ? 30 : 20;
+    const withdrawalFee = requestedAmount < 100 ? 10 : requestedAmount <= 1000 ? 20 : 30;
     const netPayout = requestedAmount - withdrawalFee;
     if (netPayout <= 0) return res.status(400).json({ success: false, message: "Withdrawal amount must be greater than the withdrawal fee." });
     const profileSnap = await reDb.collection("users").doc(decoded.uid).get();
