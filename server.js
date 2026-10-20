@@ -5931,7 +5931,10 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
     const completionSnap = completionRef ? await completionRef.get() : null;
     if (isCompletion && (!completionSnap.exists || completionSnap.data()?.userId !== decoded.uid || completionSnap.data()?.availabilityStatus !== "available" || completionSnap.data()?.availabilityApproved !== true)) return res.status(409).json({ success: false, message: "This booking is not approved to continue yet." });
     if (isCompletion && String(completionSnap.data()?.packageId) !== String(packageId)) return res.status(409).json({ success: false, message: "Continue with the package saved in your original request." });
-    const depositAmount = isCompletion || bookingMode === "direct_booking" ? totalPrice : 50;
+    const availabilityFeeSnap = !isCompletion && bookingMode === "availability_check" ? await reDb.collection("siteSeeingSettings").doc("availabilityFee").get() : null;
+    const configuredAvailabilityFee = Number(availabilityFeeSnap?.data()?.amount);
+    const availabilityFee = Number.isInteger(configuredAvailabilityFee) && configuredAvailabilityFee >= 1 && configuredAvailabilityFee <= 500000 ? configuredAvailabilityFee : 50;
+    const depositAmount = isCompletion || bookingMode === "direct_booking" ? totalPrice : availabilityFee;
     const bookingId = isCompletion ? completionBookingId : `SS_${Date.now()}_${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
     const paymentRef = `PROP_SITESEEING_${bookingId}_${Date.now()}`;
     const user = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -5971,7 +5974,7 @@ app.post("/api/bookings/site-seeing/checkout", async (req, res) => {
       orderId: paymentRef, orderType: "real_estate", isRealEstate: true,
       isSiteSeeingBooking: true, isCompletion, bookingId, userId: decoded.uid,
       userEmail: buyerEmail, buyerEmail, buyerName, phoneNumber,
-      totalAmount: depositAmount, packageTotal: totalPrice,
+      totalAmount: depositAmount, consultationFee: depositAmount, packageTotal: totalPrice,
       paymentKind: isCompletion ? "sightseeing_booking_completion" : "site_seeing_deposit",
       propertyId: property.id, propertyIds: uniquePropertyIds,
       tourProperties: tourProperties.map((item) => ({ id: item.id, title: item.title || item.name || "Property", location: item.location || item.address || null })),
